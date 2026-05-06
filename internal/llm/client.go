@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yourusername/cynapse/internal/config"
+	"github.com/Alartist40/cynapse-mini/internal/config"
 )
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -25,10 +26,10 @@ const (
 )
 
 type Message struct {
-	Role       Role        `json:"role"`
-	Content    string      `json:"content"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type ToolCall struct {
@@ -80,7 +81,7 @@ func ListOllamaModels(baseURL string) ([]string, error) {
 
 	// Create HTTP client with timeout
 	client := &http.Client{Timeout: 30 * time.Second}
-	
+
 	url := strings.TrimRight(baseURL, "/") + "/api/tags"
 	resp, err := client.Get(url)
 	if err != nil {
@@ -578,9 +579,9 @@ func (c *ollamaClient) ChatStream(ctx context.Context, req *Request) (<-chan str
 			Content string `json:"content"`
 		}
 		type oReq struct {
-			Model    string  `json:"model"`
-			Messages []oMsg  `json:"messages"`
-			Stream   bool    `json:"stream"`
+			Model    string `json:"model"`
+			Messages []oMsg `json:"messages"`
+			Stream   bool   `json:"stream"`
 			Options  struct {
 				NumPredict  int     `json:"num_predict,omitempty"`
 				Temperature float64 `json:"temperature,omitempty"`
@@ -669,5 +670,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
-}
 }

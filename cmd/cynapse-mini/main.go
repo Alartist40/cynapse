@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Alartist40/cynapse-mini/internal/agent"
 	"github.com/Alartist40/cynapse-mini/internal/config"
@@ -14,18 +16,15 @@ import (
 	"github.com/Alartist40/cynapse-mini/internal/synapse"
 )
 
-const version = "1.0.0"
+const version = "1.0.0-lightweight"
 
 func main() {
-	// Ensure home directory exists
 	homeDir := getHomeDir()
 	ensureDir(homeDir)
 	ensureDir(filepath.Join(homeDir, "synapses"))
 	ensureDir(filepath.Join(homeDir, "data"))
 
-	// Parse command
 	if len(os.Args) < 2 {
-		// No args = run interactive chat
 		runChat()
 		return
 	}
@@ -48,7 +47,6 @@ func main() {
 }
 
 func runChat() {
-	// Load configuration
 	cfg, err := config.Load(getConfigPath())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
@@ -56,31 +54,28 @@ func runChat() {
 		os.Exit(1)
 	}
 
-	// Initialize lightweight memory store
 	store, err := memory.NewLightweightStore(filepath.Join(getHomeDir(), "data"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing memory: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Initialize LLM client
-	llmClient, err := llm.New(&llm.Config{
-		Provider:       cfg.LLM.Provider,
-		Model:          cfg.LLM.Model,
-		OllamaBaseURL:  cfg.LLM.OllamaBaseURL,
-		AnthropicKey:   cfg.LLM.AnthropicKey,
-		OpenAIKey:      cfg.LLM.OpenAIKey,
-		GeminiKey:      cfg.LLM.GeminiKey,
-		MaxTokens:      cfg.LLM.MaxTokens,
-		Temperature:    cfg.LLM.Temperature,
-		MaxRetries:     cfg.LLM.MaxRetries,
+	llmClient, err := llm.New(&config.LLMConfig{
+		Provider:      cfg.LLM.Provider,
+		Model:         cfg.LLM.Model,
+		OllamaBaseURL: cfg.LLM.OllamaBaseURL,
+		AnthropicKey:  cfg.LLM.AnthropicKey,
+		OpenAIKey:     cfg.LLM.OpenAIKey,
+		GeminiKey:     cfg.LLM.GeminiKey,
+		MaxTokens:     cfg.LLM.MaxTokens,
+		Temperature:   cfg.LLM.Temperature,
+		MaxRetries:    cfg.LLM.MaxRetries,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing LLM: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Initialize agent
 	agentInstance := agent.New(
 		"cynapse_mini_01",
 		llmClient,
@@ -88,20 +83,17 @@ func runChat() {
 		cfg,
 	)
 
-	// Load synapses (optional, for future extension)
 	registry := synapse.NewRegistry()
 	synapseDir := filepath.Join(getHomeDir(), "synapses")
 	if err := registry.Discover(synapseDir); err != nil {
-		// Synapses are optional, so we don't fail if they don't load
+		// Synapses are optional
 	}
 
-	// Run CLI
 	runCLI(agentInstance, store)
 }
 
 func runCLI(ag *agent.Agent, store *memory.LightweightStore) {
 	reader := bufio.NewReader(os.Stdin)
-
 	printWelcome()
 
 	for {
@@ -116,17 +108,18 @@ func runCLI(ag *agent.Agent, store *memory.LightweightStore) {
 			continue
 		}
 
-		// Handle commands
 		if strings.HasPrefix(input, "/") {
 			handleCommand(input, ag, store)
 			continue
 		}
 
-		// Process normal input through agent
 		fmt.Print("\n🧠 ")
-		err = ag.ProcessStreaming(input, func(chunk string) {
+
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+		err = ag.ProcessStreaming(ctx, input, func(chunk string) {
 			fmt.Print(chunk)
 		})
+		cancel()
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\n❌ Error: %v\n", err)
@@ -145,18 +138,15 @@ func handleCommand(cmd string, ag *agent.Agent, store *memory.LightweightStore) 
 	switch command {
 	case "/help":
 		printCommandHelp()
-
 	case "/models":
 		fmt.Println("Available LLM providers:")
 		fmt.Println("  ollama    - Local inference (Ollama)")
 		fmt.Println("  anthropic - Claude API")
 		fmt.Println("  openai    - GPT API")
 		fmt.Println("  gemini    - Google Gemini API")
-
 	case "/clear":
 		store.Clear()
 		fmt.Println("✓ Conversation history cleared")
-
 	case "/memory":
 		msgs := store.GetRecent(5)
 		fmt.Printf("\nLast %d messages:\n", len(msgs))
@@ -167,18 +157,15 @@ func handleCommand(cmd string, ag *agent.Agent, store *memory.LightweightStore) 
 			}
 			fmt.Printf("[%s] %s\n", msg.Role, content)
 		}
-
 	case "/info":
 		fmt.Println("\n🧠 CYNAPSE Mini v1.0.0")
 		fmt.Println("Lightweight AI Agent for Raspberry Pi")
 		fmt.Println("\nMinimalist CLI Interface")
 		fmt.Println("Disk-based Memory System")
 		fmt.Println("Streaming Response Output")
-
 	case "/quit", "/exit":
 		fmt.Println("\nGoodbye! 👋")
 		os.Exit(0)
-
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		fmt.Println("Type /help for available commands")
@@ -204,7 +191,6 @@ func handleSynapseCommand(args []string) {
 			os.Exit(1)
 		}
 		registry.List()
-
 	case "add", "install":
 		if len(subargs) == 0 {
 			fmt.Println("Usage: cynapse-mini synapse add <name>")
@@ -214,7 +200,6 @@ func handleSynapseCommand(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-
 	case "remove", "uninstall":
 		if len(subargs) == 0 {
 			fmt.Println("Usage: cynapse-mini synapse remove <name>")
@@ -224,14 +209,12 @@ func handleSynapseCommand(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-
 	case "search":
 		if len(subargs) == 0 {
 			registry.SearchAll()
 		} else {
 			registry.Search(subargs[0])
 		}
-
 	default:
 		fmt.Printf("Unknown synapse command: %s\n", cmd)
 		printSynapseHelp()
@@ -254,16 +237,15 @@ func handleConfigCommand(args []string) {
 			os.Exit(1)
 		}
 		fmt.Printf("✓ Created default config at: %s\n", getConfigPath())
-
 	default:
 		fmt.Printf("Unknown config command: %s\n", cmd)
-		fmt.Println("Available commands: init")
+		fmt.Print("Available commands: init\n")
 		os.Exit(1)
 	}
 }
 
 func printWelcome() {
-	fmt.Println(`
+	fmt.Print(`
 ╔════════════════════════════════════════╗
 ║  🧠 CYNAPSE Mini v1.0.0                ║
 ║  Lightweight AI Agent                  ║
@@ -294,43 +276,22 @@ CHAT COMMANDS (type in chat):
   /info                     Show system info
   /quit                     Exit application
 
-SYNAPSE COMMANDS:
-  list                      List installed synapses
-  add <name>                Install a synapse
-  remove <name>             Remove a synapse
-  search [query]            Search available synapses
-
-CONFIG COMMANDS:
-  init                      Create default config
-
-EXAMPLES:
-  cynapse-mini                       # Run interactive chat
-  cynapse-mini synapse add leafcutter # Install LeafcutterLLM synapse
-  cynapse-mini synapse list          # See installed synapses
-  cynapse-mini config init           # Create default config
-
 For more information, visit: https://github.com/Alartist40/cynapse-mini
 `)
 }
 
 func printSynapseHelp() {
-	fmt.Println(`
+	fmt.Print(`
 Synapse commands:
   list                 List installed synapses
   add <name>           Install a synapse from registry
   remove <name>        Remove an installed synapse
   search [query]       Search available synapses
-
-Examples:
-  cynapse-mini synapse list
-  cynapse-mini synapse add leafcutter
-  cynapse-mini synapse remove git-tools
-  cynapse-mini synapse search inference
 `)
 }
 
 func printCommandHelp() {
-	fmt.Println(`
+	fmt.Print(`
 Chat Commands:
   /help                 Show this help
   /models               List available LLM providers
@@ -347,7 +308,7 @@ Normal chat:
 func getHomeDir() string {
 	home := os.Getenv("HOME")
 	if home == "" {
-		home = os.Getenv("USERPROFILE") // Windows
+		home = os.Getenv("USERPROFILE")
 	}
 	return filepath.Join(home, ".cynapse-mini")
 }
