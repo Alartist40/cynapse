@@ -47,9 +47,9 @@ type LLMConfig struct {
 	OllamaBaseURL string `yaml:"ollama_base_url"`
 
 	// Generation params
-	MaxTokens   int     `yaml:"max_tokens"`   // default 4096
-	Temperature float64 `yaml:"temperature"`  // default 0.7
-	MaxRetries  int     `yaml:"max_retries"`  // default 3
+	MaxTokens   int     `yaml:"max_tokens"`  // default 4096
+	Temperature float64 `yaml:"temperature"` // default 0.7
+	MaxRetries  int     `yaml:"max_retries"` // default 3
 }
 
 // ─── Memory ──────────────────────────────────────────────────────────────────
@@ -101,9 +101,9 @@ type MCPConfig struct {
 }
 
 type MCPServer struct {
-	Name    string `yaml:"name"`
-	Command string `yaml:"command"` // e.g. "npx -y @modelcontextprotocol/server-filesystem"
-	Args    []string `yaml:"args"`
+	Name    string            `yaml:"name"`
+	Command string            `yaml:"command"` // e.g. "npx -y @modelcontextprotocol/server-filesystem"
+	Args    []string          `yaml:"args"`
 	Env     map[string]string `yaml:"env"`
 }
 
@@ -189,4 +189,29 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("CYNAPSE_AUTH_TOKEN"); v != "" {
 		cfg.Gateway.AuthToken = v
 	}
+}
+
+// CreateDefault creates a default configuration file at the given path
+func CreateDefault(path string) error {
+	cfg := &Config{
+		LLM: LLMConfig{
+			Provider:      "ollama",
+			Model:         "qwen2.5:3b",
+			OllamaBaseURL: "http://localhost:11434",
+			MaxTokens:     2048,
+			Temperature:   0.7,
+			MaxRetries:    3,
+		},
+	}
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshaling default config: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("writing config file: %w", err)
+	}
+
+	return nil
 }
