@@ -1,116 +1,44 @@
-# ═══════════════════════════════════════════════════════
-#  CYNAPSE — Ghost Shell Backend Configuration
-# ═══════════════════════════════════════════════════════
-#
-#  Quick start:
-#    1. Choose your LLM provider (ollama recommended for local)
-#    2. Set your API key (or use environment variables)
-#    3. Run: go run ./cmd/cynapse
-#
-# ═══════════════════════════════════════════════════════
+# CYNAPSE Mini Configuration
 
-# ── Gateway ──────────────────────────────────────────────
-gateway:
-  address: "0.0.0.0:8080"
+# Agent settings
+agent:
+  device_id: "cynapse_mini_01"
+  system_prompt: "You are CYNAPSE Mini, a helpful AI assistant running on a Raspberry Pi."
 
-  # Optional: require a token to connect (set in frontend Settings)
-  # auth_token: "your-secret-token"
-
-
-# ── LLM Provider ─────────────────────────────────────────
-#
-#  Options: ollama | anthropic | openai | gemini
-#
-#  Ollama (local, no API key needed):
-#    provider: ollama
-#    model: qwen2.5        # or llama3.2, mistral, gemma2, etc.
-#
-#  Anthropic:
-#    provider: anthropic
-#    model: claude-sonnet-4-20250514
-#    anthropic_key: sk-ant-...   # or set ANTHROPIC_API_KEY env var
-#
-#  OpenAI:
-#    provider: openai
-#    model: gpt-4o
-#    openai_key: sk-...          # or set OPENAI_API_KEY env var
-#
-#  Gemini:
-#    provider: gemini
-#    model: gemini-2.0-flash
-#    gemini_key: AIza...         # or set GEMINI_API_KEY env var
-#
+# LLM Provider (ollama, anthropic, or openai)
 llm:
   provider: "ollama"
-  model: "qwen3.5:9b"
-  ollama_base_url: "http://localhost:11434"
-
-  # Uncomment and fill in for cloud providers:
-  # anthropic_key: ""
-  # openai_key: ""
-  # gemini_key: ""
-
-  max_tokens: 4096
+  model: "qwen2:0.5b"
   temperature: 0.7
-  max_retries: 3
+  max_tokens: 2048
+  
+  # Ollama settings
+  ollama:
+    base_url: "http://localhost:11434"
+  
+  # Anthropic settings (when provider = "anthropic")
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-20250514"
+  
+  # OpenAI settings (when provider = "openai")
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    model: "gpt-4"
 
-
-# ── Memory & Persona ─────────────────────────────────────
+# Memory/Session storage
 memory:
-  persona_path:    "./data/persona"    # Markdown files per device
-  sessions_path:   "./data/sessions"   # JSONL conversation logs
-  db_path:         "./data/memory.db"  # SQLite memory store
-  defaults_path:   "./persona/defaults"
+  db_path: "data/sessions.db"
+  max_history: 20  # Max messages to keep in context
 
-  # How often the curator runs to update MEMORY.md (hours)
-  heartbeat_interval_hours: 6
-
-  # Compact session log when it exceeds this many messages
-  max_session_messages: 100
-
-
-# ── Tools ─────────────────────────────────────────────────
-#
-#  Profiles:
-#    minimal  — memory tools only (memory_replace, daily_log, user_replace, soul_replace, memory_search)
-#    standard — + write_file, list_files, web_fetch
-#    full     — + bash execution (use with caution!)
-#
+# Tools configuration
 tools:
-  profile: "standard"
-  work_dir: "./workspace"
-  timeout_seconds: 30
-
-
-# ── MCP Servers ───────────────────────────────────────────
-#
-#  Connect to any MCP-compatible server. The agent will
-#  automatically discover and use the tools they provide.
-#
-#  Examples:
-#
-#  Filesystem access:
-#    - name: filesystem
-#      command: npx
-#      args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/documents"]
-#
-#  Web search (Brave):
-#    - name: brave-search
-#      command: npx
-#      args: ["-y", "@modelcontextprotocol/server-brave-search"]
-#      env:
-#        BRAVE_API_KEY: "your-key"
-#
-#  Git:
-#    - name: git
-#      command: npx
-#      args: ["-y", "@modelcontextprotocol/server-git", "--repository", "/path/to/repo"]
-#
-mcp:
-  enabled: true
-  servers: []
-  # Uncomment to add servers:
-  # servers:
-  #   - name: filesystem
-  #     command: npx
-  #     args: ["-y", "@modelcontextprotocol/server-filesystem", "./workspace"]
+  enabled: ["bash", "memory", "file"]
+  
+  bash:
+    working_dir: "."
+    timeout_seconds: 30
+  
+  file:
+    working_dir: "."
+    max_file_size_mb: 10
