@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+pub mod curator;
 pub mod dendrite;
 pub mod error;
 pub mod llm;

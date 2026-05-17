@@ -77,6 +77,7 @@ impl Node {
 }
 
 /// In-memory knowledge graph. All operations are thread-safe.
+#[derive(Clone)]
 pub struct Dendrite {
     pub(crate) nodes: Arc<RwLock<HashMap<String, Node>>>,
     link_re: Regex,

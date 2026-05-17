@@ -141,8 +141,7 @@ impl LLMProvider for OpenAIProvider {
             .await?;
         
         let byte_stream = response.bytes_stream();
-        let text_stream = futures::stream::unfold(byte_stream, |mut stream| async move {
-            let mut buffer = String::new();
+        let text_stream = futures::stream::unfold((byte_stream, String::new()), |(mut stream, mut buffer)| async move {
             loop {
                 match stream.next().await {
                     Some(Ok(bytes)) => {
@@ -150,18 +149,16 @@ impl LLMProvider for OpenAIProvider {
                         // Process complete lines
                         if let Some(pos) = buffer.rfind('\n') {
                             let complete = buffer[..=pos].to_string();
-                            buffer = buffer[pos + 1..].to_string();
-                            return Some((complete, stream));
+                            let remainder = buffer[pos + 1..].to_string();
+                            return Some((complete, (stream, remainder)));
                         }
                     }
                     Some(Err(e)) => {
-                        return Some((format!("ERROR: {e}"), stream));
+                        return Some((format!("ERROR: {e}"), (stream, buffer)));
                     }
                     None => {
                         if !buffer.is_empty() {
-                            let remaining = buffer.clone();
-                            buffer.clear();
-                            return Some((remaining, stream));
+                            return Some((buffer, (stream, String::new())));
                         }
                         return None;
                     }

@@ -1,12 +1,13 @@
 use rusqlite::{params, Connection};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use super::{Dendrite, Node, NodeType};
-use crate::error::{CynapseError, Result};
+use crate::error::Result;
 
 /// Persists Dendrite nodes to SQLite.
 pub struct DendriteStore {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
     has_fts5: bool,
 }
 
@@ -16,7 +17,7 @@ impl DendriteStore {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
 
         let mut store = Self {
-            conn,
+            conn: Arc::new(Mutex::new(conn)),
             has_fts5: false,
         };
         store.migrate()?;
@@ -24,8 +25,9 @@ impl DendriteStore {
     }
 
     fn migrate(&mut self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
         // Core table
-        self.conn.execute(
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS dendrite_nodes (
                 id         TEXT PRIMARY KEY,
                 title      TEXT NOT NULL,
@@ -40,15 +42,13 @@ impl DendriteStore {
             [],
         )?;
 
-        self.conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_dendrite_updated ON dendrite_nodes(updated_at DESC)",
             [],
         )?;
 
         // Try FTS5; fall back gracefully
-        if self
-            .conn
-            .execute(
+        if conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS dendrite_fts USING fts5(
                     id UNINDEXED,
                     title,
@@ -62,7 +62,7 @@ impl DendriteStore {
         {
             self.has_fts5 = true;
             // Sync triggers
-            self.conn.execute_batch(
+            conn.execute_batch(
                 "CREATE TRIGGER IF NOT EXISTS dendrite_nodes_ai
                  AFTER INSERT ON dendrite_nodes BEGIN
                      INSERT INTO dendrite_fts(id, title, content, tags)
@@ -83,7 +83,7 @@ impl DendriteStore {
             )?;
         } else {
             // Fallback table
-            self.conn.execute(
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS dendrite_fts_fallback (
                     id    TEXT PRIMARY KEY,
                     title TEXT,
@@ -103,7 +103,8 @@ impl DendriteStore {
         let links = serde_json::to_string(&node.links)?;
         let backlinks = serde_json::to_string(&node.backlinks)?;
 
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
 
         tx.execute(
             "INSERT INTO dendrite_nodes
@@ -148,7 +149,8 @@ impl DendriteStore {
 
     /// Delete a node.
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         tx.execute("DELETE FROM dendrite_nodes WHERE id = ?1", params![id])?;
         if !self.has_fts5 {
             tx.execute("DELETE FROM dendrite_fts_fallback WHERE id = ?1", params![id])?;
@@ -159,8 +161,8 @@ impl DendriteStore {
 
     /// Load all nodes into a Dendrite graph.
     pub fn load_all(&self, graph: &Dendrite) -> Result<()> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
             .prepare("SELECT id, title, content, type, tags, links, backlinks, created_at, updated_at
                       FROM dendrite_nodes ORDER BY updated_at DESC")?;
 
@@ -208,8 +210,8 @@ impl DendriteStore {
         let limit = if limit == 0 { 10 } else { limit };
 
         if self.has_fts5 {
-            let mut stmt = self
-                .conn
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
                 .prepare("SELECT id FROM dendrite_fts WHERE dendrite_fts MATCH ?1 ORDER BY rank LIMIT ?2")?;
             let rows = stmt.query_map(params![query, limit as i64], |row| row.get(0))?;
             let mut ids = Vec::new();
@@ -219,8 +221,8 @@ impl DendriteStore {
             Ok(ids)
         } else {
             let pattern = format!("%{query}%");
-            let mut stmt = self
-                .conn
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
                 .prepare("SELECT id FROM dendrite_fts_fallback
                           WHERE title LIKE ?1 OR content LIKE ?1 OR tags LIKE ?1
                           LIMIT ?2")?;

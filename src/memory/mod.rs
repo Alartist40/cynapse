@@ -15,11 +15,14 @@ pub trait Memory: Send + Sync {
     async fn clear_history(&mut self, device_id: &str) -> Result<()>;
 }
 
+pub mod hybrid;
 pub mod sqlite;
+
+pub use hybrid::HybridMemory;
 
 use crate::config::MemoryConfig;
 
 /// Create memory store from configuration
 pub fn create_memory(config: &MemoryConfig) -> Result<Box<dyn Memory>> {
-    Ok(Box::new(sqlite::SqliteMemory::new(config)?))
+    Ok(Box::new(hybrid::HybridMemory::new(config)?))
 }
