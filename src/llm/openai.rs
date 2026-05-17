@@ -44,6 +44,23 @@ struct OpenAIResponseMessage {
     content: String,
 }
 
+// Streaming types
+#[derive(Deserialize)]
+struct OpenAIStreamChunk {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: String,
+}
+
 impl OpenAIProvider {
     pub fn new(config: &LLMConfig) -> Result<Self> {
         let api_key = config.openai.api_key.clone();
@@ -118,19 +135,69 @@ impl LLMProvider for OpenAIProvider {
             .client
             .post("https://api.openai.com/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Accept", "text/event-stream")
             .json(&request)
             .send()
             .await?;
         
-        let stream = response.bytes_stream().map(|chunk| {
-            let bytes = chunk.map_err(|e| CynapseError::HttpError(e))?;
-            let text = String::from_utf8_lossy(&bytes);
-            
-            // Parse SSE format
-            // Simplified - real implementation needs proper SSE parsing
-            Ok(text.to_string())
+        let byte_stream = response.bytes_stream();
+        let text_stream = futures::stream::unfold(byte_stream, |mut stream| async move {
+            let mut buffer = String::new();
+            loop {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        // Process complete lines
+                        if let Some(pos) = buffer.rfind('\n') {
+                            let complete = buffer[..=pos].to_string();
+                            buffer = buffer[pos + 1..].to_string();
+                            return Some((complete, stream));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        return Some((format!("ERROR: {e}"), stream));
+                    }
+                    None => {
+                        if !buffer.is_empty() {
+                            let remaining = buffer.clone();
+                            buffer.clear();
+                            return Some((remaining, stream));
+                        }
+                        return None;
+                    }
+                }
+            }
+        });
+
+        let parsed = text_stream.flat_map(|text| {
+            let chunks: Vec<Result<String>> = text
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with(':') {
+                        return None;
+                    }
+                    if !line.starts_with("data: ") {
+                        return None;
+                    }
+                    let data = &line[6..];
+                    if data == "[DONE]" {
+                        return None;
+                    }
+                    match serde_json::from_str::<OpenAIStreamChunk>(data) {
+                        Ok(chunk) => {
+                            let text = chunk.choices.first()
+                                .map(|c| c.delta.content.clone())
+                                .unwrap_or_default();
+                            if text.is_empty() { None } else { Some(Ok(text)) }
+                        }
+                        Err(_) => None,
+                    }
+                })
+                .collect();
+            futures::stream::iter(chunks)
         });
         
-        Ok(Box::new(Box::pin(stream)))
+        Ok(Box::new(Box::pin(parsed)))
     }
 }

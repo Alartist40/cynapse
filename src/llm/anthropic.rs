@@ -39,6 +39,19 @@ struct ContentBlock {
     text: String,
 }
 
+// Streaming types
+#[derive(Deserialize)]
+struct AnthropicStreamEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    delta: Option<StreamDelta>,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    text: Option<String>,
+}
+
 impl AnthropicProvider {
     pub fn new(config: &LLMConfig) -> Result<Self> {
         let api_key = config.anthropic.api_key.clone();
@@ -60,12 +73,12 @@ impl AnthropicProvider {
     fn convert_messages(&self, messages: Vec<Message>) -> Vec<AnthropicMessage> {
         messages
             .into_iter()
-            .filter(|m| m.role != Role::System) // System prompt handled separately
+            .filter(|m| m.role != Role::System)
             .map(|m| AnthropicMessage {
                 role: match m.role {
                     Role::User => "user".to_string(),
                     Role::Assistant | Role::Tool => "assistant".to_string(),
-                    Role::System => "user".to_string(), // Shouldn't reach here
+                    Role::System => "user".to_string(),
                 },
                 content: m.content,
             })
@@ -116,19 +129,67 @@ impl LLMProvider for AnthropicProvider {
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
+            .header("Accept", "text/event-stream")
             .json(&request)
             .send()
             .await?;
         
-        let stream = response.bytes_stream().map(|chunk| {
-            let bytes = chunk.map_err(|e| CynapseError::HttpError(e))?;
-            let text = String::from_utf8_lossy(&bytes);
-            
-            // Parse SSE format
-            // This is simplified - actual implementation needs proper SSE parsing
-            Ok(text.to_string())
+        let byte_stream = response.bytes_stream();
+        let text_stream = futures::stream::unfold(byte_stream, |mut stream| async move {
+            let mut buffer = String::new();
+            loop {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        if let Some(pos) = buffer.rfind('\n') {
+                            let complete = buffer[..=pos].to_string();
+                            buffer = buffer[pos + 1..].to_string();
+                            return Some((complete, stream));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        return Some((format!("ERROR: {e}"), stream));
+                    }
+                    None => {
+                        if !buffer.is_empty() {
+                            let remaining = buffer.clone();
+                            buffer.clear();
+                            return Some((remaining, stream));
+                        }
+                        return None;
+                    }
+                }
+            }
         });
+
+        let parsed = text_stream.filter_map(|text| {
+            let chunks: Vec<Result<String>> = text
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if !line.starts_with("data: ") {
+                        return None;
+                    }
+                    let data = &line[6..];
+                    if data == "[DONE]" {
+                        return None;
+                    }
+                    match serde_json::from_str::<AnthropicStreamEvent>(data) {
+                        Ok(event) => {
+                            if event.event_type == "content_block_delta" {
+                                event.delta.and_then(|d| d.text).filter(|t| !t.is_empty())
+                                    .map(|t| Ok(t))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                })
+                .collect();
+            futures::future::ready(Some(futures::stream::iter(chunks)))
+        }).flatten();
         
-        Ok(Box::new(Box::pin(stream)))
+        Ok(Box::new(Box::pin(parsed)))
     }
 }

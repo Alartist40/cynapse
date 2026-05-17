@@ -1,8 +1,10 @@
 pub mod agent;
 pub mod config;
+pub mod dendrite;
 pub mod error;
 pub mod llm;
 pub mod memory;
+pub mod synapse;
 pub mod tools;
 
 pub use agent::Agent;
