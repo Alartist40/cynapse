@@ -1,0 +1,19 @@
+[package]
+name = "cynapse-memory"
+version = "0.1.0"
+edition = "2021"
+description = "DENDRITE 4-tier knowledge graph & SQLite persistent memory for Cynapse."
+license = "MIT"
+
+[lib]
+name = "cynapse_memory"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1"
+chrono = "0.4"

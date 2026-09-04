@@ -1,0 +1,16 @@
+# Cynapse System Configuration
+
+[system]
+name = "cynapse"
+version = "0.1.0"
+
+[engine]
+tier1_endpoint = "http://127.0.0.1:11434"
+default_model = "ministral-3:3b"
+memory_headroom_mb = 1536
+
+[memory]
+subsystem = "DENDRITE"
+database_path = "data/dendrite.db"
+cache_ttl_seconds = 300
+core_node_budget = 0.40

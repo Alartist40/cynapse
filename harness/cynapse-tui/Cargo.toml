@@ -1,0 +1,23 @@
+[package]
+name = "cynapse-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, lightweight REPL TUI interface for Cynapse with dynamic quant parsing & token streaming."
+license = "MIT"
+
+[lib]
+name = "cynapse_tui"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+colored = "2.1"
+regex = "1"
+cynapse-core = { path = "../cynapse-core" }
+cynapse-engine = { path = "../../engine/cynapse-engine" }
+cynapse-memory = { path = "../../memory/cynapse-memory" }
+serde = { version = "1", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+toml = "0.8"

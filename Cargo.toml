@@ -1,66 +1,32 @@
 [package]
-name = "cynapse-mini"
-version = "1.0.0"
+name = "cynapse"
+version = "0.1.0"
 edition = "2021"
-authors = ["Alartist40"]
-license = "MIT OR Apache-2.0"
-description = "Lightweight Rust AI agent for embedded systems and Raspberry Pi"
-repository = "https://github.com/Alartist40/cynapse-mini"
-keywords = ["ai", "agent", "cli", "embedded", "raspberry-pi"]
-categories = ["command-line-utilities"]
+authors = ["Cynapse Team"]
+description = "Pure Rust AI Agent System: 3-tier LLM engine, REPL TUI, atomic-agent local tools, and Dendrite graph memory."
+license = "MIT"
+
+[workspace]
+members = [
+    ".",
+    "harness/cynapse-core",
+    "harness/cynapse-tui",
+    "engine/cynapse-engine",
+    "engine/leafcutter_core/rust",
+    "memory/cynapse-memory",
+]
 
 [[bin]]
-name = "cynapse-mini"
-path = "src/main.rs"
-
-[lib]
-name = "cynapse_mini"
-path = "src/lib.rs"
+name = "cynapse"
+path = "harness/src/main.rs"
 
 [dependencies]
-# Async runtime - minimal features for size
-tokio = { version = "1.36", default-features = false, features = ["rt-multi-thread", "macros", "time", "io-util", "sync", "process", "fs"] }
-tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
-
-# HTTP client - minimal features
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9"
-
-# Database
-rusqlite = { version = "0.30", features = ["bundled"] }
-
-# CLI
+cynapse-core = { path = "harness/cynapse-core" }
+cynapse-tui = { path = "harness/cynapse-tui" }
+cynapse-engine = { path = "engine/cynapse-engine" }
+cynapse-memory = { path = "memory/cynapse-memory" }
+tokio = { version = "1", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
-
-# Error handling
 anyhow = "1.0"
-thiserror = "1.0"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Utilities
-async-trait = "0.1"
-futures = "0.3"
-shellexpand = "3.1"
-regex = "1.12.3"
-chrono = { version = "0.4.44", features = ["clock"] }
-
-[dev-dependencies]
-tempfile = "3.10"
-
-[profile.release]
-opt-level = "z"          # Optimize for size
-lto = "fat"              # Full link-time optimization
-codegen-units = 1        # Better optimization
-strip = true             # Remove debug symbols
-panic = "abort"          # Smaller binary
-
-[profile.dev]
-opt-level = 0
-incremental = true
+colored = "2.1"
+dirs = "6.0"

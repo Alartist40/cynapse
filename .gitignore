@@ -1,1 +1,7 @@
 /target
+/cynapse
+*.gguf
+*.db
+*.db-wal
+*.db-shm
+/data

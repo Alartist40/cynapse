@@ -1,0 +1,19 @@
+[package]
+name = "cynapse-engine"
+version = "0.1.0"
+edition = "2021"
+description = "3-tier LLM inference engine & Leafcutter GGUF/Safetensor layer streaming for Cynapse."
+license = "MIT"
+
+[lib]
+name = "cynapse_engine"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
