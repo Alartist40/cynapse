@@ -116,6 +116,30 @@ impl std::fmt::Display for NodeType {
     }
 }
 
+/// Classification of memory category for multi-galaxy clusters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeCategory {
+    Personal,
+    Engineering,
+    Preferences,
+    Meta,
+    Episodic,
+    Transient,
+}
+
+impl NodeCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeCategory::Personal => "Personal",
+            NodeCategory::Engineering => "Engineering",
+            NodeCategory::Preferences => "Preferences",
+            NodeCategory::Meta => "Meta & Identity",
+            NodeCategory::Episodic => "Episodic & Events",
+            NodeCategory::Transient => "Transient Buffer",
+        }
+    }
+}
+
 /// A single knowledge node in the graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
@@ -133,10 +157,51 @@ pub struct Node {
 }
 
 impl Node {
+    /// Classify node into a sub-galaxy category.
+    pub fn category(&self) -> NodeCategory {
+        if self.node_type == NodeType::Identity {
+            return NodeCategory::Meta;
+        }
+        if self.node_type == NodeType::TurnLog {
+            return NodeCategory::Transient;
+        }
+        for tag in &self.tags {
+            let t = tag.to_lowercase();
+            if t.contains("pref") || t.contains("like") || t.contains("favorite") || t.contains("food") || t.contains("book") || t.contains("color") {
+                return NodeCategory::Preferences;
+            }
+            if t.contains("code") || t.contains("rust") || t.contains("arch") || t.contains("procedure") || t.contains("project") || t.contains("concept") {
+                return NodeCategory::Engineering;
+            }
+            if t.contains("fact") || t.contains("person") || t.contains("user") {
+                return NodeCategory::Personal;
+            }
+        }
+        match self.node_type {
+            NodeType::Person | NodeType::AtomicFact => NodeCategory::Personal,
+            NodeType::Procedure | NodeType::Project | NodeType::Concept => NodeCategory::Engineering,
+            NodeType::Event | NodeType::Memory => NodeCategory::Episodic,
+            NodeType::Identity => NodeCategory::Meta,
+            NodeType::TurnLog => NodeCategory::Transient,
+            NodeType::Custom => NodeCategory::Personal,
+        }
+    }
+
+    /// Specialization index spec(e) in range [0.1, 1.0].
+    pub fn spec_index(&self) -> f32 {
+        let tag_score = (self.tags.len() as f32 * 0.25).min(0.5);
+        let link_score = ((self.links.len() + self.backlinks.len()) as f32 * 0.1).min(0.3);
+        let tier_base = match self.node_type.tier() {
+            3 => 0.9,
+            2 => 0.7,
+            1 => 0.8,
+            _ => 0.2,
+        };
+        (tier_base + tag_score + link_score).min(1.0)
+    }
+
     /// Create a minimal placeholder for a node that is referenced by a
-    /// `[[link]]` but has no content yet.  Currently unused — placeholder
-    /// creation was removed from `upsert` to prevent ghost nodes, but
-    /// this helper is kept for potential future use (e.g. lazy resolution).
+    /// `[[link]]` but has no content yet.
     #[allow(dead_code)]
     pub fn placeholder(id: String, now: i64) -> Node {
         Node {

@@ -5,6 +5,9 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use regex::Regex;
+pub mod doctor;
+pub mod downloader;
+pub mod offline_agent;
 pub mod session;
 use serde::{Deserialize, Serialize};
 

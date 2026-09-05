@@ -43,6 +43,12 @@ enum Commands {
     },
     /// Render visual 4-tier Dendrite memory overview & graph topology
     Memory,
+    /// Run self-healing Cynapse Doctor system diagnostic & recovery
+    Doctor {
+        /// Enable automatic self-healing repair mode
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 /// Resolve models directory dynamically relative to executable, workspace, or user home folder.
@@ -116,6 +122,29 @@ async fn main() -> Result<()> {
                 }
             }
             cynapse_tui::memory_render::render_dendrite_visualizer(&session.graph);
+        }
+        Some(Commands::Doctor { fix }) => {
+            let db_path = dirs::home_dir().map(|h| h.join(".cynapse").join("dendrite.db")).unwrap_or_else(|| PathBuf::from("data/dendrite.db"));
+            let doctor = cynapse_core::doctor::CynapseDoctor::new(models_dir.clone(), db_path, fix);
+            let report = doctor.run_diagnostics();
+
+            println!("======================================================================");
+            println!("           🩺 CYNAPSE AGENT SYSTEM SELF-HEALING DOCTOR                ");
+            println!("======================================================================");
+            println!("Overall System Health Score: [ {}% ]", report.health_score);
+            println!("Summary: {} Pass | {} Warning | {} Repaired | {} Failed", report.total_pass, report.total_warn, report.total_repaired, report.total_fail);
+            println!("----------------------------------------------------------------------");
+            for item in &report.items {
+                println!("{}{} [{:<14}] {:<35} - {}", item.status.color_code(), item.status.badge(), item.subsystem, item.check_name, item.detail);
+                if let Some(fix) = &item.fix_recommendation {
+                    println!("    └─> Fix Recommendation: {}", fix);
+                }
+                print!("\x1b[0m"); // reset color
+            }
+            println!("======================================================================");
+            if report.total_fail > 0 && !fix {
+                println!("💡 Tip: Run 'cynapse doctor --fix' to execute automatic self-healing repairs.");
+            }
         }
         Some(Commands::Run { target }) => {
             if let Some(t) = target {

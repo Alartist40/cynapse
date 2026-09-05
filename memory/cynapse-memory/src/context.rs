@@ -19,7 +19,7 @@ const CORE_NODE_BUDGET: f64 = 0.40;
 const MAX_CANDIDATES: usize = 50;
 
 /// Core identity nodes always included first.
-const CORE_IDS: [&str; 4] = ["identity", "soul", "agents", "tools"];
+const CORE_IDS: [&str; 5] = ["identity", "cynapse_core", "soul", "agents", "tools"];
 
 struct ContextInner {
     graph: Arc<Dendrite>,
@@ -118,6 +118,18 @@ impl DendriteContext {
     }
 }
 
+fn clean_node_content(content: &str) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Target:") || trimmed.starts_with("Linked:") {
+            continue;
+        }
+        lines.push(line);
+    }
+    lines.join("\n").trim().to_string()
+}
+
 fn assemble(inner: &ContextInner, user_message: &str, max_tokens: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut used: usize = 0;
@@ -129,7 +141,11 @@ fn assemble(inner: &ContextInner, user_message: &str, max_tokens: usize) -> Stri
             Some(n) => n,
             None => continue,
         };
-        let part = format!("## {}\n\n{}", node.title, node.content);
+        let cleaned = clean_node_content(&node.content);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let part = format!("## {}\n\n{}", node.title, cleaned);
         let cost = estimate_tokens(&part);
         if used + cost > core_budget {
             break;
@@ -139,14 +155,18 @@ fn assemble(inner: &ContextInner, user_message: &str, max_tokens: usize) -> Stri
     }
 
     if !user_message.trim().is_empty() {
-        // Conversation-relevant nodes.
+        // Conversation-relevant nodes (excluding TurnLogs to avoid prompt pollution).
         let candidates = find_relevant(inner, user_message);
         let scored = score(&candidates, user_message);
         for (node, _score) in scored {
-            if CORE_IDS.contains(&node.id.as_str()) {
-                continue; // already included
+            if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
+                continue; // Skip core (already added) and ephemeral turn logs
             }
-            let part = format!("## {}\n\n{}", node.title, node.content);
+            let cleaned = clean_node_content(&node.content);
+            if cleaned.is_empty() {
+                continue;
+            }
+            let part = format!("## {}\n\n{}", node.title, cleaned);
             let cost = estimate_tokens(&part);
             if used + cost > max_tokens {
                 break;
@@ -157,10 +177,14 @@ fn assemble(inner: &ContextInner, user_message: &str, max_tokens: usize) -> Stri
     } else {
         // No message context: recently updated non-core nodes.
         for node in inner.graph.all() {
-            if CORE_IDS.contains(&node.id.as_str()) {
+            if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
                 continue;
             }
-            let part = format!("## {}\n\n{}", node.title, node.content);
+            let cleaned = clean_node_content(&node.content);
+            if cleaned.is_empty() {
+                continue;
+            }
+            let part = format!("## {}\n\n{}", node.title, cleaned);
             let cost = estimate_tokens(&part);
             if used + cost > max_tokens {
                 break;
@@ -172,13 +196,15 @@ fn assemble(inner: &ContextInner, user_message: &str, max_tokens: usize) -> Stri
 
     let prompt = parts.join("\n\n");
     format!(
-        "{prompt}\n\n## System Instructions & Protocol\n\
+        "=== CYNAPSE SYSTEM PRESET ===\n\
         1. You are CYNAPSE — a local-first, modular, precise AI companion.\n\
         2. Lead with the answer or immediate action on line 1. No greetings, preambles, or 'Great question!' openers.\n\
         3. Number multi-step tasks clearly. Cap lists at maximum 5 items.\n\
         4. End with exactly one concrete next action. No closers like 'Hope this helps!' or 'Let me know if you need anything else'.\n\
         5. State cause and fix directly for errors. Be concise and brief.\n\
-        6. Never repeat system headers, section dividers, or internal tokens. Stop generation immediately when the response is complete."
+        6. Never repeat system headers, section dividers, or internal tokens. Stop generation immediately when the response is complete.\n\n\
+        === DENDRITE KNOWLEDGE CONTEXT ===\n\
+        {prompt}"
     )
 }
 
@@ -246,6 +272,7 @@ type ScoredNode = (Node, f64);
 
 fn score(nodes: &[Node], query: &str) -> Vec<ScoredNode> {
     let q = query.to_lowercase();
+    let query_words: Vec<&str> = q.split_whitespace().filter(|w| !is_stop_word(w)).collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -254,31 +281,40 @@ fn score(nodes: &[Node], query: &str) -> Vec<ScoredNode> {
     let mut scored: Vec<ScoredNode> = nodes
         .iter()
         .map(|n| {
-            let mut s = 0.0;
+            let mut bm25_score = 0.0;
 
             if n.title.to_lowercase().contains(&q) {
-                s += 15.0;
+                bm25_score += 15.0;
             }
-            s += count_occurrences(&n.content.to_lowercase(), &q) as f64 * 2.0;
-
-            // Recency boost (linear decay, max 5 points over 7 days).
-            let age = (now - n.updated_at) as f64 / 86400.0;
-            if age < 7.0 {
-                s += (7.0 - age) * (5.0 / 7.0);
+            for qw in &query_words {
+                if n.title.to_lowercase().contains(qw) {
+                    bm25_score += 5.0;
+                }
+                bm25_score += count_occurrences(&n.content.to_lowercase(), qw) as f64 * 2.0;
             }
 
-            // Connectivity bonus — hub nodes carry more weight.
-            s += (n.links.len() + n.backlinks.len()) as f64 * 0.3;
+            // Recency decay gamma^(delta_t) (0.95 decay per day)
+            let age_days = (now - n.updated_at).max(0) as f64 / 86400.0;
+            let recency_decay = 0.95f64.powf(age_days);
 
-            // Node type priority.
+            // Specialization index boost spec(e)
+            let spec_boost = n.spec_index() as f64;
+
+            // Final 2-tier score combining lexical BM25 + specialization + recency decay
+            let mut final_score = (bm25_score * recency_decay) + (spec_boost * 4.0);
+
+            // Connectivity bonus — hub nodes carry more weight
+            final_score += (n.links.len() + n.backlinks.len()) as f64 * 0.3;
+
+            // Node type priority
             match n.node_type {
-                NodeType::Identity => s += 10.0,
-                NodeType::Person => s += 5.0,
-                NodeType::Project => s += 3.0,
+                NodeType::Identity => final_score += 10.0,
+                NodeType::Person => final_score += 5.0,
+                NodeType::Project => final_score += 3.0,
                 _ => {}
             }
 
-            (n.clone(), s)
+            (n.clone(), final_score)
         })
         .collect();
 

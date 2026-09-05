@@ -20,4 +20,5 @@ cynapse-memory = { path = "../../memory/cynapse-memory" }
 serde = { version = "1", features = ["derive"] }
 ratatui = "0.29"
 crossterm = "0.28"
+dirs = "5"
 toml = "0.8"

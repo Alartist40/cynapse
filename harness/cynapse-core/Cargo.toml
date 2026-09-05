@@ -19,3 +19,5 @@ futures-util = "0.3"
 regex = "1"
 dirs = "6.0"
 toml = "0.8"
+cynapse-engine = { path = "../../engine/cynapse-engine" }
+cynapse-memory = { path = "../../memory/cynapse-memory" }

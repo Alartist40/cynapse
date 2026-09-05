@@ -8,6 +8,9 @@ use serde::Deserialize;
 use cynapse_engine::{query_tier1_stream, TokenType};
 use cynapse_memory::graph::{Dendrite, NodeType};
 
+use cynapse_memory::context::DendriteContext;
+use cynapse_memory::store::DendriteStore;
+
 pub mod memory_render;
 pub mod app;
 pub mod terminal;
@@ -33,6 +36,8 @@ pub struct TuiSession {
     pub active_model_path: PathBuf,
     pub tier1_endpoint: String,
     pub graph: Arc<Dendrite>,
+    pub store: Option<Arc<DendriteStore>>,
+    pub dendrite_ctx: Arc<DendriteContext>,
 }
 
 impl TuiSession {
@@ -65,12 +70,48 @@ impl TuiSession {
         }
 
         let active_model_path = models_dir.join("model.gguf");
+
+        // Initialize SQLite persistence store
+        let db_dir = PathBuf::from("data");
+        let _ = std::fs::create_dir_all(&db_dir);
+        let primary_db = db_dir.join("dendrite.db");
+
+        let store = match DendriteStore::open(&primary_db) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(_) => {
+                if let Some(home) = dirs::home_dir() {
+                    let user_db_dir = home.join(".cynapse");
+                    let _ = std::fs::create_dir_all(&user_db_dir);
+                    let user_db = user_db_dir.join("dendrite.db");
+                    DendriteStore::open(&user_db).ok().map(Arc::new)
+                } else {
+                    None
+                }
+            }
+        };
+
         let graph = Arc::new(Dendrite::new());
 
-        // Pre-populate graph with core nodes if empty
-        graph.upsert("cynapse_core", "CYNAPSE Agent Core", "Local-first modular AI agent system with Dendrite 4-tier memory graph.", NodeType::Identity, Some(vec!["#summary".into(), "#system".into()]));
-        graph.upsert("fast_tier", "Ollama/llama.cpp Fast Engine", "Tier 1 execution engine optimized for SBC hardware reaching 4.8 tok/s.", NodeType::Concept, Some(vec!["#engine".into()]));
-        graph.upsert("rust_inference", "Leafcutter Pure Rust Inference", "Tier 2 GGUF & Tier 3 Safetensors layer streaming engine written in pure Rust.", NodeType::Procedure, Some(vec!["#procedure".into()]));
+        // Hydrate stored graph nodes from SQLite DB
+        if let Some(ref st) = store {
+            let _ = st.load_all(&graph);
+        }
+
+        // Pre-populate core nodes if missing
+        if graph.get("cynapse_core").is_none() {
+            let n1 = graph.upsert("cynapse_core", "CYNAPSE Agent Core", "Local-first modular AI agent system with Dendrite 4-tier memory graph.", NodeType::Identity, Some(vec!["#summary".into(), "#system".into()]));
+            if let Some(ref st) = store { let _ = st.save(&n1); }
+        }
+        if graph.get("fast_tier").is_none() {
+            let n2 = graph.upsert("fast_tier", "Ollama/llama.cpp Fast Engine", "Tier 1 execution engine optimized for SBC hardware reaching 4.8 tok/s.", NodeType::Concept, Some(vec!["#engine".into()]));
+            if let Some(ref st) = store { let _ = st.save(&n2); }
+        }
+        if graph.get("rust_inference").is_none() {
+            let n3 = graph.upsert("rust_inference", "Leafcutter Pure Rust Inference", "Tier 2 GGUF & Tier 3 Safetensors layer streaming engine written in pure Rust.", NodeType::Procedure, Some(vec!["#procedure".into()]));
+            if let Some(ref st) = store { let _ = st.save(&n3); }
+        }
+
+        let dendrite_ctx = DendriteContext::new(graph.clone(), store.clone());
 
         let mut sess = Self {
             models_dir,
@@ -78,6 +119,8 @@ impl TuiSession {
             active_model_path,
             tier1_endpoint,
             graph,
+            store,
+            dendrite_ctx,
         };
         sess.auto_detect_model_sync();
         sess
@@ -175,6 +218,8 @@ impl TuiSession {
             self.active_model_name.clone(),
             self.tier1_endpoint.clone(),
             self.graph.clone(),
+            self.store.clone(),
+            self.dendrite_ctx.clone(),
         );
         app.run().await
     }
@@ -281,7 +326,7 @@ impl TuiSession {
                 search_status: StepStatus::Done,
                 verify_detail: "Verified graph relevance".into(),
                 verify_status: StepStatus::Done,
-                inject_detail: "Injected 3 relevant facts into prompt".into(),
+                inject_detail: "Injected relevant facts into prompt".into(),
                 inject_status: StepStatus::Done,
                 update_detail: "Streaming model output...".into(),
                 update_status: StepStatus::Running,
@@ -291,11 +336,13 @@ impl TuiSession {
             println!("\n{}", "⚙️ Generating stream...".dimmed());
             let mut current_type: Option<TokenType> = None;
 
+            let system_prompt = self.dendrite_ctx.build_prompt(trimmed, 4000);
+
             let stats_res = query_tier1_stream(
                 &self.tier1_endpoint,
                 &self.active_model_name,
                 trimmed,
-                "You are CYNAPSE — a local-first, modular, precise AI companion.",
+                &system_prompt,
                 |ttype, token| {
                     if current_type != Some(ttype) {
                         current_type = Some(ttype);

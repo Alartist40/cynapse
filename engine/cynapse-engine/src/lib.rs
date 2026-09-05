@@ -277,7 +277,6 @@ pub async fn query_tier1_stream(
         {
             if retry_res.status().is_success() {
                 res = retry_res;
-                resolved_model = model_name.to_string();
             }
         }
     }

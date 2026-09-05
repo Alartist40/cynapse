@@ -286,4 +286,11 @@ impl DendriteStore {
         })?;
         Ok(count as usize)
     }
+
+    /// Perform SQLite database integrity check via PRAGMA quick_check.
+    pub fn quick_check(&self) -> Result<String> {
+        let conn = lock_conn(&self.conn);
+        let status: String = conn.query_row("PRAGMA quick_check;", [], |r| r.get(0))?;
+        Ok(status)
+    }
 }
