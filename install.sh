@@ -4,14 +4,38 @@ set -e
 # ==============================================================================
 # 🧠 CYNAPSE - Single-Line Pure Rust Installer & Hardware Auto-Detector
 # ==============================================================================
+# Single Line Install Command:
+#   curl -fsSL https://raw.githubusercontent.com/Alartist40/cynapse/main/install.sh | bash
+# ==============================================================================
 
-CYNAPSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://github.com/Alartist40/cynapse.git"
+INSTALL_ROOT="${HOME}/.cynapse"
 BIN_DIR="${HOME}/.local/bin"
 
 echo "======================================================================"
 echo "      🧠 CYNAPSE PURE RUST SYSTEM INSTALLER & HARDWARE DETECTOR       "
 echo "======================================================================"
-echo "Installing from: ${CYNAPSE_DIR}"
+
+# Determine workspace directory
+if [ -f "Cargo.toml" ] && grep -q "cynapse" Cargo.toml 2>/dev/null; then
+    CYNAPSE_DIR="$(pwd)"
+    echo "📍 Installing from local repository checkout: ${CYNAPSE_DIR}"
+elif [ -d "${BASH_SOURCE[0]%/*}" ] && [ -f "${BASH_SOURCE[0]%/*}/Cargo.toml" ]; then
+    CYNAPSE_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
+    echo "📍 Installing from script directory: ${CYNAPSE_DIR}"
+else
+    CYNAPSE_DIR="${INSTALL_ROOT}/repo"
+    echo "📥 Remote installation detected. Preparing repository at: ${CYNAPSE_DIR}"
+    mkdir -p "${INSTALL_ROOT}"
+    if [ -d "${CYNAPSE_DIR}/.git" ]; then
+        echo "   [→] Updating existing Cynapse repository..."
+        git -C "${CYNAPSE_DIR}" fetch --all --quiet
+        git -C "${CYNAPSE_DIR}" reset --hard origin/main --quiet
+    else
+        echo "   [→] Cloning latest Cynapse repository from ${REPO_URL}..."
+        git clone --depth 1 "${REPO_URL}" "${CYNAPSE_DIR}"
+    fi
+fi
 
 # 1. Detect OS Kernel
 OS_TYPE="$(uname -s)"
@@ -54,7 +78,7 @@ echo "   - CPU Cores:   ${CPU_CORES} logical cores"
 echo "   - System RAM:  ${TOTAL_RAM_GB} GB RAM"
 echo "   - Accelerator: ${GPU_TYPE}"
 
-# 4. Check for Rust Cargo Build System
+# 4. Check for Rust Cargo Build System & Auto-Install
 echo ""
 echo "🔍 Toolchain Check:"
 
@@ -62,22 +86,31 @@ if command -v cargo &>/dev/null; then
     RUST_VER="$(cargo --version | head -n1)"
     echo "   [✓] Rust Cargo: ${RUST_VER}"
 else
-    echo "   [!] Rust Cargo not found. Please install Rust from https://rustup.rs"
-    exit 1
+    echo "   [!] Rust Cargo not found. Installing Rust toolchain via rustup..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    else
+        echo "ERROR: Need curl or wget to install Rust."
+        exit 1
+    fi
+    . "${HOME}/.cargo/env"
 fi
 
 # 5. Build Standalone Pure Rust Cynapse Release Binary
 echo ""
 echo "⚙️ Building Standalone Pure Rust Cynapse Binary (cargo build --release)..."
 
-mkdir -p "${CYNAPSE_DIR}/models" "${CYNAPSE_DIR}/data" "${BIN_DIR}"
+mkdir -p "${CYNAPSE_DIR}/models" "${CYNAPSE_DIR}/data" "${BIN_DIR}" "${HOME}/.cynapse/models"
 (cd "${CYNAPSE_DIR}" && cargo build --release)
 
 # 6. Install Release Executable into User PATH
 RELEASE_BIN="${CYNAPSE_DIR}/target/release/cynapse"
 
 if [ -f "${RELEASE_BIN}" ]; then
-    cp -f "${RELEASE_BIN}" "${BIN_DIR}/cynapse"
+    rm -f "${BIN_DIR}/cynapse"
+    cp "${RELEASE_BIN}" "${BIN_DIR}/cynapse"
     chmod +x "${BIN_DIR}/cynapse"
     echo "   [✓] Installed release binary to ${BIN_DIR}/cynapse"
 else
@@ -85,14 +118,28 @@ else
     exit 1
 fi
 
+# 7. Run Cynapse Doctor Self-Healing Initializer
+echo ""
+echo "🩺 Initializing Cynapse Doctor Self-Healing Subsystem..."
+"${BIN_DIR}/cynapse" doctor --fix || true
+
 echo ""
 echo "======================================================================"
 echo "🎉 CYNAPSE INSTALLATION COMPLETE (PURE RUST - ZERO NODE/PYTHON)!"
 echo "======================================================================"
 echo "Global launcher installed to: ${BIN_DIR}/cynapse"
+
+if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
+    echo ""
+    echo "⚠️  ${BIN_DIR} is not in your current PATH."
+    echo "    Add this line to your ~/.bashrc or ~/.zshrc:"
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+fi
+
 echo ""
 echo "Quick Start Commands:"
 echo "  1. Start Interactive Cynapse TUI: cynapse"
-echo "  2. List Downloaded Models:         cynapse list"
-echo "  3. Test Semantic Router:           cynapse route"
+echo "  2. Download Hardware Model:       cynapse pull"
+echo "  3. Run Self-Healing Doctor:       cynapse doctor"
+echo "  4. View 3D Memory Atlas:         cynapse memory"
 echo ""

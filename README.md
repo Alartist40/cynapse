@@ -105,18 +105,16 @@
 - Linux / macOS / Windows
 - Rust 1.75+ toolchain (`cargo`, `rustc`)
 
-### Quick Install
+### One-Line Automatic Install (Linux / macOS)
+```bash
+curl -fsSL https://raw.githubusercontent.com/Alartist40/cynapse/main/install.sh | bash
+```
+
+### Manual Install from Source
 ```bash
 git clone https://github.com/Alartist40/cynapse.git
 cd cynapse
-cargo build --release
 ./install.sh
-```
-
-Or build manually:
-```bash
-cargo build --release
-cp target/release/cynapse ~/.local/bin/cynapse
 ```
 
 ---
