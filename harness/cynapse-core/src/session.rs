@@ -55,7 +55,19 @@ impl SessionManager {
     pub fn save_session(&self, data: &SessionData) -> Result<()> {
         fs::create_dir_all(&self.storage_dir)?;
         let file_path = self.storage_dir.join(format!("{}.json", data.session_id));
-        let content = serde_json::to_string_pretty(data)?;
+        let mut data_to_save = data.clone();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if data_to_save.created_at == 0 {
+            if let Ok(existing) = self.load_session(&data.session_id) {
+                data_to_save.created_at = if existing.created_at != 0 { existing.created_at } else { now };
+            } else {
+                data_to_save.created_at = now;
+            }
+        }
+        if data_to_save.updated_at == 0 {
+            data_to_save.updated_at = now;
+        }
+        let content = serde_json::to_string_pretty(&data_to_save)?;
         fs::write(&file_path, content)
             .with_context(|| format!("Failed to save session data to {}", file_path.display()))?;
         Ok(())

@@ -145,14 +145,14 @@ async fn main() -> Result<()> {
                 session.active_model_name = t;
             }
             if cli.cli {
-                session.run_cli_loop().await?;
+                session.run_cli_loop_with_resume(cli.resume.as_deref()).await?;
             } else {
                 session.run_tui_app_with_resume(cli.resume.as_deref()).await?;
             }
         }
         None => {
             if cli.cli {
-                session.run_cli_loop().await?;
+                session.run_cli_loop_with_resume(cli.resume.as_deref()).await?;
             } else {
                 session.run_tui_app_with_resume(cli.resume.as_deref()).await?;
             }

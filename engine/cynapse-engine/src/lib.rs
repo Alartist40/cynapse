@@ -277,12 +277,20 @@ pub async fn query_tier1_stream(
         match req_builder.send().await {
             Ok(resp) if resp.status().is_success() => break resp,
             Ok(resp) if resp.status().is_server_error() && attempt < max_attempts => {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let jitter = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0) % 100) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms + jitter)).await;
                 delay_ms *= 2;
             }
             Ok(resp) => break resp,
             Err(_err) if attempt < max_attempts => {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let jitter = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0) % 100) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms + jitter)).await;
                 delay_ms *= 2;
             }
             Err(err) => {

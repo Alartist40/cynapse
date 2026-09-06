@@ -71,24 +71,20 @@ impl TuiSession {
 
         let active_model_path = models_dir.join("model.gguf");
 
-        // Initialize SQLite persistence store
-        let db_dir = PathBuf::from("data");
-        let _ = std::fs::create_dir_all(&db_dir);
-        let primary_db = db_dir.join("dendrite.db");
-
-        let store = match DendriteStore::open(&primary_db) {
-            Ok(s) => Some(Arc::new(s)),
-            Err(_) => {
-                if let Some(home) = dirs::home_dir() {
-                    let user_db_dir = home.join(".cynapse");
-                    let _ = std::fs::create_dir_all(&user_db_dir);
-                    let user_db = user_db_dir.join("dendrite.db");
-                    DendriteStore::open(&user_db).ok().map(Arc::new)
-                } else {
-                    None
-                }
-            }
-        };
+        // Initialize SQLite persistence store: check ~/.cynapse/dendrite.db FIRST
+        let store = if let Some(home) = dirs::home_dir() {
+            let user_db_dir = home.join(".cynapse");
+            let _ = std::fs::create_dir_all(&user_db_dir);
+            let user_db = user_db_dir.join("dendrite.db");
+            DendriteStore::open(&user_db).ok().map(Arc::new)
+        } else {
+            None
+        }.or_else(|| {
+            let db_dir = PathBuf::from("data");
+            let _ = std::fs::create_dir_all(&db_dir);
+            let primary_db = db_dir.join("dendrite.db");
+            DendriteStore::open(&primary_db).ok().map(Arc::new)
+        });
 
         let graph = Arc::new(Dendrite::new());
 
@@ -239,6 +235,20 @@ impl TuiSession {
     }
 
     pub async fn run_cli_loop(&mut self) -> Result<()> {
+        self.run_cli_loop_with_resume(None).await
+    }
+
+    pub async fn run_cli_loop_with_resume(&mut self, resume_id: Option<&str>) -> Result<()> {
+        if let Some(sid) = resume_id {
+            let session_mgr = cynapse_core::session::SessionManager::new();
+            if let Ok(data) = session_mgr.load_session(sid) {
+                println!("{}", format!("Resuming past CLI session transcript: {}", sid).cyan().bold());
+                for msg in &data.messages {
+                    println!("[{}] {}", msg.role.yellow(), msg.content);
+                }
+                println!("{}", "----------------------------------------------------------------------".cyan());
+            }
+        }
         self.run_interactive_loop().await
     }
 

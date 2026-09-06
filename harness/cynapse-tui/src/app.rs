@@ -183,6 +183,7 @@ pub struct TuiApp {
     pub galaxy_auto_spin: bool,
     pub show_thinking: bool,
     pub loop_guard: LoopGuard,
+    pub agent_step_count: usize,
 
     // Model Downloader state
     pub puller_step: PullerStep,
@@ -250,6 +251,7 @@ impl TuiApp {
             galaxy_pitch: 0.3,
             galaxy_auto_spin: true,
             loop_guard: LoopGuard::default(),
+            agent_step_count: 0,
             puller_step: PullerStep::CuratedList,
             selected_pull_idx: 0,
             custom_pull_url: String::new(),
@@ -990,6 +992,7 @@ impl TuiApp {
                                     thinking: None,
                                 });
 
+                                self.agent_step_count = 0;
                                 self.is_generating = true;
                                 self.current_thinking_buf.clear();
                                 self.current_response_buf.clear();
@@ -1076,63 +1079,78 @@ impl TuiApp {
                     self.last_latency_sec = elapsed_sec;
 
                     let mut triggered_reprompt = false;
+                    const MAX_AGENT_STEPS: usize = 5;
 
                     // Offline Agent: GBNF tool call check & circular LoopGuard intervention
                     if let Ok(tool_call) = validate_gbnf_tool_call(&self.current_response_buf) {
-                        match self.loop_guard.record_and_check(&tool_call) {
-                            Ok(()) => {
-                                let (tool_output, ok) = self.execute_tool_and_format(&tool_call);
-                                self.messages.push(ChatMessage {
-                                    role: "system".into(),
-                                    content: format!("🔧 Tool Call [{}] Executed:\n{}", tool_call.name, tool_output),
-                                    thinking: None,
-                                });
+                        if self.agent_step_count >= MAX_AGENT_STEPS {
+                            self.messages.push(ChatMessage {
+                                role: "system".into(),
+                                content: format!("⚠️ MAX AGENT STEPS REACHED ({} steps): Automated tool execution loop paused to prevent runaway execution.", MAX_AGENT_STEPS),
+                                thinking: None,
+                            });
+                        } else {
+                            match self.loop_guard.record_and_check(&tool_call) {
+                                Ok(()) => {
+                                    self.agent_step_count += 1;
+                                    let (tool_output, ok) = self.execute_tool_and_format(&tool_call);
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: format!("🔧 Tool Call [{}] Executed (Step {}/{}):\n{}", tool_call.name, self.agent_step_count, MAX_AGENT_STEPS, tool_output),
+                                        thinking: None,
+                                    });
 
-                                if ok {
-                                    triggered_reprompt = true;
-                                    let (tx, rx) = mpsc::unbounded_channel();
-                                    self.stream_rx = Some(rx);
-                                    self.is_generating = true;
-                                    self.current_thinking_buf.clear();
-                                    self.current_response_buf.clear();
+                                    if ok {
+                                        triggered_reprompt = true;
+                                        let (tx, rx) = mpsc::unbounded_channel();
+                                        self.stream_rx = Some(rx);
+                                        self.is_generating = true;
+                                        self.current_thinking_buf.clear();
+                                        self.current_response_buf.clear();
 
-                                    let system_prompt = self.dendrite_ctx.build_prompt(&tool_output, 4000);
-                                    let endpoint = self.tier1_endpoint.clone();
-                                    let model_name = self.active_model_name.clone();
-                                    let prompt = format!("Tool Result for {}:\n{}\n\nContinue resolution.", tool_call.name, tool_output);
+                                        let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
+                                        let system_prompt = self.dendrite_ctx.build_prompt(&tool_output, 4000);
+                                        let endpoint = self.tier1_endpoint.clone();
+                                        let model_name = self.active_model_name.clone();
+                                        let prompt = if user_msg.is_empty() {
+                                            format!("Tool Result for {}:\n{}\n\nContinue resolution.", tool_call.name, tool_output)
+                                        } else {
+                                            format!("User Request: {}\n\nTool Result for {}:\n{}\n\nContinue resolution.", user_msg, tool_call.name, tool_output)
+                                        };
 
-                                    tokio::spawn(async move {
-                                        let res = query_tier1_stream(
-                                            &endpoint,
-                                            &model_name,
-                                            &prompt,
-                                            &system_prompt,
-                                            |ttype, token| {
-                                                let _ = tx.send(StreamEvent::Token { ttype, text: token.to_string() });
-                                            },
-                                        )
-                                        .await;
+                                        tokio::spawn(async move {
+                                            let res = query_tier1_stream(
+                                                &endpoint,
+                                                &model_name,
+                                                &prompt,
+                                                &system_prompt,
+                                                |ttype, token| {
+                                                    let _ = tx.send(StreamEvent::Token { ttype, text: token.to_string() });
+                                                },
+                                            )
+                                            .await;
 
-                                        match res {
-                                            Ok(stats) => {
-                                                let _ = tx.send(StreamEvent::Done {
-                                                    tok_per_sec: stats.tok_per_sec,
-                                                    elapsed_sec: stats.elapsed_sec,
-                                                });
+                                            match res {
+                                                Ok(stats) => {
+                                                    let _ = tx.send(StreamEvent::Done {
+                                                        tok_per_sec: stats.tok_per_sec,
+                                                        elapsed_sec: stats.elapsed_sec,
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(StreamEvent::Error(e.to_string()));
+                                                }
                                             }
-                                            Err(e) => {
-                                                let _ = tx.send(StreamEvent::Error(e.to_string()));
-                                            }
-                                        }
+                                        });
+                                    }
+                                }
+                                Err(loop_warn) => {
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: loop_warn,
+                                        thinking: None,
                                     });
                                 }
-                            }
-                            Err(loop_warn) => {
-                                self.messages.push(ChatMessage {
-                                    role: "system".into(),
-                                    content: loop_warn,
-                                    thinking: None,
-                                });
                             }
                         }
                     }
@@ -1223,13 +1241,18 @@ impl TuiApp {
 
     fn scan_models_sync(&self) -> Vec<ModelItem> {
         let mut items = Vec::new();
-        let re = regex::Regex::new(r"(?i)(Q[0-9]_[K0-9_A-Z]+|F16|F32|IQ[0-9]_[A-Z]+)").unwrap();
+        static GGUF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = GGUF_RE.get_or_init(|| {
+            regex::Regex::new(r"(?i)(Q[0-9]_[K0-9_A-Z]+|F16|F32|IQ[0-9]_[A-Z]+)").unwrap()
+        });
 
-        let search_dirs = [
+        let mut search_dirs = vec![
             self.models_dir.clone(),
-            PathBuf::from("/home/xander/Documents/portfolio/cynapse-mini/models"),
             PathBuf::from("./models"),
         ];
+        if let Some(home) = dirs::home_dir() {
+            search_dirs.push(home.join(".cynapse").join("models"));
+        }
 
         for dir in &search_dirs {
             if let Ok(entries) = fs::read_dir(dir) {
