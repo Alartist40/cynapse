@@ -48,6 +48,14 @@ pub struct ReflectionWorker {
     in_flight: Arc<AtomicBool>,
 }
 
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl ReflectionWorker {
     pub fn new(
         graph: Arc<Dendrite>,
@@ -80,8 +88,8 @@ impl ReflectionWorker {
         let in_flight = self.in_flight.clone();
 
         tokio::spawn(async move {
+            let _guard = InFlightGuard(in_flight);
             let _ = Self::do_reflection(graph, store, &messages).await;
-            in_flight.store(false, Ordering::SeqCst);
         });
     }
 

@@ -362,18 +362,13 @@ impl Dendrite {
     /// Delete a node and clean up all references.
     pub fn delete(&self, id: &str) -> bool {
         let mut inner = lock_inner(&self.inner);
-        let node = match inner.nodes.get(id) {
-            Some(n) => n.clone(),
-            None => return false,
-        };
-
-        for link in &node.links {
-            if let Some(target) = inner.nodes.get_mut(link) {
-                target.backlinks = remove_str(&target.backlinks, id);
-            }
+        if !inner.nodes.contains_key(id) {
+            return false;
         }
+
         for n in inner.nodes.values_mut() {
             n.links = remove_str(&n.links, id);
+            n.backlinks = remove_str(&n.backlinks, id);
         }
 
         inner.nodes.remove(id);
@@ -443,41 +438,35 @@ impl Dendrite {
             return Vec::new();
         }
 
-        // Compute document frequency for each query token (how many docs contain it).
+        // Single-pass doc_text pre-computation and doc_freq accumulation
+        let mut docs: Vec<(&Node, String, f32)> = Vec::with_capacity(inner.nodes.len());
         let mut doc_freq: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut total_len_sum = 0.0f32;
+
         for node in inner.nodes.values() {
             let doc_text = format!("{} {} {}", node.title, node.content, node.tags.join(" ")).to_lowercase();
+            let doc_len = doc_text.len() as f32;
+            total_len_sum += doc_len;
+
             for token in &query_tokens {
                 if doc_text.contains(token) {
                     *doc_freq.entry(token.clone()).or_insert(0.0) += 1.0;
                 }
             }
+            docs.push((node, doc_text, doc_len));
         }
 
-        let mut scored: Vec<(Node, f32)> = Vec::new();
+        let avg_len = total_len_sum / total_docs.max(1.0);
         let k1 = 1.2f32;
         let b = 0.75f32;
+        let mut scored: Vec<(Node, f32)> = Vec::new();
 
-        let avg_len = inner
-            .nodes
-            .values()
-            .map(|n| {
-                let doc_text = format!("{} {} {}", n.title, n.content, n.tags.join(" "));
-                doc_text.len() as f32
-            })
-            .sum::<f32>()
-            / total_docs.max(1.0);
-
-        for node in inner.nodes.values() {
-            let doc_text = format!("{} {} {}", node.title, node.content, node.tags.join(" ")).to_lowercase();
-            let doc_len = doc_text.len() as f32;
+        for (node, doc_text, doc_len) in docs {
             let mut score = 0.0f32;
-
             for token in &query_tokens {
                 let count = doc_text.matches(token).count() as f32;
                 if count > 0.0 {
                     let df = doc_freq.get(token).copied().unwrap_or(0.0);
-                    // Standard BM25 IDF: ln((N - df + 0.5) / (df + 0.5))
                     let idf = ((total_docs - df + 0.5) / (df + 0.5)).max(0.0001).ln();
                     let tf = (count * (k1 + 1.0)) / (count + k1 * (1.0 - b + b * (doc_len / avg_len.max(1.0))));
                     score += idf * tf;

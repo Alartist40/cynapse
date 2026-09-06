@@ -348,7 +348,7 @@ pub async fn query_tier1_stream(
     let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
 
     Ok(ExecutionStats {
-        model_name: model_name.to_string(),
+        model_name: resolved_model,
         tokens_generated,
         elapsed_sec,
         tok_per_sec,

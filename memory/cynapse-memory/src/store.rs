@@ -222,28 +222,50 @@ impl DendriteStore {
         Ok(())
     }
 
+    /// Escape user input into safe FTS5 match tokens.
+    pub fn escape_fts5_query(query: &str) -> String {
+        let clean: String = query
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == ' ' { c } else { ' ' })
+            .collect();
+        let words: Vec<&str> = clean.split_whitespace().collect();
+        if words.is_empty() {
+            return String::new();
+        }
+        words
+            .iter()
+            .map(|w| format!("\"{}\"", w))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Full-text search, returning matching node IDs ordered by rank.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<String>> {
-        let limit = if limit <= 0 { 10 } else { limit };
+        let limit = if limit == 0 { 10 } else { limit };
         let conn = lock_conn(&self.conn);
 
         if self.has_fts {
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT id FROM dendrite_fts
-                WHERE dendrite_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![query, limit as i64], |row| row.get(0))?;
-            let mut ids = Vec::new();
-            for row in rows {
-                if let Ok(id) = row {
-                    ids.push(id);
+            let safe_query = Self::escape_fts5_query(query);
+            if !safe_query.is_empty() {
+                if let Ok(mut stmt) = conn.prepare(
+                    r#"
+                    SELECT id FROM dendrite_fts
+                    WHERE dendrite_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    "#,
+                ) {
+                    if let Ok(rows) = stmt.query_map(params![safe_query, limit as i64], |row| row.get(0)) {
+                        let mut ids = Vec::new();
+                        for row in rows.flatten() {
+                            ids.push(row);
+                        }
+                        if !ids.is_empty() {
+                            return Ok(ids);
+                        }
+                    }
                 }
             }
-            return Ok(ids);
         }
 
         // Fallback: LIKE-based search across title/content/tags.
