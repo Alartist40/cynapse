@@ -227,8 +227,8 @@ pub fn q4_k_matmul_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usiz
     // For large matrices, parallelize over output columns into a flat
     // per-column buffer (no Vec<Vec<f32>> allocation churn), then scatter
     // into the row-major output. Each column j owns a contiguous m-slice.
-    // Threshold: n >= 4096 ensures enough work per thread to amortize Rayon overhead.
-    if n >= 4096 {
+    // Threshold: n >= 256 ensures Rayon multi-core parallelism across all GEMV layer sizes.
+    if n >= 256 {
         use rayon::prelude::*;
         let mut col_results = vec![0.0f32; n * m];
         col_results.par_chunks_mut(m).enumerate().for_each(|(j, col)| {
@@ -377,7 +377,7 @@ pub fn q4_k_gemv_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], k: usize,
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
 
-    if n >= 4096 {
+    if n >= 256 {
         use rayon::prelude::*;
         #[cfg(target_arch = "x86_64")]
         if use_avx2 {

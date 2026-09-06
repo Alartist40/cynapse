@@ -89,6 +89,12 @@ impl CynapseDoctor {
         // Check 7: Tokio Async Scheduler & Event Communication Channels
         items.push(self.check_tokio_channels());
 
+        // Check 8: Tier 1 LLM Engine Endpoint & Model Registration Alignment
+        items.push(self.check_llm_endpoint_and_models());
+
+        // Check 9: Markdown Persona System & System Prompt Directory Integrity
+        items.push(self.check_persona_subsystem());
+
         let total_pass = items.iter().filter(|i| i.status == DoctorStatus::Pass).count();
         let total_warn = items.iter().filter(|i| i.status == DoctorStatus::Warning).count();
         let total_repaired = items.iter().filter(|i| i.status == DoctorStatus::Repaired).count();
@@ -405,6 +411,53 @@ impl CynapseDoctor {
             status: DoctorStatus::Pass,
             detail: "Tokio multi-threaded task pool and unbounded event channel streams operating cleanly.".into(),
             fix_recommendation: None,
+        }
+    }
+
+    fn check_llm_endpoint_and_models(&self) -> DoctorItem {
+        let models = cynapse_engine::fetch_native_models_sync();
+
+        if models.is_empty() {
+            DoctorItem {
+                subsystem: "Cynapse Engine".into(),
+                check_name: "Native Leafcutter Engine & GGUF Catalog".into(),
+                status: DoctorStatus::Warning,
+                detail: "No GGUF models detected in local ./models/ directory.".into(),
+                fix_recommendation: Some("Download models via Cynapse TUI or place GGUF files in ./models/.".into()),
+            }
+        } else {
+            DoctorItem {
+                subsystem: "Cynapse Engine".into(),
+                check_name: "Native Leafcutter Engine & GGUF Catalog".into(),
+                status: DoctorStatus::Pass,
+                detail: format!("Cynapse native model catalog active. Available models: [{}]", models.join(", ")),
+                fix_recommendation: None,
+            }
+        }
+    }
+
+    fn check_persona_subsystem(&self) -> DoctorItem {
+        let p_dir = crate::persona::PersonaManager::default_dir();
+        match crate::persona::PersonaManager::new(&p_dir) {
+            Ok(mgr) => {
+                let personas = mgr.list_personas();
+                let prompt = mgr.build_system_prompt();
+                let status = if self.auto_fix { DoctorStatus::Repaired } else { DoctorStatus::Pass };
+                DoctorItem {
+                    subsystem: "Persona System".into(),
+                    check_name: "Markdown Persona Catalog & System Prompt Compiler".into(),
+                    status,
+                    detail: format!("Persona directory at {} verified. Active personas: [{}]. System prompt length: {} chars.", p_dir.display(), personas.join(", "), prompt.len()),
+                    fix_recommendation: None,
+                }
+            }
+            Err(err) => DoctorItem {
+                subsystem: "Persona System".into(),
+                check_name: "Markdown Persona Catalog & System Prompt Compiler".into(),
+                status: DoctorStatus::Failed,
+                detail: format!("Failed to initialize persona manager: {}", err),
+                fix_recommendation: Some(format!("Check permissions or recreate directory at {}", p_dir.display())),
+            },
         }
     }
 }

@@ -185,7 +185,7 @@ pub fn q5_k_matmul_transposed_b(a: &[f32], b: &Q5KMatrix, c: &mut [f32], m: usiz
         }
     };
 
-    if n >= 4096 {
+    if n >= 256 {
         use rayon::prelude::*;
         let col_results: Vec<Vec<f32>> = (0..n)
             .into_par_iter()

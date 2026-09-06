@@ -102,7 +102,7 @@ fi
 echo ""
 echo "⚙️ Building Standalone Pure Rust Cynapse Binary (cargo build --release)..."
 
-mkdir -p "${CYNAPSE_DIR}/models" "${CYNAPSE_DIR}/data" "${BIN_DIR}" "${HOME}/.cynapse/models"
+mkdir -p "${CYNAPSE_DIR}/models" "${CYNAPSE_DIR}/data" "${BIN_DIR}" "${HOME}/.cynapse/models" "${HOME}/.cynapse/persona"
 (cd "${CYNAPSE_DIR}" && cargo build --release)
 
 # 6. Install Release Executable into User PATH

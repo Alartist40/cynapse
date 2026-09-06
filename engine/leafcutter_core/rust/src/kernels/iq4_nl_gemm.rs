@@ -185,7 +185,7 @@ pub fn iq4_nl_matmul_transposed_b(a: &[f32], b: &IQ4NLMatrix, c: &mut [f32], m: 
     };
 
     // For large matrices, parallelize over output columns.
-    if n >= 4096 {
+    if n >= 256 {
         use rayon::prelude::*;
         let col_results: Vec<Vec<f32>> = (0..n)
             .into_par_iter()

@@ -7,6 +7,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -25,7 +26,7 @@ impl TuiRuntimeGuard {
         RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
 
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
         Ok(Self { _private: () })
     }
@@ -42,7 +43,7 @@ impl TuiRuntimeGuard {
         if RAW_MODE_ACTIVE.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             let _ = disable_raw_mode();
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
         }
     }
 }

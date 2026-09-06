@@ -5,7 +5,7 @@ name = "cynapse"
 version = "0.1.0"
 
 [engine]
-tier1_endpoint = "http://127.0.0.1:11434"
+tier1_endpoint = "http://127.0.0.1:11435"
 default_model = "ministral-3:3b"
 memory_headroom_mb = 1536
 

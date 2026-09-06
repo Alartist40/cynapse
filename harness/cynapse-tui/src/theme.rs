@@ -145,10 +145,10 @@ impl AppTheme {
     // Autocomplete Dropdown Selection Highlight
     pub fn highlight_item(&self) -> Style {
         match self {
-            AppTheme::DarkSlate => Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-            AppTheme::Cyberpunk => Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD),
-            AppTheme::AmberCRT => Style::default().fg(Color::Black).bg(Color::Rgb(255, 191, 0)).add_modifier(Modifier::BOLD),
-            AppTheme::EmeraldMatrix => Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD),
+            AppTheme::DarkSlate => Style::default().fg(Color::Rgb(15, 15, 15)).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            AppTheme::Cyberpunk => Style::default().fg(Color::Rgb(15, 15, 15)).bg(Color::Magenta).add_modifier(Modifier::BOLD),
+            AppTheme::AmberCRT => Style::default().fg(Color::Rgb(15, 15, 15)).bg(Color::Rgb(255, 191, 0)).add_modifier(Modifier::BOLD),
+            AppTheme::EmeraldMatrix => Style::default().fg(Color::Rgb(15, 15, 15)).bg(Color::Green).add_modifier(Modifier::BOLD),
         }
     }
 }

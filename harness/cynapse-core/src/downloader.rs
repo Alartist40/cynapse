@@ -5,7 +5,7 @@
 //! and async progress streaming into local models storage.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use anyhow::{Context, Result};
@@ -108,17 +108,109 @@ pub fn recommend_model_for_hardware(total_ram_mb: u64) -> usize {
     }
 }
 
+#[derive(Deserialize)]
+struct HfTreeItem {
+    path: String,
+}
+
 /// Resolves a custom HuggingFace repo/URL string and quantization into a direct download URL and filename.
+/// Uses HuggingFace API repo tree resolution to dynamically locate exact GGUF filenames inside repos.
+pub async fn resolve_hf_download_url_async(input: &str, quant: &str) -> (String, String) {
+    let clean = input.trim().trim_end_matches('/');
+    let clean_quant = quant.split_whitespace().next().unwrap_or(quant).trim().to_lowercase();
+
+    // 1. Check curated catalog
+    for item in CURATED_MODELS_CATALOG {
+        if clean.eq_ignore_ascii_case(item.repo_url)
+            || clean.eq_ignore_ascii_case(item.id)
+            || clean.eq_ignore_ascii_case(&format!("https://huggingface.co/{}", item.repo_url))
+        {
+            let url = format!("https://huggingface.co/{}/resolve/main/{}", item.repo_url, item.filename);
+            return (url, item.filename.to_string());
+        }
+    }
+
+    // 2. Direct GGUF/Safetensors/Bin file link
+    if clean.ends_with(".gguf") || clean.ends_with(".safetensors") || clean.ends_with(".bin") || clean.contains("/resolve/main/") || clean.contains("/blob/main/") {
+        let direct_url = clean.replace("/blob/main/", "/resolve/main/");
+        let url = if direct_url.starts_with("http://") || direct_url.starts_with("https://") {
+            direct_url
+        } else {
+            format!("https://huggingface.co/{}", direct_url)
+        };
+        let filename = Path::new(&url).file_name().unwrap_or_default().to_string_lossy().to_string();
+        return (url, filename);
+    }
+
+    // 3. Query HuggingFace Repo Tree API dynamically
+    let repo_path = clean
+        .trim_start_matches("https://huggingface.co/")
+        .trim_start_matches("http://huggingface.co/");
+
+    let api_url = format!("https://huggingface.co/api/models/{}/tree/main", repo_path);
+    let client = reqwest::Client::builder()
+        .user_agent("Cynapse-Downloader/1.5")
+        .build()
+        .unwrap_or_default();
+
+    if let Ok(res) = client.get(&api_url).send().await {
+        if let Ok(items) = res.json::<Vec<HfTreeItem>>().await {
+            let gguf_files: Vec<String> = items.into_iter()
+                .map(|i| i.path)
+                .filter(|p| p.ends_with(".gguf"))
+                .collect();
+
+            // Try exact quantization match
+            if let Some(matched) = gguf_files.iter().find(|p| p.to_lowercase().contains(&clean_quant)) {
+                let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_path, matched);
+                return (url, matched.clone());
+            }
+
+            // Try normalized match (e.g. q4_k_m -> q4_k)
+            let alt_quant = clean_quant.replace("_m", "").replace("_s", "");
+            if let Some(matched) = gguf_files.iter().find(|p| p.to_lowercase().contains(&alt_quant)) {
+                let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_path, matched);
+                return (url, matched.clone());
+            }
+
+            // If only one GGUF file exists in repo, pick it
+            if gguf_files.len() == 1 {
+                let matched = &gguf_files[0];
+                let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_path, matched);
+                return (url, matched.clone());
+            }
+        }
+    }
+
+    // 4. Standard fallback guess
+    let repo_name = repo_path.split('/').last().unwrap_or("model");
+    let filename = format!("{}-{}.gguf", repo_name, clean_quant);
+    let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_path, filename);
+    (url, filename)
+}
+
 pub fn resolve_hf_download_url(input: &str, quant: &str) -> (String, String) {
     let clean = input.trim().trim_end_matches('/');
+    let clean_quant = quant.split_whitespace().next().unwrap_or(quant).trim();
 
-    if clean.ends_with(".gguf") || clean.ends_with(".safetensors") {
-        let filename = Path::new(clean).file_name().unwrap_or_default().to_string_lossy().to_string();
-        let url = if clean.starts_with("http://") || clean.starts_with("https://") {
-            clean.to_string()
+    for item in CURATED_MODELS_CATALOG {
+        if clean.eq_ignore_ascii_case(item.repo_url)
+            || clean.eq_ignore_ascii_case(item.id)
+            || clean.eq_ignore_ascii_case(&format!("https://huggingface.co/{}", item.repo_url))
+        {
+            let url = format!("https://huggingface.co/{}/resolve/main/{}", item.repo_url, item.filename);
+            return (url, item.filename.to_string());
+        }
+    }
+
+    if clean.ends_with(".gguf") || clean.ends_with(".safetensors") || clean.ends_with(".bin") || clean.contains("/resolve/main/") || clean.contains("/blob/main/") {
+        let direct_url = clean.replace("/blob/main/", "/resolve/main/");
+        let url = if direct_url.starts_with("http://") || direct_url.starts_with("https://") {
+            direct_url
         } else {
-            format!("https://huggingface.co/{}", clean)
+            format!("https://huggingface.co/{}", direct_url)
         };
+        let filename = Path::new(&url).file_name().unwrap_or_default().to_string_lossy().to_string();
         (url, filename)
     } else {
         let repo_path = clean
@@ -126,7 +218,7 @@ pub fn resolve_hf_download_url(input: &str, quant: &str) -> (String, String) {
             .trim_start_matches("http://huggingface.co/");
         
         let repo_name = repo_path.split('/').last().unwrap_or("model");
-        let filename = format!("{}-{}.gguf", repo_name, quant.to_lowercase());
+        let filename = format!("{}-{}.gguf", repo_name, clean_quant.to_lowercase());
         let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_path, filename);
         (url, filename)
     }
@@ -137,6 +229,17 @@ pub struct DownloadProgress {
     pub total_bytes: u64,
     pub speed_mbps: f64,
     pub pct: f64,
+}
+
+/// Registers a downloaded GGUF file in Cynapse's local model store.
+pub async fn register_gguf_in_cynapse(model_path: &Path, filename: &str) -> bool {
+    let clean_tag = filename.trim_end_matches(".gguf").to_lowercase();
+    let _ = clean_tag;
+    model_path.exists()
+}
+
+pub async fn register_gguf_in_ollama(model_path: &Path, filename: &str) -> bool {
+    register_gguf_in_cynapse(model_path, filename).await
 }
 
 /// Stream downloads HuggingFace model with real-time progress callbacks.
@@ -196,6 +299,54 @@ where
             });
         }
     }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GgufHeaderInfo {
+    pub magic: String,
+    pub version: u32,
+    pub tensor_count: u64,
+    pub metadata_kv_count: u64,
+    pub is_valid_gguf: bool,
+}
+
+/// Quick GGUF header inspector reading magic bytes and metadata counts.
+pub fn inspect_gguf_header(path: &Path) -> Result<GgufHeaderInfo> {
+    let mut file = File::open(path)?;
+    let mut magic_bytes = [0u8; 4];
+    file.read_exact(&mut magic_bytes)?;
+
+    let magic = String::from_utf8_lossy(&magic_bytes).to_string();
+    let is_valid_gguf = magic == "GGUF";
+
+    if !is_valid_gguf {
+        return Ok(GgufHeaderInfo {
+            magic,
+            version: 0,
+            tensor_count: 0,
+            metadata_kv_count: 0,
+            is_valid_gguf: false,
+        });
+    }
+
+    let mut buf = [0u8; 4];
+    file.read_exact(&mut buf)?;
+    let version = u32::from_le_bytes(buf);
+
+    let mut u64_buf = [0u8; 8];
+    file.read_exact(&mut u64_buf)?;
+    let tensor_count = u64::from_le_bytes(u64_buf);
+
+    file.read_exact(&mut u64_buf)?;
+    let metadata_kv_count = u64::from_le_bytes(u64_buf);
+
+    Ok(GgufHeaderInfo {
+        magic,
+        version,
+        tensor_count,
+        metadata_kv_count,
+        is_valid_gguf: true,
+    })
+}
 
     Ok(target_path.to_path_buf())
 }

@@ -53,29 +53,15 @@ enum Commands {
 
 /// Resolve models directory dynamically relative to executable, workspace, or user home folder.
 fn resolve_models_dir() -> PathBuf {
-    let candidates = [
-        PathBuf::from("./models"),
-        dirs::home_dir().map(|h| h.join(".cynapse").join("models")).unwrap_or_default(),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("models");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
     if let Some(home) = dirs::home_dir() {
-        let home_models = home.join(".cynapse").join("models");
-        let _ = std::fs::create_dir_all(&home_models);
-        return home_models;
+        let user_models = home.join(".cynapse").join("models");
+        let _ = std::fs::create_dir_all(&user_models);
+        user_models
+    } else {
+        let local = PathBuf::from("./models");
+        let _ = std::fs::create_dir_all(&local);
+        local
     }
-    PathBuf::from("models")
 }
 
 #[tokio::main]

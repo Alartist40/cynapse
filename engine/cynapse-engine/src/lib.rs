@@ -126,17 +126,119 @@ pub fn probe_hardware_info() -> SystemHardwareInfo {
 }
 
 #[derive(Deserialize)]
-struct OllamaTagsResp {
-    models: Option<Vec<OllamaModelItem>>,
+struct NativeTagsResp {
+    models: Option<Vec<NativeModelItem>>,
 }
 
 #[derive(Deserialize)]
-struct OllamaModelItem {
+struct NativeModelItem {
     name: String,
 }
 
-/// Fetch list of available models from Ollama endpoint /api/tags
-pub async fn fetch_ollama_models(endpoint: &str) -> Vec<String> {
+/// Locate absolute GGUF file path on host system
+pub fn find_model_file_path(model_name: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(shellexpand::tilde(model_name).as_ref());
+    if p.exists() && p.is_file() {
+        return Some(p);
+    }
+
+    let mut dirs_to_search = vec![
+        std::path::PathBuf::from("./models"),
+        std::path::PathBuf::from("../models"),
+        std::path::PathBuf::from("models"),
+    ];
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = std::path::PathBuf::from(&home);
+        dirs_to_search.push(home_path.join(".cynapse").join("models"));
+        dirs_to_search.push(home_path.join("Downloads").join("models"));
+        dirs_to_search.push(home_path.join("Downloads"));
+    }
+
+    let lower_model = model_name.to_lowercase();
+    let stripped = lower_model.trim_end_matches(".gguf").to_string();
+
+    // 1. Exact filename match
+    for dir in &dirs_to_search {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("gguf") {
+                    if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                        let lower_fname = fname.to_lowercase();
+                        if lower_fname == lower_model {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Base name / fuzzy match
+    for dir in &dirs_to_search {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("gguf") {
+                    if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                        let lower_fname = fname.to_lowercase();
+                        let stripped_fname = lower_fname.trim_end_matches(".gguf");
+
+                        if stripped_fname == stripped
+                            || stripped_fname.contains(&stripped)
+                            || stripped.contains(stripped_fname)
+                        {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Synchronous model scanner for local GGUF models on disk (no async runtime required)
+pub fn fetch_native_models_sync() -> Vec<String> {
+    let mut models = Vec::new();
+
+    let mut search_dirs = vec![
+        Path::new("./models").to_path_buf(),
+        Path::new("../models").to_path_buf(),
+        Path::new("models").to_path_buf(),
+    ];
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = Path::new(&home);
+        search_dirs.push(home_path.join(".cynapse").join("models"));
+        search_dirs.push(home_path.join("Downloads").join("models"));
+        search_dirs.push(home_path.join("Downloads"));
+    }
+
+    for dir in &search_dirs {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("gguf") {
+                    if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+                        if !models.contains(&fname.to_string()) {
+                            models.push(fname.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    models
+}
+
+/// Fetch list of available models from Cynapse Native Engine endpoint or local GGUF directories
+pub async fn fetch_native_models(endpoint: &str) -> Vec<String> {
+    let mut models = fetch_native_models_sync();
+
+    // Query endpoint /api/tags if available
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
@@ -144,14 +246,22 @@ pub async fn fetch_ollama_models(endpoint: &str) -> Vec<String> {
     if let Some(c) = client {
         let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
         if let Ok(res) = c.get(&url).send().await {
-            if let Ok(parsed) = res.json::<OllamaTagsResp>().await {
-                if let Some(models) = parsed.models {
-                    return models.into_iter().map(|m| m.name).collect();
+            if let Ok(parsed) = res.json::<NativeTagsResp>().await {
+                if let Some(endpoint_models) = parsed.models {
+                    for m in endpoint_models {
+                        if !models.contains(&m.name) {
+                            models.push(m.name);
+                        }
+                    }
                 }
             }
         }
     }
-    Vec::new()
+    models
+}
+
+pub async fn fetch_ollama_models(endpoint: &str) -> Vec<String> {
+    fetch_native_models(endpoint).await
 }
 
 pub fn route_model(model_path: &Path, prefer_gpu: bool) -> RouteDecision {
@@ -202,20 +312,6 @@ pub struct ExecutionStats {
     pub avail_ram_gb: f64,
 }
 
-#[derive(Serialize)]
-struct GenerateOptions {
-    cache_prompt: bool,
-    slot_id: i32,
-}
-
-#[derive(Serialize)]
-struct GenerateReq<'a> {
-    model: &'a str,
-    prompt: &'a str,
-    system: &'a str,
-    stream: bool,
-    options: GenerateOptions,
-}
 
 #[derive(Deserialize)]
 struct StreamChunk {
@@ -230,7 +326,135 @@ pub enum TokenType {
     Response,
 }
 
-/// Real token-by-token streaming query runner over local HTTP endpoint (Tier 1 fast).
+/// Smart fuzzy model tag resolver matching GGUF model filenames against Ollama/llama-server registered model tags.
+pub fn resolve_model_tag(model_name: &str, available_tags: &[String]) -> String {
+    if available_tags.is_empty() {
+        return model_name.to_string();
+    }
+
+    let lower_model = model_name.to_lowercase();
+    let stripped = lower_model.trim_end_matches(".gguf").to_string();
+
+    // 1. Exact match (case-insensitive)
+    for tag in available_tags {
+        let lower_tag = tag.to_lowercase();
+        if lower_tag == lower_model || lower_tag == stripped {
+            return tag.clone();
+        }
+    }
+
+    // 2. Tag base name matching (e.g. "ornith:9b" -> base "ornith")
+    for tag in available_tags {
+        let tag_base = tag.split(':').next().unwrap_or(tag).to_lowercase();
+        let clean_base = tag_base.split('/').last().unwrap_or(&tag_base);
+        if !clean_base.is_empty() && (stripped.contains(clean_base) || clean_base.contains(&stripped)) {
+            return tag.clone();
+        }
+    }
+
+    // 3. Main model keyword token matching
+    let keywords = [
+        "ornith", "qwen", "ministral", "mistral", "llama", "gemma", "phi", "deepseek",
+        "smollm", "starcoder", "command", "granite", "internlm", "baichuan", "chatglm",
+        "minimax", "falcon", "yi", "nemotron", "cohere", "ocr", "nomic",
+    ];
+    for kw in keywords {
+        if stripped.contains(kw) {
+            if let Some(matched) = available_tags.iter().find(|t| t.to_lowercase().contains(kw)) {
+                return matched.clone();
+            }
+        }
+    }
+
+    // 4. Token overlap scoring fallback
+    let stripped_tokens: Vec<&str> = stripped.split(['-', '_', '.', ':', '/']).filter(|s| !s.is_empty()).collect();
+    let mut best_match: Option<(&String, usize)> = None;
+
+    for tag in available_tags {
+        let tag_lower = tag.to_lowercase();
+        let tag_tokens: Vec<&str> = tag_lower.split(['-', '_', '.', ':', '/']).filter(|s| !s.is_empty()).collect();
+        let mut score = 0;
+        for st in &stripped_tokens {
+            if tag_tokens.contains(st) {
+                score += 1;
+            }
+        }
+        if score > 0 {
+            if let Some((_, best_score)) = best_match {
+                if score > best_score {
+                    best_match = Some((tag, score));
+                }
+            } else {
+                best_match = Some((tag, score));
+            }
+        }
+    }
+
+    if let Some((best_tag, _)) = best_match {
+        return best_tag.clone();
+    }
+
+    model_name.to_string()
+}
+
+/// Direct in-process native Leafcutter Rust GGUF stream runner
+pub fn query_native_leafcutter_stream(
+    model_path: &Path,
+    prompt: &str,
+    system_prompt: &str,
+    mut on_token: impl FnMut(TokenType, &str),
+) -> Result<ExecutionStats> {
+    use leafcutter::api::NativeStreamingEngine;
+
+    let path_str = model_path.to_string_lossy();
+    let engine = NativeStreamingEngine::load(&path_str)
+        .map_err(|e| anyhow::anyhow!("Failed to load native Leafcutter GGUF engine for {}: {}", model_path.display(), e))?;
+
+    let full_prompt = if system_prompt.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", system_prompt, prompt)
+    };
+
+    let start = Instant::now();
+    let mut is_thinking = false;
+
+    let (_text, tokens) = engine
+        .generate_stream(&full_prompt, 2048, 0.7, 0.9, |token| {
+            if token.contains("<think>") {
+                is_thinking = true;
+                let clean = token.replace("<think>", "");
+                if !clean.is_empty() {
+                    on_token(TokenType::Thinking, &clean);
+                }
+            } else if token.contains("</think>") {
+                let clean = token.replace("</think>", "");
+                if !clean.is_empty() {
+                    on_token(TokenType::Thinking, &clean);
+                }
+                is_thinking = false;
+            } else {
+                let ttype = if is_thinking { TokenType::Thinking } else { TokenType::Response };
+                on_token(ttype, token);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("Native Leafcutter generation error: {}", e))?;
+
+    let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
+    let tokens_generated = tokens.len().max(1);
+    let tok_per_sec = tokens_generated as f64 / elapsed_sec;
+    let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
+
+    Ok(ExecutionStats {
+        model_name: model_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        tokens_generated,
+        elapsed_sec,
+        tok_per_sec,
+        avail_ram_gb,
+    })
+}
+
+/// Real token-by-token streaming query runner (native Leafcutter runner or Tier 1 HTTP endpoint).
 pub async fn query_tier1_stream(
     endpoint: &str,
     model_name: &str,
@@ -238,24 +462,48 @@ pub async fn query_tier1_stream(
     system_prompt: &str,
     mut on_token: impl FnMut(TokenType, &str),
 ) -> Result<ExecutionStats> {
+    // 1. Direct native Leafcutter execution if GGUF file exists on disk
+    if let Some(local_path) = find_model_file_path(model_name) {
+        let p = local_path.clone();
+        let pr = prompt.to_string();
+        let sys = system_prompt.to_string();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(TokenType, String)>();
+        let handle = tokio::task::spawn_blocking(move || {
+            query_native_leafcutter_stream(&p, &pr, &sys, |ttype, text| {
+                let _ = tx.send((ttype, text.to_string()));
+            })
+        });
+
+        while let Some((ttype, text)) = rx.recv().await {
+            on_token(ttype, &text);
+        }
+
+        if let Ok(res) = handle.await {
+            if let Ok(stats) = res {
+                return Ok(stats);
+            }
+        }
+    }
+
     let client = reqwest::Client::new();
     let start = Instant::now();
     let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
 
     // Resolve model tag from Ollama endpoint if available
     let available_tags = fetch_ollama_models(endpoint).await;
-    let mut resolved_model = model_name.to_string();
+    let resolved_model = resolve_model_tag(model_name, &available_tags);
 
-    if !available_tags.is_empty() && !available_tags.contains(&resolved_model) {
-        let stripped = model_name.trim_end_matches(".gguf").to_string();
-        if available_tags.contains(&stripped) {
-            resolved_model = stripped;
-        } else if let Some(matched) = available_tags.iter().find(|t| t == &&stripped || t.starts_with(&stripped)) {
-            resolved_model = matched.clone();
-        } else {
-            resolved_model = available_tags[0].clone();
+    let payload = serde_json::json!({
+        "model": resolved_model,
+        "prompt": prompt,
+        "system": system_prompt,
+        "stream": true,
+        "options": {
+            "num_ctx": 4096,
+            "temperature": 0.7
         }
-    }
+    });
 
     let mut attempt = 0;
     let max_attempts = 3;
@@ -263,16 +511,7 @@ pub async fn query_tier1_stream(
 
     let mut res = loop {
         attempt += 1;
-        let req_builder = client.post(&url).json(&GenerateReq {
-            model: &resolved_model,
-            prompt,
-            system: system_prompt,
-            stream: true,
-            options: GenerateOptions {
-                cache_prompt: true,
-                slot_id: 0,
-            },
-        });
+        let req_builder = client.post(&url).json(&payload);
 
         match req_builder.send().await {
             Ok(resp) if resp.status().is_success() => break resp,
@@ -301,18 +540,20 @@ pub async fn query_tier1_stream(
 
     // Retry once with raw model_name if resolved tag returned 404
     if res.status() == reqwest::StatusCode::NOT_FOUND && resolved_model != model_name {
+        let retry_payload = serde_json::json!({
+            "model": model_name,
+            "prompt": prompt,
+            "system": system_prompt,
+            "stream": true,
+            "options": {
+                "num_ctx": 4096,
+                "temperature": 0.7
+            }
+        });
+
         if let Ok(retry_res) = client
             .post(&url)
-            .json(&GenerateReq {
-                model: model_name,
-                prompt,
-                system: system_prompt,
-                stream: true,
-                options: GenerateOptions {
-                    cache_prompt: true,
-                    slot_id: 0,
-                },
-            })
+            .json(&retry_payload)
             .send()
             .await
         {
@@ -323,13 +564,22 @@ pub async fn query_tier1_stream(
     }
 
     if !res.status().is_success() {
-        if res.status() == reqwest::StatusCode::NOT_FOUND {
+        let status = res.status();
+        let err_body = res.text().await.unwrap_or_default();
+        let clean_err = err_body.trim();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!(
-                "Model '{}' not loaded on local LLM engine (HTTP 404).\nRun: ollama run qwen2.5:0.5b  or  cynapse pull {}",
-                model_name, model_name
+                "Model '{}' not found in local Cynapse engine catalog (HTTP 404).\nAvailable models: [{}]\nPlace GGUF models into ./models/ or download via Cynapse TUI.",
+                model_name, available_tags.join(", ")
             );
         }
-        anyhow::bail!("Local LLM engine returned HTTP error: {}", res.status());
+
+        if !clean_err.is_empty() {
+            anyhow::bail!("Local LLM engine returned HTTP error {}: {}", status, clean_err);
+        } else {
+            anyhow::bail!("Local LLM engine returned HTTP error: {}", status);
+        }
     }
 
     let mut stream = res.bytes_stream();
@@ -395,4 +645,55 @@ pub async fn query_tier1_stream(
         tok_per_sec,
         avail_ram_gb,
     })
+}
+
+/// Send keep_alive: 0 payload to local LLM engine to immediately free memory.
+pub async fn unload_model(endpoint: &str, model_name: &str) {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
+    let payload = serde_json::json!({
+        "model": model_name,
+        "keep_alive": 0
+    });
+    let _ = client.post(&url).json(&payload).send().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_model_tag_fuzzy() {
+        let available = vec![
+            "nomic-embed-text-v2-moe:latest".to_string(),
+            "ministral-3:3b".to_string(),
+            "frob/unlimited-ocr:f16".to_string(),
+            "frob/unlimited-ocr:q8_0".to_string(),
+            "ornith:9b".to_string(),
+        ];
+
+        // User case: Ornith-1.5-9B-Q4_K_M.gguf -> ornith:9b
+        assert_eq!(
+            resolve_model_tag("Ornith-1.5-9B-Q4_K_M.gguf", &available),
+            "ornith:9b"
+        );
+
+        // Case: ministral-8b-instruct-q4_k_m.gguf -> ministral-3:3b
+        assert_eq!(
+            resolve_model_tag("ministral-8b-instruct-q4_k_m.gguf", &available),
+            "ministral-3:3b"
+        );
+
+        // Case: exact match
+        assert_eq!(
+            resolve_model_tag("nomic-embed-text-v2-moe:latest", &available),
+            "nomic-embed-text-v2-moe:latest"
+        );
+
+        // Case: unlisted model stays unchanged
+        assert_eq!(
+            resolve_model_tag("unknown-custom-model.gguf", &available),
+            "unknown-custom-model.gguf"
+        );
+    }
 }

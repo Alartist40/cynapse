@@ -21,3 +21,6 @@ dirs = "6.0"
 toml = "0.8"
 cynapse-engine = { path = "../../engine/cynapse-engine" }
 cynapse-memory = { path = "../../memory/cynapse-memory" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -8,6 +8,7 @@ use regex::Regex;
 pub mod doctor;
 pub mod downloader;
 pub mod offline_agent;
+pub mod persona;
 pub mod session;
 use serde::{Deserialize, Serialize};
 

@@ -1,149 +1,158 @@
-# 🧠 CYNAPSE — Pure Rust AI Agent System & Dendrite Graph Memory
+# 🧠 CYNAPSE — Offline-First Agent System & Synaptic Knowledge Memory
 
-**Cynapse** is a production-grade, local-first AI agent system built in **100% Pure Rust**. It features zero Python and zero Node.js dependencies, a **3-Tier Hardware & Engine Router**, **Paraclea-Style Dendrite 4-Tier Knowledge Graph Memory** (with SQLite FTS5 + BM25 search), and a **Colibri/Jcode-inspired visual Terminal UI (TUI)**.
+**Cynapse** is a high-performance, offline-first AI agent platform engineered entirely in 100% pure Rust. Designed for total privacy, zero external runtime dependencies, and instant local execution, it bridges host hardware telemetry with an intelligent multi-engine router and a dynamic, synaptic knowledge graph.
 
----
-
-## 🌟 Key Features
-
-### 🚀 Zero External Runtime Dependencies
-- Built completely in pure Rust (`Ratatui 0.29` + `Crossterm 0.28` + `Tokio` + `SQLite`).
-- Ultra-lightweight memory footprint and instant startup times.
-
-### ⌨️ Dynamic Input Auto-Layout & Word-by-Word Backspace (`Ctrl + Backspace`)
-- **Downward Box Expansion**: The prompt input box dynamically expands downward (from 3 to 8 lines) as your prompt grows, keeping all input text visible while typing.
-- **Line Word Wrapping**: Uses `.wrap(Wrap { trim: false })` so multi-line text wraps cleanly onto line 2, 3, 4, etc.
-- **Multi-Line Cursor Tracking**: Multi-line aware terminal blinking cursor positioning (`f.set_cursor_position`) using exact line (`row_offset`) and column (`col_offset`) calculations.
-- **Word Deletion (`Ctrl + Backspace` / `Ctrl + W`)**: `delete_word_backward` deletes words backward cleanly without inserting stray characters (`h`) or breaking prompt text.
-
-### 🖼️ Complete 32-Line ASCII Banner Welcome Screen
-- **Full 32-Line Brand Banner**: Renders the complete 32-line ASCII artwork logo (`ascii-art.txt`) centered in the Conversation Viewport upon launch or when clearing chat (`/clear`).
-- **Automatic Chat Transition**: The ASCII banner cleanly recedes when you send your first prompt, focusing 100% on chat history, thinking blocks, and responses.
-
-### 🗂️ Collapsible Reasoning Stream Cards (`/thinking` & `Ctrl + T`)
-- **Expandable / Collapsible Thinking Blocks**: Model chain-of-thought (`[Thinking...]`) blocks can be collapsed into a compact single-line badge (`▶ [Thinking... (Collapsed)]`) or expanded (`▼ [Thinking...]`).
-- **Toggle Shortcut**: Toggle visibility anytime via `Ctrl + T` shortcut or `/thinking` slash command.
-
-### 📊 Live Tool Execution Progress Cards
-- Real-time status cards in the Left Sidebar showing execution pipeline stages:
-  - `FTS5 Index`: `✓ Active`
-  - `Ranker`: `✓ BM25`
-  - `RAG Budget`: `✓ 4k Budget`
-  - `Engine`: `• Running...` / `✓ Idle`
-
-### 🎨 In-Terminal Rich Markdown & Syntax-Highlighted Code Blocks
-- Formats Markdown headers (`#`, `##`, `###`), bullet points (`•`), blockquotes (`│`), and fenced code blocks with language headers (`┌── [ RUST ] ───`, `└───`) and green syntax styling.
-
-### 🖥️ Colibri-Style Left Sidebar & Hardware Telemetry
-- **Left Sidebar Panel (26% width)**: Real-time telemetry status panel.
-  - **SYSTEM HARDWARE**: CPU model & core count, RAM usage (`Used / Total GB`) with a visual progress bar `[████░░░░] 42%`, GPU & hardware acceleration status.
-  - **MODEL DETAILS**: Active filename (`qwen2.5-0.5b-instruct-q4_k_m.gguf`), Quantization (`Q4_K_M`), Size (`398 MB`), Source (`Local File` / `Leafcutter`).
-  - **ENGINE TIER & STATS**: Active tier, `tok/s` speed, latency.
-  - **EXECUTION PIPELINE**: Live FTS5, BM25 ranker, RAG budget, and streaming status.
-  - **VISUAL THEME**: Active color theme name (`Amber CRT`, etc.).
-  - **DENDRITE MEMORY**: Live node & edge count, FTS5 + BM25 index status.
-
-### 🌌 Multi-Galaxy 3D Dendrite Memory Visualizer (`/memory`)
-- **Central Core Star (`✸`)**: Supermassive mass at origin `(0, 0, 0)` drawing category sub-galaxies into orbit.
-- **Sub-Galaxy Clusters**: Categorized sub-galaxies (`Personal`, `Engineering`, `Preferences`, `Meta`, `Episodic`, `Transient Oort Cloud`) orbiting the central star.
-- **Category Color-Coding**: Pink/Magenta (Personal), Cyan (Engineering), Yellow (Preferences), Green (Meta), White (Episodic), Dark Gray (Transient).
-- **Specialization Node Sizing**: Scaled star symbols and brightness using normalized entropy specialization metrics ($\text{spec} > 0.75$ rendered as bright `★` / `✦`).
-- **Interactive Controls**: `Left`/`Right`/`Up`/`Down` Arrow Keys rotate 3D Yaw & Pitch in real time, `Spacebar`/`s` toggles auto-spin.
-
-### 📥 Atomic-Agent Inspired HuggingFace Model Downloader (`/pull` / `/download`)
-- **Hardware Recommendation Engine**: Autodetects host RAM/VRAM and tags optimal curated models (`[★ Recommended]`).
-- **Custom HuggingFace Write-In**: Input custom HuggingFace repo identifiers or URLs (e.g. `TheBloke/Llama-2-7B-GGUF` or `unsloth/gemma-4-12B-it-qat-GGUF`).
-- **Quantization Selector**: Select target quantization level (`Q4_K_M`, `Q5_K_M`, `Q8_0`, `F16`).
-- **Live Streaming Progress Bar**: Non-blocking background Tokio task with real-time speed (`14.2 MB/s`), percentage, and MB counter visualizer (`[██████░░░░] 60%`).
-- **Auto-Registration**: Automatically saves to local `models` directory and registers the downloaded model as active.
-
-### 🩺 Self-Healing System Doctor (`cynapse doctor` & `/doctor`)
-- **Subsystem Diagnostic Engine**: Audits 9 subsystem areas (Host RAM Safety Headroom, AVX2 SIMD, GGUF magic header validation `0x46554747`, SQLite `PRAGMA quick_check;` & FTS5 health, GBNF tool call grammar, Atomic-Agent local tools, Tokio async task scheduler).
-- **Auto-Healing Recovery (`--fix` / `r`/`F5`)**: Automatically repairs DB schemas, missing storage directories, stale scratch files, and broken model references.
-- **TUI & CLI Entrypoints**: Run `cynapse doctor [--fix]` in CLI or type `/doctor` inside the TUI dashboard.
-
-### 🗄️ Interactive Dendrite Memory Drawer (`Tab` Key / `/drawer`)
-- **Instant Overlay (`Tab`)**: Press `Tab` anywhere in the TUI to open the interactive Memory Drawer inspector overlay.
-- **Node Management**: Inspect title, category, specialization score, and hashtags. Delete obsolete nodes directly with `d` or `Delete`.
-
-### 🛡️ Atomic-Agent Offline Capability Suite
-- **GBNF Tool Call Grammar Validation**: Ensures zero-syntax-error tool execution offline.
-- **Stable Prefix KV-Cache Preservation**: 100% KV-cache hit rate on local llama.cpp/GGUF engines.
-- **Two-Tier Hybrid Memory Recall**: Combines BM25 term matches, specialization index boost, and exponential recency decay ($\gamma^{\Delta t}$).
-- **Loop Guard Protection**: Circular buffer detecting repeating non-progressing tool call loops offline.
-
-### ⚡ 3-Tier Hardware & Engine Router
-- **Tier 1 (Fast Engine)**: HTTP streaming runner over local llama.cpp / Ollama endpoints (`reqwest` streaming) with automatic model tag resolution and 404 retries.
-- **Tier 2 (Large GGUF)**: Leafcutter Pure Rust GGUF Layer Streaming Core.
-- **Tier 3 (Large Safetensor)**: Leafcutter Pure Rust Safetensor Core.
-
-### 🔍 Slash Command Dropdown Autocomplete (`/` Menu)
-- Type `/` in the prompt input bar to open a floating autocomplete menu.
-- Slash Commands:
-  - `/help` — Display keyboard shortcuts & help menu
-  - `/model` — Open interactive model selector
-  - `/pull` — Open interactive HuggingFace model downloader (hardware curated)
-  - `/doctor` — Run self-healing Cynapse Doctor system diagnostic & recovery
-  - `/memory` — Open 3D Dendrite Memory Galaxy Visualizer
-  - `/drawer` — Open interactive Dendrite Memory drawer inspector
-  - `/thinking` — Toggle collapsible model thinking/reasoning blocks
-  - `/theme` — Cycle visual color theme (Dark Slate, Neon, Amber CRT, Emerald Matrix)
-  - `/session` — Open saved sessions manager (resume past runs)
-  - `/clear` — Clear conversation history
-  - `/exit` — Quit Cynapse TUI
-- Controls: `Up`/`Down` arrows navigate, `Tab`/`Right Arrow` auto-completes, `Enter` executes.
-
-### 💾 Persistent Session Manager (`~/.cynapse/sessions/`)
-- Automatic JSON conversation transcript persistence.
-- Resume past sessions via `cynapse --resume <session_id>` or through the interactive `/session` modal.
+At the heart of Cynapse lies a unified architecture where three powerful engines work in concert: **Dendrite**, a 4-tier graph memory system powered by SQLite FTS5 full-text indexing and BM25 relevance ranking that organically grows and adapts like biological synapses; **Leafcutter**, a custom pure-Rust GGUF and Safetensors execution core providing local tensor streaming; and **llama.cpp / Ollama integration**, acting as a high-speed Tier-1 inference runner. Together, these subsystems provide a complete local agent harness capable of autonomous tool execution, strict GBNF grammar constrained outputs, real-time memory synthesis, 3D orbital galaxy memory visualization, and self-healing diagnostics—all running locally on your hardware without a single byte leaving your machine.
 
 ---
 
-## 🛠️ Installation & Building
+## 📥 Installation & Setup
 
-### Prerequisites
-- Linux / macOS / Windows
-- Rust 1.75+ toolchain (`cargo`, `rustc`)
-
-### One-Line Automatic Install (Linux / macOS)
+### Single-Line Automated Install (Linux & macOS)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Alartist40/cynapse/main/install.sh | bash
 ```
 
-### Manual Install from Source
+### Build from Source
 ```bash
 git clone https://github.com/Alartist40/cynapse.git
 cd cynapse
-./install.sh
+cargo build --release
+cp target/release/cynapse ~/.local/bin/cynapse
+```
+
+### System Health Verification
+After installation, run the self-healing diagnostic to verify hardware, SIMD acceleration, storage, and database integrity:
+```bash
+cynapse doctor --fix
 ```
 
 ---
 
-## 🚀 Quick Usage
+## 🕹️ Menu & Usage Guide
 
-### Start TUI Mode (Default)
-```bash
-cynapse
+### Launch Modes
+- **Visual TUI Dashboard (Default)**: Launch the full visual Ratatui interactive interface:
+  ```bash
+  cynapse
+  ```
+- **CLI REPL Mode**: Run in line-by-line terminal mode:
+  ```bash
+  cynapse --cli
+  ```
+- **Resume Past Session**: Reopen any saved session transcript by ID:
+  ```bash
+  cynapse --resume <session_id>
+  ```
+- **Run Model Directly**:
+  ```bash
+  cynapse run <model_name_or_number>
+  ```
+
+### Interactive Slash Commands (`/`)
+Type `/` in the prompt bar to trigger the floating command menu:
+- `/help` — Display interactive keyboard shortcuts & help menu
+- `/model` — Open interactive model selector & scanner
+- `/pull` — Download GGUF models from HuggingFace (Curated catalog & custom URLs)
+- `/persona` — Manage agent personality markdown files (`IDENTITY`, `SOUL`, `USER`, custom `.md`)
+- `/doctor` — Launch Cynapse Doctor self-healing diagnostic dashboard
+- `/memory` — Launch 3D Orbital Galaxy Memory Atlas visualizer
+- `/drawer` — Open interactive Dendrite Memory drawer inspector
+- `/thinking` — Toggle collapsible model reasoning/thinking stream blocks
+- `/theme` — Cycle color themes (Dark Slate, Neon Cyber, Amber CRT, Emerald Matrix)
+- `/session` — Manage and resume saved conversation sessions
+- `/clear` — Reset conversation view and restore brand banner
+- `/exit` — Quit Cynapse TUI
+
+### Terminal Shortcuts
+- `Tab`: Open Dendrite Memory Drawer inspector from anywhere
+- `Up` / `Down`: Scroll conversation viewport line-by-line
+- `Ctrl + Backspace` / `Ctrl + W`: Delete word backward in prompt input
+- `Ctrl + T`: Toggle model thinking/reasoning blocks
+- `Ctrl + A` / `Ctrl + E`: Move input cursor to start / end of line
+- `Ctrl + U`: Clear input line
+- `Spacebar` / `s` (in `/memory`): Toggle 3D Galaxy auto-rotation
+- `r` / `F5` (in `/doctor`): Re-run self-healing diagnostics with auto-repair
+
+---
+
+## 🏗️ Architecture Structure
+
+Cynapse is structured as a decoupled multi-crate Rust workspace:
+
+```
+cynapse-mini/
+├── harness/
+│   ├── src/main.rs             # CLI & TUI entrypoint dispatcher
+│   ├── cynapse-tui/            # Ratatui visual interface, modals, 3D visualizer
+│   └── cynapse-core/           # Tool execution, GBNF parser, session manager, doctor
+├── memory/
+│   └── cynapse-memory/         # Dendrite graph engine, SQLite FTS5 store, BM25 ranker
+├── engine/
+│   ├── cynapse-engine/         # Semantic hardware router & Tier-1 LLM client
+│   └── leafcutter_core/        # Pure Rust GGUF & Safetensors tensor kernels
+└── install.sh                  # Dual remote/local automated installer & setup script
 ```
 
-### Start Line-by-Line CLI Mode
-```bash
-cynapse --cli
+### Data & Memory Flow
+```
+[ User Input ]
+      │
+      ▼
+[ Dendrite Memory Core ] ──( SQLite FTS5 + BM25 )──► [ Relevant Context Facts ]
+      │                                                        │
+      ▼                                                        ▼
+[ Hardware Tier Router ] ◄───────────────────────── [ Injected System Prompt ]
+      │
+      ├─────► Tier 1 (Fast): llama.cpp / Ollama HTTP Stream
+      ├─────► Tier 2 (GGUF): Leafcutter Rust Tensor Core
+      └─────► Tier 3 (Safetensor): Leafcutter Rust Core
+      │
+      ▼
+[ GBNF Tool Grammar Parser ] ──( Tool Executed )──► [ Tool Output Result ]
+      │                                                     │
+      └─────────────────────◄ ( Reprompt Loop ) ────────────┘
+      │
+      ▼
+[ Turn Log & Fact Extraction ] ──► [ Dendrite Knowledge Graph ]
 ```
 
-### Resume Past Session
-```bash
-cynapse --resume session_1725500000_1a2b
-```
+---
 
-### Keyboard Shortcuts
-- `Up` / `Down` Arrow Keys: Scroll conversation viewport up/down line-by-line
-- `Ctrl + Backspace` / `Ctrl + W`: Delete word backward in prompt bar
-- `Ctrl + T`: Toggle collapsible model thinking/reasoning cards
-- `Ctrl + A` / `Ctrl + E`: Jump cursor to start / end of prompt line
-- `Ctrl + U`: Clear prompt line
+## 🌟 Capabilities, Specs & Features
+
+### 🧠 Synaptic Memory & 3D Galaxy Memory Atlas
+Memory in Cynapse is modeled after biological neural networks. Ideas, facts, and conversation turn logs form nodes connected by weighted synaptic links that strengthen with use and decay with disuse over time.
+- **3D Orbital Galaxy Visualizer (`/memory`)**: Visualizes memory nodes as stars organized into galactic clusters revolving around a supermassive central core of knowledge. Categories (Personal, Engineering, Preferences, Meta, Episodic) orbit in colorful stellar belts. Node size dynamically scales with entropy-based specialization metrics.
+- **Two-Tier Hybrid Memory Recall**: Merges SQLite FTS5 keyword matching with BM25 scoring, specialization index weighting, and exponential temporal decay ($\gamma^{\Delta t}$).
+- **Interactive Memory Drawer (`Tab`)**: Inspect, search, and purge individual memory nodes directly from a pop-up overlay.
+
+### 📥 Offline Model Downloader & Model Management (`/pull`)
+- **Curated Recommendations**: Probes system RAM and GPU VRAM to tag optimal model sizes (`[★ Recommended]`).
+- **Custom HuggingFace Downloads**: Download any model from HuggingFace by entering a repository ID (e.g., `Qwen/Qwen2.5-7B-Instruct-GGUF` or `TheBloke/Llama-2-7B-GGUF`) or pasting a direct GGUF file URL. Select quantization levels ranging from `Q2_K` to `F16`.
+- **Background Async Progress**: Non-blocking Tokio downloader streams models directly to storage with real-time speed (`MB/s`), progress bars, and automatic activation upon completion.
+
+### 🛡️ Offline Agent Capabilities & GBNF Grammar Engine
+- **GBNF Grammar Constraints**: Enforces valid JSON tool-call schema syntax, preventing output formatting panics offline.
+- **KV-Cache Slot Preservation**: Reuses prompt prefix KV-caches across conversation turns for near-zero prefix evaluation latency.
+- **Loop Guard Protection**: Active circular buffer detects and halts non-progressing repeated tool execution loops.
+- **Max Step Safeguards**: Configurable step limits
+
+### 🎭 System Persona Manager (`/persona`)
+- **Interactive TUI Modal**: Inspect available `.md` persona files in `~/.cynapse/persona/`, preview file contents and system prompt outputs in real-time, switch active personas (`Enter`), or reset to default identity (`r`).
+- **Dynamic Prompt Compiler**: Injects direct, high-character system instructions into every model prompt without generic LLM headers or preambles.
+
+### 🩺 Cynapse Doctor Self-Healing Engine (`/doctor`)
+- **9-Subsystem Auditing**: Audits host RAM headroom, SIMD instruction availability (AVX2 + FMA), GGUF magic headers (`0x46554747`), SQLite database health (`PRAGMA quick_check;`), GBNF grammar parser, local host tools (`bash`, `git`), async Tokio runtimes, and the Markdown Persona Subsystem.
+- **Auto-Fix Mode (`--fix`)**: Automatically recreates missing directories (`~/.cynapse/persona`), repairs database indexes, clears stale scratch files, and updates configuration paths.
+
+### 🎨 Visual Themes & UI Experience
+- **4 Visual Color Presets**: Switch instantly between Dark Slate, Neon Cyber, Amber CRT, and Emerald Matrix themes.
+- **Dynamic Input Box**: Expands downward from 3 to 8 lines as text grows, keeping long prompts completely visible.
+- **Collapsible Reasoning Blocks (`Ctrl + T`)**: Expand or collapse internal model thinking streams.
+- **Rich Markdown Formatting**: In-terminal syntax-highlighted code blocks, blockquotes, headers, and bullet lists.
 
 ---
 
 ## 📄 License
-MIT License. Free for open-source and commercial use.
+MIT License. Free and open-source.

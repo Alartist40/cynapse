@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use cynapse_core::offline_agent::{validate_gbnf_tool_call, LoopGuard};
 use cynapse_core::session::{SessionData, SessionManager, SessionMessage};
-use cynapse_engine::{fetch_ollama_models, probe_hardware_info, query_tier1_stream, SystemHardwareInfo, TokenType};
+use cynapse_engine::{fetch_native_models, probe_hardware_info, query_tier1_stream, unload_model, SystemHardwareInfo, TokenType};
 use cynapse_memory::context::DendriteContext;
 use cynapse_memory::graph::{Dendrite, NodeType};
 use cynapse_memory::store::DendriteStore;
@@ -53,6 +53,7 @@ pub enum ActiveModal {
     ModelPuller,
     SessionList,
     Doctor,
+    PersonaManager,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +64,16 @@ pub enum PullerStep {
     Downloading,
 }
 
-pub const QUANT_OPTIONS: &[&str] = &["Q4_K_M", "Q5_K_M", "Q8_0", "F16"];
+pub const QUANT_OPTIONS: &[&str] = &[
+    "Q4_K_M (Recommended 4-bit Medium)",
+    "Q5_K_M (High Precision 5-bit)",
+    "Q8_0 (8-bit High Precision)",
+    "F16 (16-bit Float)",
+    "Q2_K (Ultra Fast 2-bit)",
+    "Q3_K_M (3-bit Medium)",
+    "Q6_K (6-bit High Quality)",
+    "IQ4_NL (Non-linear 4-bit)",
+];
 
 #[derive(Debug, Clone)]
 pub struct DownloadProgressState {
@@ -99,11 +109,13 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/help", description: "Display keyboard shortcuts & help menu" },
     SlashCommand { name: "/model", description: "Open interactive model selector" },
     SlashCommand { name: "/pull", description: "Download GGUF model from HuggingFace (hardware curated)" },
+    SlashCommand { name: "/persona", description: "Manage agent personality markdown files (IDENTITY, SOUL, USER, custom .md)" },
     SlashCommand { name: "/doctor", description: "Run self-healing Cynapse Doctor system diagnostic & recovery" },
     SlashCommand { name: "/memory", description: "View 3D Galaxy Memory Atlas topology" },
     SlashCommand { name: "/drawer", description: "Open interactive Dendrite Memory drawer inspector" },
     SlashCommand { name: "/thinking", description: "Toggle collapsible model thinking/reasoning blocks" },
     SlashCommand { name: "/theme", description: "Cycle visual color theme (Dark Slate, Neon, Amber, Matrix)" },
+    SlashCommand { name: "/unload", description: "Unload active LLM model from RAM immediately to free memory" },
     SlashCommand { name: "/session", description: "Open saved sessions manager" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
     SlashCommand { name: "/exit", description: "Exit Cynapse TUI" },
@@ -181,6 +193,7 @@ pub struct TuiApp {
     pub galaxy_yaw: f32,
     pub galaxy_pitch: f32,
     pub galaxy_auto_spin: bool,
+    pub galaxy_anim_spin: f32,
     pub show_thinking: bool,
     pub loop_guard: LoopGuard,
     pub agent_step_count: usize,
@@ -196,6 +209,10 @@ pub struct TuiApp {
 
     // Doctor Self-Healing Diagnostic state
     pub doctor_report: Option<cynapse_core::doctor::DoctorReport>,
+
+    // Persona System Manager
+    pub persona_mgr: cynapse_core::persona::PersonaManager,
+    pub selected_persona_idx: usize,
 }
 
 impl TuiApp {
@@ -250,6 +267,7 @@ impl TuiApp {
             galaxy_yaw: 0.4,
             galaxy_pitch: 0.3,
             galaxy_auto_spin: true,
+            galaxy_anim_spin: 0.0,
             loop_guard: LoopGuard::default(),
             agent_step_count: 0,
             puller_step: PullerStep::CuratedList,
@@ -260,6 +278,9 @@ impl TuiApp {
             download_progress_rx: None,
             current_download_state: None,
             doctor_report: None,
+            persona_mgr: cynapse_core::persona::PersonaManager::new(cynapse_core::persona::PersonaManager::default_dir())
+                .unwrap_or_else(|_| cynapse_core::persona::PersonaManager::new("./persona").unwrap()),
+            selected_persona_idx: 0,
         }
     }
 
@@ -309,13 +330,12 @@ impl TuiApp {
 
     pub fn scroll_down(&mut self, delta: u16) {
         let max_scroll = self.last_max_scroll.load(Ordering::Relaxed);
-        if self.auto_scroll {
-            return;
-        }
         self.scroll_offset = self.scroll_offset.saturating_add(delta);
         if self.scroll_offset >= max_scroll {
             self.scroll_offset = max_scroll;
             self.auto_scroll = true;
+        } else {
+            self.auto_scroll = false;
         }
     }
 
@@ -428,16 +448,36 @@ impl TuiApp {
         self.event_loop(&mut terminal).await
     }
 
-    pub fn start_hf_download(&mut self, download_url: String, target_filename: String) {
+    pub fn start_hf_download(&mut self, repo_or_url: String, quant: String) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.download_progress_rx = Some(rx);
         self.puller_step = PullerStep::Downloading;
         self.modal = ActiveModal::ModelPuller;
 
+        let initial_name = if repo_or_url.contains('/') {
+            repo_or_url.split('/').last().unwrap_or("model").to_string()
+        } else {
+            repo_or_url.clone()
+        };
+
+        self.current_download_state = Some(DownloadProgressState {
+            model_name: initial_name,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            speed_mbps: 0.0,
+            pct: 0.0,
+            is_done: false,
+            error: None,
+        });
+
         let models_dir = self.models_dir.clone();
-        let target_path = models_dir.join(&target_filename);
 
         tokio::spawn(async move {
+            let (download_url, target_filename) =
+                cynapse_core::downloader::resolve_hf_download_url_async(&repo_or_url, &quant).await;
+
+            let target_path = models_dir.join(&target_filename);
+
             let res = cynapse_core::downloader::stream_download_hf_model(
                 &download_url,
                 &target_path,
@@ -456,7 +496,8 @@ impl TuiApp {
             .await;
 
             match res {
-                Ok(_path) => {
+                Ok(path) => {
+                    let _ = cynapse_core::downloader::register_gguf_in_cynapse(&path, &target_filename).await;
                     let _ = tx.send(DownloadProgressState {
                         model_name: target_filename,
                         downloaded_bytes: 0,
@@ -499,6 +540,12 @@ impl TuiApp {
                     });
                 } else {
                     self.active_model_name = st.model_name.clone();
+                    let scanned = self.scan_models_sync();
+                    if let Some(found) = scanned.iter().find(|m| m.name == st.model_name) {
+                        self.active_model_quant = found.quant.clone();
+                        self.active_model_size = found.size_str.clone();
+                        self.active_model_source = found.source.clone();
+                    }
                     self.messages.push(ChatMessage {
                         role: "system".into(),
                         content: format!("✓ Download Complete: Saved and activated model '{}'", st.model_name),
@@ -506,7 +553,6 @@ impl TuiApp {
                     });
                 }
                 self.download_progress_rx = None;
-                self.modal = ActiveModal::None;
             }
             self.current_download_state = Some(st);
         }
@@ -520,6 +566,7 @@ impl TuiApp {
             }
             if self.modal == ActiveModal::MemoryGraph && self.galaxy_auto_spin {
                 self.galaxy_yaw += 0.05;
+                self.galaxy_anim_spin += 0.02;
             }
 
             self.poll_stream_events();
@@ -536,6 +583,28 @@ impl TuiApp {
                             break;
                         }
 
+                        // Global Paste Shortcut (Ctrl+V)
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
+                            let pasted = std::process::Command::new("wl-paste")
+                                .output()
+                                .or_else(|_| std::process::Command::new("xclip").args(["-selection", "clipboard", "-o"]).output())
+                                .ok()
+                                .and_then(|out| String::from_utf8(out.stdout).ok())
+                                .map(|s| s.trim().to_string());
+
+                            if let Some(clean_text) = pasted {
+                                if self.modal == ActiveModal::ModelPuller && self.puller_step == PullerStep::CustomInput {
+                                    self.custom_pull_url.insert_str(self.custom_pull_cursor, &clean_text);
+                                    self.custom_pull_cursor += clean_text.len();
+                                    continue;
+                                } else if self.modal == ActiveModal::None {
+                                    self.input.insert_str(self.input_cursor, &clean_text);
+                                    self.input_cursor += clean_text.len();
+                                    continue;
+                                }
+                            }
+                        }
+
                         // Handle Modal Inputs
                         if self.modal != ActiveModal::None {
                             if self.modal == ActiveModal::ModelPuller {
@@ -545,7 +614,7 @@ impl TuiApp {
                                             self.modal = ActiveModal::None;
                                         }
                                         KeyCode::Up => {
-                                            let cat_len = cynapse_core::downloader::CURATED_MODELS_CATALOG.len();
+                                            let cat_len = cynapse_core::downloader::CURATED_MODELS_CATALOG.len() + 1;
                                             if self.selected_pull_idx > 0 {
                                                 self.selected_pull_idx -= 1;
                                             } else {
@@ -553,7 +622,7 @@ impl TuiApp {
                                             }
                                         }
                                         KeyCode::Down => {
-                                            let cat_len = cynapse_core::downloader::CURATED_MODELS_CATALOG.len();
+                                            let cat_len = cynapse_core::downloader::CURATED_MODELS_CATALOG.len() + 1;
                                             if self.selected_pull_idx + 1 < cat_len {
                                                 self.selected_pull_idx += 1;
                                             } else {
@@ -567,11 +636,15 @@ impl TuiApp {
                                         }
                                         KeyCode::Enter => {
                                             let cat = cynapse_core::downloader::CURATED_MODELS_CATALOG;
-                                            if !cat.is_empty() {
+                                            let custom_idx = cat.len();
+                                            if self.selected_pull_idx == custom_idx {
+                                                self.puller_step = PullerStep::CustomInput;
+                                                self.custom_pull_url.clear();
+                                                self.custom_pull_cursor = 0;
+                                            } else if !cat.is_empty() {
                                                 let idx = self.selected_pull_idx.min(cat.len() - 1);
                                                 let item = &cat[idx];
-                                                let (url, filename) = cynapse_core::downloader::resolve_hf_download_url(item.repo_url, "Q4_K_M");
-                                                self.start_hf_download(url, filename);
+                                                self.start_hf_download(item.repo_url.to_string(), "Q4_K_M".to_string());
                                             }
                                         }
                                         _ => {}
@@ -599,9 +672,14 @@ impl TuiApp {
                                             }
                                         }
                                         KeyCode::Enter => {
-                                            if !self.custom_pull_url.trim().is_empty() {
-                                                self.selected_quant_idx = 0;
-                                                self.puller_step = PullerStep::QuantSelect;
+                                            let trimmed = self.custom_pull_url.trim();
+                                            if !trimmed.is_empty() {
+                                                if trimmed.ends_with(".gguf") || trimmed.ends_with(".safetensors") || trimmed.ends_with(".bin") || trimmed.contains("/resolve/main/") || trimmed.contains("/blob/main/") {
+                                                    self.start_hf_download(trimmed.to_string(), "Q4_K_M".to_string());
+                                                } else {
+                                                    self.selected_quant_idx = 0;
+                                                    self.puller_step = PullerStep::QuantSelect;
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -620,13 +698,12 @@ impl TuiApp {
                                         }
                                         KeyCode::Enter => {
                                             let quant = QUANT_OPTIONS[self.selected_quant_idx.min(QUANT_OPTIONS.len() - 1)];
-                                            let (url, filename) = cynapse_core::downloader::resolve_hf_download_url(&self.custom_pull_url, quant);
-                                            self.start_hf_download(url, filename);
+                                            self.start_hf_download(self.custom_pull_url.clone(), quant.to_string());
                                         }
                                         _ => {}
                                     },
                                     PullerStep::Downloading => match key.code {
-                                        KeyCode::Esc | KeyCode::Char('q') => {
+                                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
                                             self.modal = ActiveModal::None;
                                         }
                                         _ => {}
@@ -664,6 +741,9 @@ impl TuiApp {
                                     ActiveModal::SessionList => {
                                         self.selected_session_idx = self.selected_session_idx.saturating_sub(1);
                                     }
+                                    ActiveModal::PersonaManager => {
+                                        self.selected_persona_idx = self.selected_persona_idx.saturating_sub(1);
+                                    }
                                     _ => {}
                                 },
                                 KeyCode::Down => match self.modal {
@@ -678,6 +758,9 @@ impl TuiApp {
                                     }
                                     ActiveModal::SessionList => {
                                         self.selected_session_idx = self.selected_session_idx.saturating_add(1);
+                                    }
+                                    ActiveModal::PersonaManager => {
+                                        self.selected_persona_idx = self.selected_persona_idx.saturating_add(1);
                                     }
                                     _ => {}
                                 },
@@ -712,6 +795,14 @@ impl TuiApp {
                                         let doctor = cynapse_core::doctor::CynapseDoctor::new(self.models_dir.clone(), db_path, true);
                                         self.doctor_report = Some(doctor.run_diagnostics());
                                     }
+                                    ActiveModal::PersonaManager => {
+                                        self.persona_mgr.set_active_persona(None);
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "Persona reset to default Cynapse identity (IDENTITY.md + SOUL.md + USER.md).".into(),
+                                            thinking: None,
+                                        });
+                                    }
                                     _ => {}
                                 },
                                 KeyCode::Enter => match self.modal {
@@ -737,6 +828,20 @@ impl TuiApp {
                                             let idx = self.selected_session_idx.min(sessions.len() - 1);
                                             let sid = sessions[idx].session_id.clone();
                                             let _ = self.load_session(&sid);
+                                        }
+                                        self.modal = ActiveModal::None;
+                                    }
+                                    ActiveModal::PersonaManager => {
+                                        let personas = self.persona_mgr.list_personas();
+                                        if !personas.is_empty() {
+                                            let idx = self.selected_persona_idx.min(personas.len() - 1);
+                                            let selected_name = personas[idx].clone();
+                                            self.persona_mgr.set_active_persona(Some(selected_name.clone()));
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("Active persona loaded: {}.md", selected_name),
+                                                thinking: None,
+                                            });
                                         }
                                         self.modal = ActiveModal::None;
                                     }
@@ -921,6 +1026,21 @@ impl TuiApp {
                                     continue;
                                 }
 
+                                if trimmed == "/unload" || trimmed == "/stop" || trimmed == "/free" {
+                                    let endpoint = self.tier1_endpoint.clone();
+                                    let model_name = self.active_model_name.clone();
+                                    tokio::spawn(async move {
+                                        unload_model(&endpoint, &model_name).await;
+                                    });
+
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: format!("✓ Unloaded model '{}' from RAM. System memory freed.", self.active_model_name),
+                                        thinking: None,
+                                    });
+                                    continue;
+                                }
+
                                 if trimmed == "/pull" || trimmed == "/download" {
                                     let rec_idx = cynapse_core::downloader::recommend_model_for_hardware(self.hw_info.ram_total_mb);
                                     self.selected_pull_idx = rec_idx;
@@ -985,6 +1105,53 @@ impl TuiApp {
                                     continue;
                                 }
 
+                                if trimmed == "/persona" || trimmed == "/persona list" {
+                                    self.selected_persona_idx = 0;
+                                    self.modal = ActiveModal::PersonaManager;
+                                    continue;
+                                }
+
+                                if trimmed.starts_with("/persona load ") || trimmed.starts_with("/persona set ") || trimmed.starts_with("/persona use ") {
+                                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                                    let target = parts.get(2).cloned().unwrap_or(parts.get(1).cloned().unwrap_or(""));
+                                    if target.is_empty() || target == "default" || target == "reset" {
+                                        self.persona_mgr.set_active_persona(None);
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "Persona reset to default Cynapse identity (IDENTITY.md + SOUL.md + USER.md).".into(),
+                                            thinking: None,
+                                        });
+                                    } else {
+                                        self.persona_mgr.set_active_persona(Some(target.to_string()));
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: format!("Active persona loaded: {}.md", target),
+                                            thinking: None,
+                                        });
+                                    }
+                                    continue;
+                                }
+
+                                if trimmed == "/persona show" || trimmed == "/persona prompt" {
+                                    let prompt = self.persona_mgr.build_system_prompt();
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: format!("📜 **Active Cynapse Persona System Prompt**:\n```\n{}\n```", prompt),
+                                        thinking: None,
+                                    });
+                                    continue;
+                                }
+
+                                if trimmed == "/persona default" || trimmed == "/persona reset" {
+                                    self.persona_mgr.set_active_persona(None);
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: "Persona reset to default Cynapse identity.".into(),
+                                        thinking: None,
+                                    });
+                                    continue;
+                                }
+
                                 // User Prompt Execution
                                 self.messages.push(ChatMessage {
                                     role: "user".into(),
@@ -998,8 +1165,10 @@ impl TuiApp {
                                 self.current_response_buf.clear();
                                 self.auto_scroll = true; // Lock scroll to bottom for incoming response
 
-                                // Build System Prompt with Dendrite Memory Injection
-                                let system_prompt = self.dendrite_ctx.build_prompt(&trimmed, 4000);
+                                // Build System Prompt with Persona & Dendrite Memory Injection
+                                let persona_prompt = self.persona_mgr.build_system_prompt();
+                                let memory_prompt = self.dendrite_ctx.build_prompt(&trimmed, 4000);
+                                let system_prompt = format!("{}\n\n=== DENDRITE CONTEXT ===\n{}", persona_prompt, memory_prompt);
 
                                 // Spawn Non-blocking Async LLM Task
                                 let (tx, rx) = mpsc::unbounded_channel();
@@ -1049,6 +1218,16 @@ impl TuiApp {
                                 self.scroll_down(2);
                             }
                             _ => {}
+                        }
+                    }
+                    Event::Paste(text) => {
+                        let clean_text: String = text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+                        if self.modal == ActiveModal::ModelPuller && self.puller_step == PullerStep::CustomInput {
+                            self.custom_pull_url.insert_str(self.custom_pull_cursor, &clean_text);
+                            self.custom_pull_cursor += clean_text.len();
+                        } else if self.modal == ActiveModal::None {
+                            self.input.insert_str(self.input_cursor, &clean_text);
+                            self.input_cursor += clean_text.len();
                         }
                     }
                     _ => {}
@@ -1109,7 +1288,9 @@ impl TuiApp {
                                         self.current_response_buf.clear();
 
                                         let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
-                                        let system_prompt = self.dendrite_ctx.build_prompt(&tool_output, 4000);
+                                        let persona_prompt = self.persona_mgr.build_system_prompt();
+                                        let memory_prompt = self.dendrite_ctx.build_prompt(&tool_output, 4000);
+                                        let system_prompt = format!("{}\n\n=== DENDRITE CONTEXT ===\n{}", persona_prompt, memory_prompt);
                                         let endpoint = self.tier1_endpoint.clone();
                                         let model_name = self.active_model_name.clone();
                                         let prompt = if user_msg.is_empty() {
@@ -1214,19 +1395,21 @@ impl TuiApp {
     }
 
     fn get_matching_commands(&self) -> Vec<&'static SlashCommand> {
-        if !self.input.starts_with('/') {
+        let input = self.input.trim();
+        if !input.starts_with('/') {
             return Vec::new();
         }
+        let lower = input.to_lowercase();
         SLASH_COMMANDS
             .iter()
-            .filter(|cmd| cmd.name.starts_with(&self.input))
+            .filter(|cmd| cmd.name.to_lowercase().starts_with(&lower))
             .collect()
     }
 
     async fn scan_all_models(&self) -> Vec<ModelItem> {
         let mut items = self.scan_models_sync();
-        let ollama_models = fetch_ollama_models(&self.tier1_endpoint).await;
-        for name in ollama_models {
+        let native_models = fetch_native_models(&self.tier1_endpoint).await;
+        for name in native_models {
             if !items.iter().any(|i| i.name == name) {
                 items.push(ModelItem {
                     name,
@@ -1408,40 +1591,41 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             self.hw_info.cpu_brand.clone()
         };
 
+        let label_style = Style::default().fg(Color::Rgb(160, 160, 160));
         let sidebar_lines = vec![
             Line::from(Span::styled("CYNAPSE CORE", t.header_title())),
             Line::from(""),
             Line::from(Span::styled("HARDWARE TELEMETRY", t.header_title())),
-            Line::from(vec![Span::styled(" CPU: ", Style::default().fg(Color::DarkGray)), Span::styled(format!("{} ({}c)", cpu_short, self.hw_info.cpu_cores), Style::default().fg(Color::White))]),
-            Line::from(vec![Span::styled(" RAM: ", Style::default().fg(Color::DarkGray)), Span::raw(format!("{:.1}/{:.1} GB", used_gb, total_gb))]),
-            Line::from(vec![Span::styled(" Bar: ", Style::default().fg(Color::DarkGray)), Span::styled(ram_bar_str, Style::default().fg(Color::Cyan))]),
-            Line::from(vec![Span::styled(" GPU: ", Style::default().fg(Color::DarkGray)), Span::styled(&self.hw_info.gpu_info, Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(" CPU: ", label_style), Span::styled(format!("{} ({}c)", cpu_short, self.hw_info.cpu_cores), Style::default().fg(Color::White))]),
+            Line::from(vec![Span::styled(" RAM: ", label_style), Span::raw(format!("{:.1}/{:.1} GB", used_gb, total_gb))]),
+            Line::from(vec![Span::styled(" Bar: ", label_style), Span::styled(ram_bar_str, Style::default().fg(Color::Cyan))]),
+            Line::from(vec![Span::styled(" GPU: ", label_style), Span::styled(&self.hw_info.gpu_info, Style::default().fg(Color::Green))]),
             Line::from(""),
             Line::from(Span::styled("MODEL DETAILS", t.header_title())),
-            Line::from(vec![Span::styled(" Name: ", Style::default().fg(Color::DarkGray)), Span::styled(&self.active_model_name, t.active_model())]),
-            Line::from(vec![Span::styled(" Quant: ", Style::default().fg(Color::DarkGray)), Span::styled(&self.active_model_quant, Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Size:  ", Style::default().fg(Color::DarkGray)), Span::styled(&self.active_model_size, Style::default().fg(Color::Magenta))]),
-            Line::from(vec![Span::styled(" Src:   ", Style::default().fg(Color::DarkGray)), Span::raw(&self.active_model_source)]),
+            Line::from(vec![Span::styled(" Name: ", label_style), Span::styled(&self.active_model_name, t.active_model())]),
+            Line::from(vec![Span::styled(" Quant: ", label_style), Span::styled(&self.active_model_quant, Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(" Size:  ", label_style), Span::styled(&self.active_model_size, Style::default().fg(Color::Magenta))]),
+            Line::from(vec![Span::styled(" Src:   ", label_style), Span::raw(&self.active_model_source)]),
             Line::from(""),
             Line::from(Span::styled("ENGINE TIER", t.header_title())),
-            Line::from(vec![Span::styled(" Tier:  ", Style::default().fg(Color::DarkGray)), Span::styled("Tier 1 Fast", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Speed: ", Style::default().fg(Color::DarkGray)), Span::raw(format!("{:.1} tok/s", self.last_tok_per_sec))]),
-            Line::from(vec![Span::styled(" Lat:   ", Style::default().fg(Color::DarkGray)), Span::raw(format!("{:.2} s", self.last_latency_sec))]),
+            Line::from(vec![Span::styled(" Tier:  ", label_style), Span::styled("Tier 1 Fast", Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(" Speed: ", label_style), Span::raw(format!("{:.1} tok/s", self.last_tok_per_sec))]),
+            Line::from(vec![Span::styled(" Lat:   ", label_style), Span::raw(format!("{:.2} s", self.last_latency_sec))]),
             Line::from(""),
             Line::from(Span::styled("EXECUTION PIPELINE", t.header_title())),
-            Line::from(vec![Span::styled(" FTS5:  ", Style::default().fg(Color::DarkGray)), Span::styled("✓ Active", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Ranker:", Style::default().fg(Color::DarkGray)), Span::styled("✓ BM25 + Spec", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" GBNF:  ", Style::default().fg(Color::DarkGray)), Span::styled("✓ Schema Check", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" RAG:   ", Style::default().fg(Color::DarkGray)), Span::styled("✓ 4k Budget", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Engine:", Style::default().fg(Color::DarkGray)), Span::styled(if self.is_generating { "• Running..." } else { "✓ Idle" }, if self.is_generating { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Green) })]),
+            Line::from(vec![Span::styled(" FTS5:  ", label_style), Span::styled("✓ Active", Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(" Ranker:", label_style), Span::styled("✓ BM25 + Spec", Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(" GBNF:  ", label_style), Span::styled("✓ Schema Check", Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(" RAG:   ", label_style), Span::styled("✓ 4k Budget", Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(" Engine:", label_style), Span::styled(if self.is_generating { "• Running..." } else { "✓ Idle" }, if self.is_generating { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Green) })]),
             Line::from(""),
             Line::from(Span::styled("VISUAL THEME", t.header_title())),
-            Line::from(vec![Span::styled(" Theme: ", Style::default().fg(Color::DarkGray)), Span::styled(t.name(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::styled(" Theme: ", label_style), Span::styled(t.name(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
             Line::from(""),
             Line::from(Span::styled("DENDRITE MEMORY", t.header_title())),
-            Line::from(vec![Span::styled(" Nodes: ", Style::default().fg(Color::DarkGray)), Span::styled(nodes.len().to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
-            Line::from(vec![Span::styled(" Links: ", Style::default().fg(Color::DarkGray)), Span::styled(edges.len().to_string(), Style::default().fg(Color::Cyan))]),
-            Line::from(vec![Span::styled(" DB:    ", Style::default().fg(Color::DarkGray)), Span::raw("FTS5 + Spec Ranker")]),
+            Line::from(vec![Span::styled(" Nodes: ", label_style), Span::styled(nodes.len().to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::styled(" Links: ", label_style), Span::styled(edges.len().to_string(), Style::default().fg(Color::Cyan))]),
+            Line::from(vec![Span::styled(" DB:    ", label_style), Span::raw("FTS5 + Spec Ranker")]),
         ];
 
         let sidebar = Paragraph::new(sidebar_lines)
@@ -1461,7 +1645,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             }
             chat_lines.push(Line::from(""));
             chat_lines.push(Line::from(Span::styled("                      CYNAPSE LOCAL AGENT SYSTEM", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
-            chat_lines.push(Line::from(Span::styled("             Pure Rust LLM Engine + Dendrite 4-Tier Memory Graph", Style::default().fg(Color::DarkGray))));
+            chat_lines.push(Line::from(Span::styled("             Pure Rust LLM Engine + Dendrite 4-Tier Memory Graph", Style::default().fg(Color::Rgb(170, 170, 170)))));
             chat_lines.push(Line::from(""));
             chat_lines.push(Line::from(Span::styled(" Type your prompt below to start conversation... (Try /help, /model, /memory, /thinking)", Style::default().fg(Color::Cyan))));
             chat_lines.push(Line::from(""));
@@ -1582,11 +1766,11 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         // 4. Floating Slash Command Dropdown Popup
         let matching_cmds = self.get_matching_commands();
         if self.input.starts_with('/') && !self.input.contains(' ') && !matching_cmds.is_empty() {
-            let popup_height = (matching_cmds.len() as u16 + 2).min(8);
+            let popup_height = (matching_cmds.len() as u16 + 2).min(14);
             let popup_area = Rect {
                 x: main_chunks[2].x + 2,
                 y: main_chunks[2].y.saturating_sub(popup_height),
-                width: main_chunks[2].width.saturating_sub(4).min(65),
+                width: main_chunks[2].width.saturating_sub(4).min(75),
                 height: popup_height,
             };
 
@@ -1597,15 +1781,15 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 .enumerate()
                 .map(|(idx, cmd)| {
                     let is_selected = idx == self.autocomplete_idx;
-                    let style = if is_selected {
-                        t.highlight_item()
+                    let (cmd_style, desc_style) = if is_selected {
+                        (t.highlight_item(), Style::default().fg(Color::Rgb(40, 40, 40)))
                     } else {
-                        Style::default().fg(Color::White)
+                        (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), Style::default().fg(Color::Rgb(180, 180, 180)))
                     };
 
                     let line = Line::from(vec![
-                        Span::styled(format!(" {:<10} ", cmd.name), style),
-                        Span::styled(cmd.description, Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!(" {:<11} ", cmd.name), cmd_style),
+                        Span::styled(cmd.description, desc_style),
                     ]);
                     ListItem::new(line)
                 })
@@ -1631,8 +1815,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Line::from(Span::styled("CYNAPSE AGENT COMMANDS & SHORTCUTS", t.header_title())),
                     Line::from("──────────────────────────────────────────────────────────"),
                     Line::from(vec![Span::styled(" /model ", t.prompt_prefix()), Span::raw("  Open interactive model selector")]),
-                    Line::from(vec![Span::styled(" /pull  ", t.prompt_prefix()), Span::raw("  Download GGUF model from HuggingFace")]),
-                    Line::from(vec![Span::styled(" /doctor", t.prompt_prefix()), Span::raw("  Run self-healing Cynapse Doctor system diagnostic")]),
+                    Line::from(vec![Span::styled(" /pull   ", t.prompt_prefix()), Span::raw("  Download GGUF model from HuggingFace")]),
+                    Line::from(vec![Span::styled(" /persona", t.prompt_prefix()), Span::raw("  Manage agent personality markdown files (IDENTITY, SOUL, USER)")]),
+                    Line::from(vec![Span::styled(" /doctor ", t.prompt_prefix()), Span::raw("  Run self-healing Cynapse Doctor system diagnostic")]),
                     Line::from(vec![Span::styled(" /memory", t.prompt_prefix()), Span::raw("  View 3D Galaxy Memory Atlas topology")]),
                     Line::from(vec![Span::styled(" /theme ", t.prompt_prefix()), Span::raw("  Cycle visual color theme presets")]),
                     Line::from(vec![Span::styled(" /session", t.prompt_prefix()), Span::raw(" Open saved session manager (resume past runs)")]),
@@ -1863,11 +2048,22 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                             items.push(ListItem::new(line));
                         }
 
+                        let custom_idx = cat.len();
+                        let is_custom_selected = self.selected_pull_idx == custom_idx;
+                        let custom_prefix = if is_custom_selected { "> " } else { "  " };
+                        let custom_style = if is_custom_selected { t.highlight_item() } else { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) };
+
+                        items.push(ListItem::new(Line::from(vec![
+                            Span::styled(custom_prefix, custom_style),
+                            Span::styled("[ 🔗 Custom Hugging Face Model... ] ", custom_style),
+                            Span::styled("Paste custom Repo ID or GGUF URL", Style::default().fg(Color::DarkGray)),
+                        ])));
+
                         let list = List::new(items).block(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_type(BorderType::Rounded)
-                                .title(format!(" HuggingFace Model Downloader (Host RAM: {:.1} GB) — Up/Down: Select │ Enter: Download │ c/Tab: Custom HF URL ", self.hw_info.ram_total_mb as f64 / 1024.0))
+                                .title(format!(" HuggingFace Model Downloader (RAM: {:.1} GB) — Up/Down/Enter: Select │ c/Tab: Custom Model ", self.hw_info.ram_total_mb as f64 / 1024.0))
                                 .border_style(t.active_border_style()),
                         );
                         f.render_widget(list, area);
@@ -1923,37 +2119,185 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     }
                     PullerStep::Downloading => {
                         let mut lines = Vec::new();
-                        lines.push(Line::from(Span::styled("DOWNLOADING HUGGINGFACE MODEL...", t.header_title())));
-                        lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                        let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                        let spinner = spinner_frames[self.anim_tick % spinner_frames.len()];
 
                         if let Some(st) = &self.current_download_state {
-                            let filled = ((st.pct / 100.0) * 30.0) as usize;
-                            let bar_str = format!("[{}{}] {:.1}%", "█".repeat(filled), "░".repeat(30 - filled.min(30)), st.pct);
-                            let downloaded_mb = st.downloaded_bytes as f64 / 1_048_576.0;
-                            let total_mb = st.total_bytes as f64 / 1_048_576.0;
+                            if let Some(err) = &st.error {
+                                lines.push(Line::from(Span::styled("❌ DOWNLOAD FAILED", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
+                                lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                                lines.push(Line::from(vec![
+                                    Span::styled(" Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                                    Span::styled(err, Style::default().fg(Color::LightRed)),
+                                ]));
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled("Press Esc, q, or Enter to dismiss this screen.", Style::default().fg(Color::Yellow))));
+                            } else if st.is_done {
+                                lines.push(Line::from(Span::styled("✓ DOWNLOAD COMPLETE!", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+                                lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                                lines.push(Line::from(vec![
+                                    Span::styled(" Saved & Activated: ", Style::default().fg(Color::DarkGray)),
+                                    Span::styled(&st.model_name, t.active_model()),
+                                ]));
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled("Press Esc, q, or Enter to return to chat.", Style::default().fg(Color::Green))));
+                            } else {
+                                lines.push(Line::from(vec![
+                                    Span::styled(format!("{} DOWNLOADING HUGGINGFACE MODEL...", spinner), t.header_title()),
+                                ]));
+                                lines.push(Line::from("──────────────────────────────────────────────────────────"));
 
-                            lines.push(Line::from(vec![Span::styled(" Model: ", Style::default().fg(Color::DarkGray)), Span::styled(&st.model_name, t.active_model())]));
-                            lines.push(Line::from(vec![Span::styled(" Speed: ", Style::default().fg(Color::DarkGray)), Span::styled(format!("{:.2} MB/s", st.speed_mbps), Style::default().fg(Color::Green))]));
-                            lines.push(Line::from(vec![Span::styled(" Size:  ", Style::default().fg(Color::DarkGray)), Span::raw(format!("{:.1} / {:.1} MB", downloaded_mb, total_mb))]));
-                            lines.push(Line::from(""));
-                            lines.push(Line::from(Span::styled(bar_str, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+                                let filled = ((st.pct / 100.0) * 30.0) as usize;
+                                let bar_str = format!("[{}{}] {:.1}%", "█".repeat(filled), "░".repeat(30 - filled.min(30)), st.pct);
+                                let downloaded_mb = st.downloaded_bytes as f64 / 1_048_576.0;
+                                let total_mb = st.total_bytes as f64 / 1_048_576.0;
+
+                                lines.push(Line::from(vec![Span::styled(" Model: ", Style::default().fg(Color::DarkGray)), Span::styled(&st.model_name, t.active_model())]));
+                                lines.push(Line::from(vec![Span::styled(" Speed: ", Style::default().fg(Color::DarkGray)), Span::styled(format!("{:.2} MB/s", st.speed_mbps), Style::default().fg(Color::Green))]));
+                                lines.push(Line::from(vec![Span::styled(" Size:  ", Style::default().fg(Color::DarkGray)), Span::raw(format!("{:.1} / {:.1} MB", downloaded_mb, total_mb))]));
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled(bar_str, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled("Download running in background. Press Esc/q to dismiss window.", Style::default().fg(Color::DarkGray))));
+                            }
                         } else {
-                            lines.push(Line::from(" Initializing download connection..."));
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("{} Initializing download connection...", spinner), t.header_title()),
+                            ]));
                         }
 
-                        lines.push(Line::from(""));
-                        lines.push(Line::from(Span::styled("Download running in background. Press Esc/q to dismiss window.", Style::default().fg(Color::DarkGray))));
+                        let is_err = self.current_download_state.as_ref().and_then(|s| s.error.as_ref()).is_some();
+                        let is_done = self.current_download_state.as_ref().map(|s| s.is_done && s.error.is_none()).unwrap_or(false);
+                        let border_style = if is_err {
+                            Style::default().fg(Color::Red)
+                        } else if is_done {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            t.active_border_style()
+                        };
 
                         let modal = Paragraph::new(lines).block(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_type(BorderType::Rounded)
-                                .title(" Downloading GGUF Model ")
-                                .border_style(t.active_border_style()),
+                                .title(if is_err { " Download Error " } else if is_done { " Download Complete " } else { " Downloading GGUF Model " })
+                                .border_style(border_style),
                         );
                         f.render_widget(modal, area);
                     }
                 }
+            }
+            ActiveModal::PersonaManager => {
+                let area = centered_rect(82, 75, f.area());
+                f.render_widget(Clear, area);
+
+                let outer_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 🎭 System Persona Manager ")
+                    .border_style(t.active_border_style());
+
+                let inner_area = outer_block.inner(area);
+                f.render_widget(outer_block, area);
+
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+                    .split(inner_area);
+
+                let personas = self.persona_mgr.list_personas();
+                let active_file = self.persona_mgr.active_persona_file.clone();
+
+                let selected_idx = self.selected_persona_idx.min(personas.len().saturating_sub(1));
+
+                // Left Panel: Available persona markdown files
+                let items: Vec<ListItem> = personas
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let is_selected = i == selected_idx;
+                        let is_active = active_file.as_deref() == Some(name.as_str());
+
+                        let cursor = if is_selected { "> " } else { "  " };
+                        let active_badge = if is_active { " [ACTIVE]" } else { "" };
+
+                        let style = if is_selected {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else if is_active {
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+
+                        ListItem::new(Line::from(vec![
+                            Span::styled(format!("{}{}.md", cursor, name), style),
+                            Span::styled(active_badge, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                        ]))
+                    })
+                    .collect();
+
+                let list = List::new(items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" Available Personas ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+                f.render_widget(list, chunks[0]);
+
+                // Right Panel: Persona Preview & System Prompt
+                let mut right_lines = Vec::new();
+                if let Some(selected_name) = personas.get(selected_idx) {
+                    let content = self.persona_mgr.read_file_or_empty(selected_name);
+                    let is_active = active_file.as_deref() == Some(selected_name.as_str());
+
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Selected Persona File: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("{}.md", selected_name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        if is_active {
+                            Span::styled("  ★ CURRENTLY ACTIVE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                        } else {
+                            Span::raw("")
+                        },
+                    ]));
+                    right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                    right_lines.push(Line::from(Span::styled("File Content Preview:", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD))));
+
+                    for l in content.lines().take(12) {
+                        right_lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Gray))));
+                    }
+                    if content.lines().count() > 12 {
+                        right_lines.push(Line::from(Span::styled("  ... [content truncated]", Style::default().fg(Color::DarkGray))));
+                    }
+                } else {
+                    right_lines.push(Line::from(Span::styled("No persona files found in ~/.cynapse/persona/", Style::default().fg(Color::Red))));
+                }
+
+                right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                let active_status_str = match &active_file {
+                    Some(name) => format!("Custom Persona ({}.md)", name),
+                    None => "Default Identity (IDENTITY.md + SOUL.md + USER.md)".to_string(),
+                };
+                right_lines.push(Line::from(vec![
+                    Span::styled("Active Persona Mode: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(active_status_str, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                ]));
+
+                right_lines.push(Line::from(""));
+                right_lines.push(Line::from(Span::styled("Controls:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+                right_lines.push(Line::from("  • Up/Down Arrow : Navigate persona files"));
+                right_lines.push(Line::from("  • Enter         : Activate highlighted persona"));
+                right_lines.push(Line::from("  • r             : Reset to default persona identity"));
+                right_lines.push(Line::from("  • Esc / q       : Close persona manager modal"));
+
+                let preview_p = Paragraph::new(right_lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" Persona Details & Controls ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+                f.render_widget(preview_p, chunks[1]);
             }
             ActiveModal::None => {}
         }
@@ -2011,7 +2355,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         }
 
         // 3. Category Cluster Center Orbits around Central Star
-        let anim_spin = (self.anim_tick as f32) * 0.02;
+        let anim_spin = self.galaxy_anim_spin;
 
         let category_clusters = [
             (cynapse_memory::graph::NodeCategory::Meta, 6.0, 0.0 + anim_spin, Color::Green, "Meta"),

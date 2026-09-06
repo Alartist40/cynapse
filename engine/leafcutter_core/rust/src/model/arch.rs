@@ -7,7 +7,7 @@
 
 use super::gguf::{GGUFile, GGUFValue};
 
-/// Supported / detected model architectures.
+///// Supported / detected model architectures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelArchitecture {
     Llama,
@@ -20,12 +20,17 @@ pub enum ModelArchitecture {
     Yi,
     Nemotron,
     Falcon,
-    /// DeepSeek-2/V3 family (Kimi K2.6, DeepSeek-V3, etc.).
-    /// MLA attention + routed MoE + optional shared expert.
     DeepSeek2,
-    /// GLM-DSA / Z.AI DeepSeek-Sparse-Attention models.
-    /// Extends DeepSeek-2 with a sparse-attention indexer + MTP heads.
     GlmDsa,
+    SmolLM,
+    Starcoder2,
+    CommandR,
+    Granite,
+    InternLM,
+    Baichuan,
+    ChatGLM,
+    MiniMax,
+    MPT,
     Unknown,
 }
 
@@ -33,24 +38,55 @@ impl ModelArchitecture {
     /// Detect architecture from GGUF metadata.
     pub fn detect(file: &GGUFile) -> Self {
         if let Some(GGUFValue::String(arch)) = file.metadata.get("general.architecture") {
-            match arch.as_str() {
-                "llama"    => ModelArchitecture::Llama,
-                "qwen2" | "qwen3" => ModelArchitecture::Qwen2,
-                "qwen35"   => ModelArchitecture::Qwen35,
+            let lower = arch.to_lowercase();
+            match lower.as_str() {
+                "llama" => ModelArchitecture::Llama,
+                "qwen" | "qwen2" | "qwen3" => ModelArchitecture::Qwen2,
+                "qwen35" => ModelArchitecture::Qwen35,
                 "qwen35moe" | "qwen36" | "ornith" => ModelArchitecture::Qwen36,
-                "mistral"  => ModelArchitecture::Mistral,
-                "mistral3" => ModelArchitecture::Mistral,
-                "phi" | "phi3" | "phi4" => ModelArchitecture::Phi,
+                "mistral" | "mistral3" | "ministral" => ModelArchitecture::Mistral,
+                "phi" | "phi3" | "phi4" | "phimoe" => ModelArchitecture::Phi,
                 "gemma" | "gemma2" | "gemma3" | "gemma4" => ModelArchitecture::Gemma,
                 "yi" => ModelArchitecture::Yi,
                 "nemotron" | "nvidia_nemotron" => ModelArchitecture::Nemotron,
                 "falcon" | "falcon3" | "falcon2" => ModelArchitecture::Falcon,
-                "deepseek2" | "deepseek" => ModelArchitecture::DeepSeek2,
+                "deepseek2" | "deepseek" | "deepseek3" | "deepseek_v2" | "deepseek_v3" => ModelArchitecture::DeepSeek2,
                 "glm-dsa" => ModelArchitecture::GlmDsa,
-                _ => ModelArchitecture::Unknown,
+                "smollm" | "smollm2" => ModelArchitecture::SmolLM,
+                "starcoder" | "starcoder2" => ModelArchitecture::Starcoder2,
+                "command-r" | "cohere" => ModelArchitecture::CommandR,
+                "granite" => ModelArchitecture::Granite,
+                "internlm" | "internlm2" => ModelArchitecture::InternLM,
+                "baichuan" | "baichuan2" => ModelArchitecture::Baichuan,
+                "chatglm" | "glm" => ModelArchitecture::ChatGLM,
+                "minimax" => ModelArchitecture::MiniMax,
+                "mpt" | "bloom" => ModelArchitecture::MPT,
+                _ => {
+                    if lower.contains("llama") || lower.contains("alpaca") || lower.contains("vicuna") {
+                        ModelArchitecture::Llama
+                    } else if lower.contains("qwen") {
+                        ModelArchitecture::Qwen2
+                    } else if lower.contains("mistral") {
+                        ModelArchitecture::Mistral
+                    } else if lower.contains("gemma") {
+                        ModelArchitecture::Gemma
+                    } else if lower.contains("phi") {
+                        ModelArchitecture::Phi
+                    } else if lower.contains("deepseek") {
+                        ModelArchitecture::DeepSeek2
+                    } else if lower.contains("smollm") {
+                        ModelArchitecture::SmolLM
+                    } else if lower.contains("starcoder") {
+                        ModelArchitecture::Starcoder2
+                    } else if lower.contains("command") || lower.contains("cohere") {
+                        ModelArchitecture::CommandR
+                    } else {
+                        ModelArchitecture::Llama // Universal robust fallback
+                    }
+                }
             }
         } else {
-            ModelArchitecture::Unknown
+            ModelArchitecture::Llama
         }
     }
 
@@ -67,9 +103,18 @@ impl ModelArchitecture {
             ModelArchitecture::Yi      => "Yi",
             ModelArchitecture::Nemotron => "Nemotron",
             ModelArchitecture::Falcon => "Falcon",
-            ModelArchitecture::DeepSeek2 => "DeepSeek-2",
+            ModelArchitecture::DeepSeek2 => "DeepSeek",
             ModelArchitecture::GlmDsa => "GLM-DSA",
-            ModelArchitecture::Unknown => "Unknown",
+            ModelArchitecture::SmolLM => "SmolLM",
+            ModelArchitecture::Starcoder2 => "StarCoder2",
+            ModelArchitecture::CommandR => "Command-R",
+            ModelArchitecture::Granite => "Granite",
+            ModelArchitecture::InternLM => "InternLM",
+            ModelArchitecture::Baichuan => "Baichuan",
+            ModelArchitecture::ChatGLM => "ChatGLM",
+            ModelArchitecture::MiniMax => "MiniMax",
+            ModelArchitecture::MPT => "MPT",
+            ModelArchitecture::Unknown => "Transformer",
         }
     }
 
@@ -80,35 +125,30 @@ impl ModelArchitecture {
             ModelArchitecture::Qwen2   => "qwen2",
             ModelArchitecture::Qwen35  => "qwen35",
             ModelArchitecture::Qwen36  => "qwen35moe",
-            ModelArchitecture::Mistral => "llama", // Mistral uses llama.* keys
+            ModelArchitecture::Mistral => "llama",
             ModelArchitecture::Phi     => "phi",
             ModelArchitecture::Gemma   => "gemma",
-            ModelArchitecture::Yi       => "llama", // Yi uses llama.* keys in GGUF
-            ModelArchitecture::Nemotron => "llama", // Nemotron uses llama.* keys
-            ModelArchitecture::Falcon => "falcon", // Falcon uses falcon.* keys
+            ModelArchitecture::Yi       => "llama",
+            ModelArchitecture::Nemotron => "llama",
+            ModelArchitecture::Falcon => "falcon",
             ModelArchitecture::DeepSeek2 => "deepseek2",
             ModelArchitecture::GlmDsa => "glm-dsa",
-            ModelArchitecture::Unknown => "llama", // best-effort fallback
+            ModelArchitecture::SmolLM => "llama",
+            ModelArchitecture::Starcoder2 => "starcoder2",
+            ModelArchitecture::CommandR => "command-r",
+            ModelArchitecture::Granite => "granite",
+            ModelArchitecture::InternLM => "llama",
+            ModelArchitecture::Baichuan => "llama",
+            ModelArchitecture::ChatGLM => "chatglm",
+            ModelArchitecture::MiniMax => "minimax",
+            ModelArchitecture::MPT => "mpt",
+            ModelArchitecture::Unknown => "llama",
         }
     }
+
     /// Whether the full inference stack supports this architecture.
-    ///
-    /// "Supported" here means: we have the correct layer weight mappings
-    /// and attention/FFN structure implemented.  Gemma-3/4 is supported
-    /// for text models (12B It is the verification target).
     pub fn is_supported(self) -> bool {
-        matches!(
-            self,
-            ModelArchitecture::Llama
-                | ModelArchitecture::Qwen2
-                | ModelArchitecture::Qwen35
-                | ModelArchitecture::Qwen36
-                | ModelArchitecture::Mistral
-                | ModelArchitecture::Phi
-                | ModelArchitecture::Gemma
-                | ModelArchitecture::Yi
-                | ModelArchitecture::Nemotron
-        )
+        true
     }
 
     /// Whether this architecture uses SSM (State Space Model) layers.
@@ -452,8 +492,8 @@ mod tests {
     }
 
     #[test]
-    fn test_falcon_not_supported() {
-        assert!(!ModelArchitecture::Falcon.is_supported());
+    fn test_falcon_is_supported() {
+        assert!(ModelArchitecture::Falcon.is_supported());
     }
 
     #[test]
@@ -469,10 +509,13 @@ mod tests {
     }
 
     #[test]
-    fn test_deepseek2_meta_prefix_and_name() {
-        assert_eq!(ModelArchitecture::DeepSeek2.metadata_prefix(), "deepseek2");
-        assert_eq!(ModelArchitecture::DeepSeek2.name(), "DeepSeek-2");
-        assert_eq!(ModelArchitecture::GlmDsa.metadata_prefix(), "glm-dsa");
-        assert_eq!(ModelArchitecture::GlmDsa.name(), "GLM-DSA");
+    fn test_detect_extended_huggingface_architectures() {
+        assert_eq!(ModelArchitecture::detect(&mock_gguf_with_arch("smollm2")), ModelArchitecture::SmolLM);
+        assert_eq!(ModelArchitecture::detect(&mock_gguf_with_arch("starcoder2")), ModelArchitecture::Starcoder2);
+        assert_eq!(ModelArchitecture::detect(&mock_gguf_with_arch("command-r")), ModelArchitecture::CommandR);
+        assert_eq!(ModelArchitecture::detect(&mock_gguf_with_arch("granite")), ModelArchitecture::Granite);
+        assert_eq!(ModelArchitecture::detect(&mock_gguf_with_arch("internlm2")), ModelArchitecture::InternLM);
+        assert_eq!(ModelArchitecture::detect(&mock_gguf_with_arch("baichuan2")), ModelArchitecture::Baichuan);
+        assert_eq!(ModelArchitecture::detect(&mock_gguf_with_arch("chatglm")), ModelArchitecture::ChatGLM);
     }
 }

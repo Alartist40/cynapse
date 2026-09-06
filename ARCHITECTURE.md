@@ -33,14 +33,15 @@ cynapse-mini/
 - **`src/main.rs`**: Resolves local `./models` directories dynamically across the filesystem, parses command-line arguments using `clap` (`--cli`, `--tui`, `--resume`, `list`, `run`, `route`, `pull`, `memory`), and launches `TuiSession`.
 - **`cynapse-core`**:
   - `session.rs`: Handles disk serialization (`SessionData`) to `~/.cynapse/sessions/<id>.json`. Provides atomic session listing, saving, loading, and transcript recovery.
-  - `offline_agent.rs`: Atomic-Agent inspired offline utilities:
-    - `validate_gbnf_tool_call()`: Strict GBNF JSON tool call syntax validator.
+  - `offline_agent.rs`: Offline agent utilities:
+    - `validate_gbnf_tool_calls()`: Strict GBNF JSON tool call syntax validator supporting single objects and batch arrays (`[{"tool": "...", "args": {...}}]`).
     - `format_stable_kv_prompt()`: Invariant system prompt prefix formatter ensuring 100% KV-cache hit rate.
     - `LoopGuard`: Circular buffer tracking tool call hashes and triggering automated intervention upon 3+ identical consecutive invocations.
-  - `doctor.rs`: Cynapse Self-Healing System Doctor auditing 9 critical subsystem areas (RAM safety headroom, AVX2 SIMD, GGUF magic headers, SQLite/FTS5 integrity, GBNF schema parser, atomic tools, Tokio channels) and performing automatic self-healing repairs.
-  - `downloader.rs`: Atomic-Agent inspired model downloader & recommendation engine:
+  - `persona.rs`: Manages markdown system persona files (`IDENTITY.md`, `SOUL.md`, `USER.md`, `SYSTEM.md`) in `~/.cynapse/persona/`, constructing high-character, non-generic system prompts.
+  - `doctor.rs`: Cynapse Self-Healing System Doctor auditing 9 critical subsystem areas (RAM safety headroom, AVX2 SIMD, GGUF magic headers, SQLite/FTS5 integrity, GBNF schema parser, atomic tools, Tokio channels, Tier-1 LLM endpoint, and Markdown Persona System) performing automatic self-healing repairs via CLI `cynapse doctor [--fix]` or TUI `/doctor`.
+  - `downloader.rs`: Model downloader & recommendation engine:
     - `recommend_model_for_hardware()`: Selects optimal GGUF model based on host RAM.
-    - `resolve_hf_download_url()`: Parses HuggingFace URLs / identifiers into GGUF paths and target quantization tags.
+    - `resolve_hf_download_url_async()`: Uses HuggingFace API repository tree discovery (`/api/models/{repo}/tree/main`) to locate exact GGUF filenames for custom model repos, handling case/format differences automatically.
     - `stream_download_hf_model()`: Async stream downloader forwarding progress callbacks (`speed_mbps`, `downloaded_bytes`, `pct`).
   - `lib.rs`: Implements atomic agent tool execution (`read_file`, `write_file`, `grep`, `execute_command`) and HuggingFace streaming downloader.
 - **`cynapse-tui`**:

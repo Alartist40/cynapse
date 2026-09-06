@@ -2,6 +2,68 @@
 
 All notable changes to the Cynapse AI Agent System are documented in this file.
 
+## [1.9.0] - 2026-09-06
+
+### 🚀 Tier-1 Parallel Speed Acceleration & Markdown Persona Engine (`/persona`)
+- **Parallel GEMV Kernel Acceleration**: Fixed single-threaded matrix multiplication bottleneck in quantization kernels (`q4_k_gemm`, `q6_k_gemm`, `q5_k_gemm`, `iq4_nl_gemm`) by lowering the Rayon multi-core execution threshold from `n >= 4096` to `n >= 256`. Single-row GEMV operations for key, value, query, and FFN projections across all sub-4096 layer dimensions now run multi-threaded across all CPU cores.
+- **CPU SMT Core Optimization**: Optimized `default_thread_count()` in `init.rs` to fully utilize physical CPU core capacity on multi-core Ryzen/Intel hardware.
+- **Markdown Persona Management System (`cynapse-core::persona`)**: Implemented `PersonaManager` handling markdown system persona files (`IDENTITY.md`, `SOUL.md`, `USER.md`, `SYSTEM.md`) stored in `~/.cynapse/persona/`. Seeded default personas for direct, concise, non-generic responses.
+- **Interactive TUI `/persona` Slash Command**: Integrated `/persona` slash command into `cynapse-tui` supporting `/persona`, `/persona list`, `/persona load <name>`, `/persona set <name>`, `/persona show`, and `/persona default`.
+- **Cynapse Doctor Audit Expansion (Check 9)**: Added Check 9 (`check_persona_subsystem`) to `CynapseDoctor` auditing markdown persona directory health, file integrity, and dynamic system prompt compilation.
+
+## [1.8.0] - 2026-09-06
+
+### 🌐 Universal HuggingFace Model Auto-Detection & Execution Engine
+- **Universal Architecture Support**: Extended `ModelArchitecture` enum and `detect()` in `leafcutter_core` to auto-detect and run HuggingFace GGUF models across 20+ model families (`SmolLM`, `Starcoder2`, `CommandR`, `Granite`, `InternLM`, `Baichuan`, `ChatGLM`, `MiniMax`, `MPT`, `DeepSeek`, `Llama`, `Qwen`, `Mistral`, `Gemma`, `Phi`, `Yi`, `Nemotron`, `Falcon`).
+- **Dynamic Key Fallback & Auto-Binding**: Added fuzzy case-insensitive architecture parser and robust fallback layer mappings so unknown or custom HuggingFace GGUF architectures map cleanly to transformer layer execution graphs.
+- **Universal Model Resolver Keywords**: Expanded `resolve_model_tag()` in `cynapse-engine` with keywords (`smollm`, `starcoder`, `command`, `granite`, `internlm`, `baichuan`, `chatglm`, `minimax`, `falcon`, `yi`, `nemotron`, `cohere`) for instant resolution of custom HuggingFace filenames.
+- **GGUF Header Inspector**: Added `inspect_gguf_header()` in `cynapse-core` to inspect GGUF magic bytes, version header, tensor counts, and metadata KV entries.
+
+## [1.7.0] - 2026-09-06
+
+### 🌿 Pure Native Leafcutter Engine Transition (Zero External Dependencies)
+- **Ollama Dependency Removal**: Disconnected Cynapse's inference runner from external Ollama daemons (`http://127.0.0.1:11434`). Cynapse now operates completely self-contained using its in-house **Leafcutter Rust Engine** (`engine/leafcutter_core/rust`).
+- **Direct GGUF Storage Placement**: Stream downloader places downloaded HuggingFace `.gguf` files directly into `./models/` and `~/.cynapse/models/` without executing `ollama create` CLI commands.
+- **Native GGUF Directory Scanning**: `fetch_native_models()` scans local `./models/` directories and native endpoints, dynamically resolving GGUF files on disk.
+- **Cynapse Doctor Audit Upgrade**: Updated `cynapse doctor` (`check_llm_endpoint_and_models`) to audit the Cynapse Native Leafcutter Engine and verify local GGUF catalog readiness.
+- **In-House Memory Unload**: `/unload`, `/stop`, and `/free` slash commands invoke `cynapse_engine::unload_model()` to clear model weight allocations directly without external process calls.
+
+## [1.6.0] - 2026-09-06
+
+### 🩺 Cynapse Self-Healing Doctor System (`cynapse doctor` & `/doctor`)
+- **Expanded Subsystem Diagnostics**: Added Tier-1 LLM Engine Endpoint & Model Tag Registration alignment check (`check_llm_endpoint_and_models`). Cynapse Doctor now audits local HTTP runner connectivity (`http://localhost:11434`), checks registered Ollama tags, and compares them with local `.gguf` files in `~/.cynapse/models`.
+- **Interactive TUI `/doctor` Command**: Integrated `/doctor`, `/doc`, and `/heal` slash commands into the TUI to trigger immediate live diagnostics and automatic background self-healing.
+
+### ⚡ Tier-1 Payload Standardisation & Error Body Extraction
+- **HTTP 400 Payload Fix**: Standardized JSON request payload in `query_tier1_stream()` with standard fields (`num_ctx`, `temperature`), eliminating HTTP 400 Bad Request errors caused by non-standard `options` parameters on Ollama endpoints.
+- **Detailed Error Body Extraction**: Extracted full HTTP error response text from LLM engine responses (`res.text().await`), displaying exact error descriptions from Ollama / llama.cpp / vLLM servers instead of generic status strings.
+- **Model Tag Fallback Safety**: Fixed model tag resolution so selecting local GGUF models preserves the target filename instead of forcibly overriding to `available_tags[0]`.
+
+### 📋 Universal Terminal Paste Engine (`Ctrl+V` & Bracketed Paste)
+- **Bracketed Paste Mode**: Enabled `EnableBracketedPaste` and `DisableBracketedPaste` in `TuiRuntimeGuard` for seamless terminal mouse right-click, Shift+Insert, and paste menu operations.
+- **System Clipboard Fallback**: Added `Ctrl+V` keyboard shortcut handling interfacing with `wl-paste` (Wayland) and `xclip` (X11), pasting URLs and prompts directly into the active input field.
+
+### 🌌 3D Galaxy Atlas & Downloader Enhancements
+- **Complete Orbit Pause**: Replaced frame-based ticks with `galaxy_anim_spin`, ensuring 100% of stars, cluster centers, and links freeze completely when auto-spin is paused (`Spacebar`/`s`).
+- **Sticky Download Modal**: Kept download progress modal visible on HTTP errors or completion with explicit user dismissal options (`Esc`/`q`/`Enter`).
+
+---
+
+## [1.5.0] - 2026-09-06
+
+### 📥 Enhanced HuggingFace Model Downloader & Custom Repo Resolution
+- **Custom Model Entry in Curated Catalog**: Added an explicit `[ 🔗 Custom Hugging Face Model... ]` entry to the curated download list, selectable via arrow keys or keyboard shortcuts (`c` / `Tab`).
+- **Flexible HuggingFace Link & Repo Handling**: Supports pasting full HuggingFace direct file links (converting `/blob/main/` to `/resolve/main/` automatically), repository IDs (e.g. `Qwen/Qwen2.5-7B-Instruct-GGUF`, `TheBloke/Llama-2-7B-GGUF`), or custom URLs.
+- **Quantization Selector Expansion**: Expanded target quantization options to include `Q4_K_M`, `Q5_K_M`, `Q8_0`, `F16`, `Q2_K`, `Q3_K_M`, `Q6_K`, and `IQ4_NL`.
+- **Automatic Model Rescanning & Auto-Activation**: rescan models automatically upon download completion and update active model quant, size, and source metadata immediately.
+- **Unified Persistent Storage (`~/.cynapse/models`)**: Standardized model storage location to `~/.cynapse/models` across all execution contexts, ensuring downloaded models are instantly recognized regardless of current working directory.
+
+### 🛡️ GBNF Batch Tools, Agent Loop Safeguards & Retry Jitter
+- **GBNF Batch Tool Call Parser**: Upgraded `validate_gbnf_tool_calls()` to parse single JSON tool objects and batch arrays (`[{"tool": "...", "args": {...}}]`).
+- **Agent Tool Step Limiter**: Added maximum step depth limit (`MAX_AGENT_STEPS = 5`) to prevent infinite autonomous tool loops.
+- **User Prompt Context Preservation**: Retains original user query intent when re-prompting model after tool execution (`User Request: {}\n\nTool Result for {}:\n{}\n\nContinue resolution.`).
+- **Exponential Backoff Jitter**: Added 0..100ms random jitter calculation to 3x exponential backoff retries in `query_tier1_stream()`.
+
 ---
 
 ## [1.4.0] - 2026-09-05

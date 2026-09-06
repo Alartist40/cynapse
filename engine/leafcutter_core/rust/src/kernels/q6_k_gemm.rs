@@ -326,7 +326,7 @@ pub fn q6_k_matmul_transposed_b(a: &[f32], b: &Q6KMatrix, c: &mut [f32], m: usiz
                 use rayon::prelude::*;
                 // Parallel over columns. Each column accumulates into one
                 // output slot, so parallel writes never conflict.
-                if n >= 4096 {
+                if n >= 256 {
                     c.par_iter_mut().enumerate().for_each(|(j, out)| {
                         let row_base = j * bpr;
                         let acc = unsafe { q6_k_gemv_col_avx2(a_row, &b.blocks[row_base..row_base + bpr], k) };
@@ -387,7 +387,7 @@ pub fn q6_k_matmul_transposed_b(a: &[f32], b: &Q6KMatrix, c: &mut [f32], m: usiz
         }
     };
 
-    if n >= 4096 {
+    if n >= 256 {
         use rayon::prelude::*;
         let col_results: Vec<Vec<f32>> = (0..n)
             .into_par_iter()

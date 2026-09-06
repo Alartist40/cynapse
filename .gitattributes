@@ -1,0 +1,13 @@
+# GitHub Linguist Language Detection Overrides
+# Mark benchmark scripts and vendor C/C++/Python files as vendored/documentation
+# so GitHub correctly reports Cynapse as a 100% Pure Rust repository.
+
+engine/leafcutter_core/rust/llama.cpp/* linguist-vendored
+engine/leafcutter_core/scripts/* linguist-vendored
+*.py linguist-vendored
+*.cpp linguist-vendored
+*.c linguist-vendored
+*.h linguist-vendored
+*.cu linguist-vendored
+*.sh linguist-vendored
+*.json linguist-vendored

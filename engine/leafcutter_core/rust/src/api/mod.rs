@@ -178,6 +178,30 @@ impl NativeStreamingEngine {
             tokenizer: Arc::new(tokenizer),
         })
     }
+
+    pub fn generate_stream<F>(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        mut on_token: F,
+    ) -> Result<(String, Vec<usize>), String>
+    where
+        F: FnMut(&str),
+    {
+        let mut engine = self.engine.lock().map_err(|_| "Engine lock poisoned".to_string())?;
+        let tokens = self.tokenizer.encode(prompt);
+
+        let mut text_buf = String::new();
+        let generated = engine.generate_streaming_with(&tokens, max_tokens, temperature, top_p, |_id, piece| {
+            text_buf.push_str(piece);
+            on_token(piece);
+            true
+        });
+
+        Ok((text_buf, generated))
+    }
 }
 
 impl LeafcutterEngine for NativeStreamingEngine {

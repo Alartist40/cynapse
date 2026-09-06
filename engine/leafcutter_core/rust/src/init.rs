@@ -69,7 +69,7 @@ pub fn default_thread_count() -> usize {
             }
         }
         if phys > 0 {
-            return (phys.saturating_sub(1)).max(2);
+            return phys.max(2);
         }
     }
     // Fallback for x86 SMT
