@@ -203,11 +203,18 @@ pub struct ExecutionStats {
 }
 
 #[derive(Serialize)]
+struct GenerateOptions {
+    cache_prompt: bool,
+    slot_id: i32,
+}
+
+#[derive(Serialize)]
 struct GenerateReq<'a> {
     model: &'a str,
     prompt: &'a str,
     system: &'a str,
     stream: bool,
+    options: GenerateOptions,
 }
 
 #[derive(Deserialize)]
@@ -243,24 +250,46 @@ pub async fn query_tier1_stream(
         let stripped = model_name.trim_end_matches(".gguf").to_string();
         if available_tags.contains(&stripped) {
             resolved_model = stripped;
-        } else if let Some(matched) = available_tags.iter().find(|t| t.contains("qwen") || t.contains("ministral") || t.contains("llama") || t.starts_with(&stripped)) {
+        } else if let Some(matched) = available_tags.iter().find(|t| t == &&stripped || t.starts_with(&stripped)) {
             resolved_model = matched.clone();
         } else {
             resolved_model = available_tags[0].clone();
         }
     }
 
-    let mut res = client
-        .post(&url)
-        .json(&GenerateReq {
+    let mut attempt = 0;
+    let max_attempts = 3;
+    let mut delay_ms = 200u64;
+
+    let mut res = loop {
+        attempt += 1;
+        let req_builder = client.post(&url).json(&GenerateReq {
             model: &resolved_model,
             prompt,
             system: system_prompt,
             stream: true,
-        })
-        .send()
-        .await
-        .with_context(|| format!("Unable to connect to local LLM engine at {}. Ensure engine is active.", endpoint))?;
+            options: GenerateOptions {
+                cache_prompt: true,
+                slot_id: 0,
+            },
+        });
+
+        match req_builder.send().await {
+            Ok(resp) if resp.status().is_success() => break resp,
+            Ok(resp) if resp.status().is_server_error() && attempt < max_attempts => {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms *= 2;
+            }
+            Ok(resp) => break resp,
+            Err(_err) if attempt < max_attempts => {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms *= 2;
+            }
+            Err(err) => {
+                anyhow::bail!("Unable to connect to local LLM engine at {}: {}", endpoint, err);
+            }
+        }
+    };
 
     // Retry once with raw model_name if resolved tag returned 404
     if res.status() == reqwest::StatusCode::NOT_FOUND && resolved_model != model_name {
@@ -271,6 +300,10 @@ pub async fn query_tier1_stream(
                 prompt,
                 system: system_prompt,
                 stream: true,
+                options: GenerateOptions {
+                    cache_prompt: true,
+                    slot_id: 0,
+                },
             })
             .send()
             .await

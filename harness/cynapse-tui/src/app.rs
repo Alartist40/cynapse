@@ -348,10 +348,32 @@ impl TuiApp {
         let target_idx = chars.last().map(|&(idx, ch)| idx + ch.len_utf8()).unwrap_or(0);
         self.input.drain(target_idx..self.input_cursor);
         self.input_cursor = target_idx;
-        self.autocomplete_idx = 0;
+    }
+
+    fn execute_tool_and_format(&mut self, call: &cynapse_core::offline_agent::ToolCall) -> (String, bool) {
+        let name = &call.name;
+        let args = &call.arguments;
+
+        let arg1 = args.get("path")
+            .or_else(|| args.get("query"))
+            .or_else(|| args.get("command"))
+            .or_else(|| args.get("arg1"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let arg2 = args.get("content")
+            .or_else(|| args.get("dir"))
+            .or_else(|| args.get("arg2"))
+            .and_then(|v| v.as_str());
+
+        match cynapse_core::execute_tool(name, arg1, arg2) {
+            Ok(output) => (output, true),
+            Err(e) => (format!("Tool execution error: {}", e), false),
+        }
     }
 
     pub fn load_session(&mut self, session_id: &str) -> Result<()> {
+        self.autocomplete_idx = 0;
         let data = self.session_mgr.load_session(session_id)?;
         self.session_id = data.session_id;
         self.active_model_name = data.model_name;
@@ -1053,58 +1075,109 @@ impl TuiApp {
                     self.last_tok_per_sec = tok_per_sec;
                     self.last_latency_sec = elapsed_sec;
 
+                    let mut triggered_reprompt = false;
+
                     // Offline Agent: GBNF tool call check & circular LoopGuard intervention
                     if let Ok(tool_call) = validate_gbnf_tool_call(&self.current_response_buf) {
-                        if let Err(loop_warn) = self.loop_guard.record_and_check(&tool_call) {
-                            self.messages.push(ChatMessage {
-                                role: "system".into(),
-                                content: loop_warn,
-                                thinking: None,
-                            });
-                        }
-                    }
+                        match self.loop_guard.record_and_check(&tool_call) {
+                            Ok(()) => {
+                                let (tool_output, ok) = self.execute_tool_and_format(&tool_call);
+                                self.messages.push(ChatMessage {
+                                    role: "system".into(),
+                                    content: format!("🔧 Tool Call [{}] Executed:\n{}", tool_call.name, tool_output),
+                                    thinking: None,
+                                });
 
-                    self.messages.push(ChatMessage {
-                        role: "assistant".into(),
-                        content: self.current_response_buf.clone(),
-                        thinking: if self.current_thinking_buf.is_empty() {
-                            None
-                        } else {
-                            Some(self.current_thinking_buf.clone())
-                        },
-                    });
+                                if ok {
+                                    triggered_reprompt = true;
+                                    let (tx, rx) = mpsc::unbounded_channel();
+                                    self.stream_rx = Some(rx);
+                                    self.is_generating = true;
+                                    self.current_thinking_buf.clear();
+                                    self.current_response_buf.clear();
 
-                    // Store Turn Log Node into Dendrite Graph & SQLite Store
-                    let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()).unwrap_or_default();
-                    if !user_msg.is_empty() {
-                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        let turn_id = format!("turn_{}", now);
-                        let excerpt = if user_msg.len() > 25 { format!("{}...", &user_msg[..25]) } else { user_msg.clone() };
-                        let title = format!("Turn: {}", excerpt);
-                        let content = format!("User: {}\n\nAssistant: {}", user_msg, self.current_response_buf);
+                                    let system_prompt = self.dendrite_ctx.build_prompt(&tool_output, 4000);
+                                    let endpoint = self.tier1_endpoint.clone();
+                                    let model_name = self.active_model_name.clone();
+                                    let prompt = format!("Tool Result for {}:\n{}\n\nContinue resolution.", tool_call.name, tool_output);
 
-                        let node = self.graph.upsert(&turn_id, &title, &content, NodeType::TurnLog, Some(vec!["#conversation".into(), "#turn".into()]));
-                        if let Some(ref st) = self.store {
-                            let _ = st.save(&node);
-                        }
+                                    tokio::spawn(async move {
+                                        let res = query_tier1_stream(
+                                            &endpoint,
+                                            &model_name,
+                                            &prompt,
+                                            &system_prompt,
+                                            |ttype, token| {
+                                                let _ = tx.send(StreamEvent::Token { ttype, text: token.to_string() });
+                                            },
+                                        )
+                                        .await;
 
-                        // Automatic Atomic Fact & Topic Extraction
-                        let lower_msg = user_msg.to_lowercase();
-                        if lower_msg.contains("favourite") || lower_msg.contains("favorite") || lower_msg.contains("love") || lower_msg.contains("like") || lower_msg.contains("remember") || lower_msg.contains("is ") {
-                            let fact_id = format!("fact_{}", now);
-                            let fact_title = format!("User Fact: {}", excerpt);
-                            let fact_content = format!("User preference / fact: {}", user_msg);
-
-                            let fact_node = self.graph.upsert(&fact_id, &fact_title, &fact_content, NodeType::AtomicFact, Some(vec!["#preference".into(), "#user_fact".into(), "#memory".into()]));
-                            if let Some(ref st) = self.store {
-                                let _ = st.save(&fact_node);
+                                        match res {
+                                            Ok(stats) => {
+                                                let _ = tx.send(StreamEvent::Done {
+                                                    tok_per_sec: stats.tok_per_sec,
+                                                    elapsed_sec: stats.elapsed_sec,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(StreamEvent::Error(e.to_string()));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            Err(loop_warn) => {
+                                self.messages.push(ChatMessage {
+                                    role: "system".into(),
+                                    content: loop_warn,
+                                    thinking: None,
+                                });
                             }
                         }
                     }
 
-                    self.is_generating = false;
-                    self.save_current_session();
-                    finished = true;
+                    if !triggered_reprompt {
+                        self.messages.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: self.current_response_buf.clone(),
+                            thinking: if self.current_thinking_buf.is_empty() {
+                                None
+                            } else {
+                                Some(self.current_thinking_buf.clone())
+                            },
+                        });
+
+                        // Store Turn Log Node into Dendrite Graph & SQLite Store
+                        let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()).unwrap_or_default();
+                        if !user_msg.is_empty() {
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                            let turn_id = format!("turn_{}", now);
+                            let excerpt = if user_msg.len() > 25 { format!("{}...", &user_msg[..25]) } else { user_msg.clone() };
+                            let title = format!("Turn: {}", excerpt);
+                            let content = format!("User: {}\n\nAssistant: {}", user_msg, self.current_response_buf);
+
+                            let node = self.graph.upsert(&turn_id, &title, &content, NodeType::TurnLog, Some(vec!["#conversation".into(), "#turn".into()]));
+                            if let Some(ref st) = self.store {
+                                let _ = st.save(&node);
+                            }
+
+                            // Automatic Atomic Fact & Topic Extraction
+                            let lower_msg = user_msg.to_lowercase();
+                            if lower_msg.contains("favourite") || lower_msg.contains("favorite") || lower_msg.contains("love") || lower_msg.contains("like") || lower_msg.contains("remember") || lower_msg.contains("is ") {
+                                let fact_id = format!("fact_{}", now);
+                                let fact_title = format!("User Fact: {}", excerpt);
+                                let fact_content = format!("User preference / fact: {}", user_msg);
+
+                                let fact_node = self.graph.upsert(&fact_id, &fact_title, &fact_content, NodeType::AtomicFact, Some(vec!["#preference".into(), "#user_fact".into(), "#memory".into()]));
+                                if let Some(ref st) = self.store {
+                                    let _ = st.save(&fact_node);
+                                }
+                            }
+                        }
+
+                        self.is_generating = false;
+                    }
                 }
                 StreamEvent::Error(err) => {
                     self.messages.push(ChatMessage {

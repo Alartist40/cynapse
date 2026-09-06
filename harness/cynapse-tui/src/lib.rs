@@ -128,11 +128,11 @@ impl TuiSession {
 
     /// Sync scan of local models directory to pick active model if default doesn't exist
     pub fn auto_detect_model_sync(&mut self) {
-        let search_dirs = [
-            self.models_dir.clone(),
-            PathBuf::from("/home/xander/Documents/portfolio/cynapse-mini/models"),
-            PathBuf::from("./models"),
-        ];
+        let home_models = dirs::home_dir().map(|h| h.join(".cynapse").join("models"));
+        let mut search_dirs = vec![self.models_dir.clone(), PathBuf::from("./models")];
+        if let Some(h) = home_models {
+            search_dirs.push(h);
+        }
 
         let mut found_files = Vec::new();
         for dir in &search_dirs {
@@ -161,7 +161,8 @@ impl TuiSession {
 
     /// Extract dynamic quantization tag from filename (e.g. Q4_K_M, Q4_K_XL, Q8_0, F16, Q5_K_S)
     fn extract_quantization(&self, filename: &str) -> String {
-        let re = Regex::new(r"(?i)(Q[0-9]_[K0-9_A-Z]+|F16|F32|IQ[0-9]_[A-Z]+)").unwrap();
+        static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"(?i)(Q[0-9]_[K0-9_A-Z]+|F16|F32|IQ[0-9]_[A-Z]+)").unwrap());
         if let Some(mat) = re.find(filename) {
             mat.as_str().to_uppercase()
         } else if filename.ends_with(".safetensors") {
@@ -213,6 +214,10 @@ impl TuiSession {
     }
 
     pub async fn run_tui_app(&mut self) -> Result<()> {
+        self.run_tui_app_with_resume(None).await
+    }
+
+    pub async fn run_tui_app_with_resume(&mut self, resume_id: Option<&str>) -> Result<()> {
         let mut app = TuiApp::new(
             self.models_dir.clone(),
             self.active_model_name.clone(),
@@ -221,6 +226,15 @@ impl TuiSession {
             self.store.clone(),
             self.dendrite_ctx.clone(),
         );
+        if let Some(sid) = resume_id {
+            if let Ok(()) = app.load_session(sid) {
+                app.messages.push(app::ChatMessage {
+                    role: "system".into(),
+                    content: format!("Resumed session transcript from ID: {}", sid),
+                    thinking: None,
+                });
+            }
+        }
         app.run().await
     }
 

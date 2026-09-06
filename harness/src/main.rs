@@ -55,7 +55,7 @@ enum Commands {
 fn resolve_models_dir() -> PathBuf {
     let candidates = [
         PathBuf::from("./models"),
-        PathBuf::from("/home/xander/Documents/portfolio/cynapse-mini/models"),
+        dirs::home_dir().map(|h| h.join(".cynapse").join("models")).unwrap_or_default(),
     ];
     for cand in &candidates {
         if cand.exists() {
@@ -109,16 +109,10 @@ async fn main() -> Result<()> {
             println!("✓ Model successfully downloaded to: {}", target_path.display());
         }
         Some(Commands::Memory) => {
-            let db_candidates = [
-                PathBuf::from("data/dendrite.db"),
-                dirs::home_dir().map(|h| h.join(".cynapse").join("dendrite.db")).unwrap_or_default(),
-            ];
-            for db_path in &db_candidates {
-                if db_path.exists() {
-                    if let Ok(store) = cynapse_memory::store::DendriteStore::open(db_path) {
-                        let _ = store.load_all(&session.graph);
-                    }
-                    break;
+            let db_path = dirs::home_dir().map(|h| h.join(".cynapse").join("dendrite.db")).unwrap_or_else(|| PathBuf::from("data/dendrite.db"));
+            if db_path.exists() {
+                if let Ok(store) = cynapse_memory::store::DendriteStore::open(&db_path) {
+                    let _ = store.load_all(&session.graph);
                 }
             }
             cynapse_tui::memory_render::render_dendrite_visualizer(&session.graph);
@@ -153,14 +147,14 @@ async fn main() -> Result<()> {
             if cli.cli {
                 session.run_cli_loop().await?;
             } else {
-                session.run_tui_app().await?;
+                session.run_tui_app_with_resume(cli.resume.as_deref()).await?;
             }
         }
         None => {
             if cli.cli {
                 session.run_cli_loop().await?;
             } else {
-                session.run_tui_app().await?;
+                session.run_tui_app_with_resume(cli.resume.as_deref()).await?;
             }
         }
     }
