@@ -2,6 +2,16 @@
 
 All notable changes to the Cynapse AI Agent System are documented in this file.
 
+## [1.9.1] - 2026-09-07
+
+### ⚡ HTTP Acceleration Priority, Interactive Persona TUI Editor & Dendrite Relevance Gate
+- **HTTP Acceleration Priority**: Reversed engine execution order in `cynapse-engine` (`query_tier1_stream`). High-speed HTTP endpoint runners (`llama-server` / `Ollama` at 15–30+ tok/s) are now tried first, falling back to native Leafcutter GGUF streaming only when the endpoint is unreachable.
+- **Interactive TUI Persona Editor**: Added live in-terminal persona file editing to `ActiveModal::PersonaManager`. Users can select any `.md` file, press `e` to enter editing mode with live cursor navigation, and save updates via `Ctrl+S` (`persona_mgr.write_file()`).
+- **Dendrite Relevance Gate**: Implemented `MIN_RELEVANCE_SCORE = 5.0` filtering in `cynapse-memory::context`. Search results scoring below threshold 5.0 are omitted to prevent context pollution on generic queries.
+- **Prompt Duplication & Core Bypass**: Added `build_prompt_with_options()` in `context.rs`. When a custom persona is active, duplicate `=== CYNAPSE SYSTEM PRESET ===` headers and `CORE_IDS` identity nodes are bypassed.
+- **TUI Slash Menu Contrast**: Fixed autocomplete popup contrast by adding an explicit `.style(Style::default().bg(Color::Rgb(30, 30, 30)))` dark background block.
+- **Session Timestamp Fix**: Dynamically populated `created_at` Unix timestamps in `save_current_session()` and `load_session()`.
+
 ## [1.9.0] - 2026-09-06
 
 ### 🚀 Tier-1 Parallel Speed Acceleration & Markdown Persona Engine (`/persona`)
