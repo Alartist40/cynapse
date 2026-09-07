@@ -1353,6 +1353,7 @@ impl TuiApp {
                                 content: format!("⚠️ MAX AGENT STEPS REACHED ({} steps): Automated tool execution loop paused to prevent runaway execution.", MAX_AGENT_STEPS),
                                 thinking: None,
                             });
+                            self.save_current_session();
                         } else {
                             match self.loop_guard.record_and_check(&tool_call) {
                                 Ok(()) => {
@@ -1363,6 +1364,7 @@ impl TuiApp {
                                         content: format!("🔧 Tool Call [{}] Executed (Step {}/{}):\n{}", tool_call.name, self.agent_step_count, MAX_AGENT_STEPS, tool_output),
                                         thinking: None,
                                     });
+                                    self.save_current_session();
 
                                     if ok {
                                         triggered_reprompt = true;
@@ -1374,7 +1376,8 @@ impl TuiApp {
 
                                         let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
                                         let persona_prompt = self.persona_mgr.build_system_prompt();
-                                        let memory_prompt = self.dendrite_ctx.build_prompt(&tool_output, 4000);
+                                        let has_persona = !persona_prompt.trim().is_empty();
+                                        let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&tool_output, 4000, has_persona, has_persona);
                                         let system_prompt = format!("{}\n\n=== DENDRITE CONTEXT ===\n{}", persona_prompt, memory_prompt);
                                         let endpoint = self.tier1_endpoint.clone();
                                         let model_name = self.active_model_name.clone();
@@ -1416,6 +1419,7 @@ impl TuiApp {
                                         content: loop_warn,
                                         thinking: None,
                                     });
+                                    self.save_current_session();
                                 }
                             }
                         }
@@ -1431,6 +1435,7 @@ impl TuiApp {
                                 Some(self.current_thinking_buf.clone())
                             },
                         });
+                        self.save_current_session();
 
                         // Store Turn Log Node into Dendrite Graph & SQLite Store
                         let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()).unwrap_or_default();
