@@ -397,6 +397,26 @@ pub fn resolve_model_tag(model_name: &str, available_tags: &[String]) -> String 
     model_name.to_string()
 }
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+static NATIVE_ENGINE_CACHE: OnceLock<StdMutex<HashMap<String, Arc<leafcutter::api::NativeStreamingEngine>>>> = OnceLock::new();
+
+fn get_or_load_native_engine(path_str: &str) -> Result<Arc<leafcutter::api::NativeStreamingEngine>> {
+    let cache = NATIVE_ENGINE_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = cache.lock().map_err(|_| anyhow::anyhow!("Engine cache lock poisoned"))?;
+
+    if let Some(engine) = guard.get(path_str) {
+        return Ok(Arc::clone(engine));
+    }
+
+    let engine = leafcutter::api::NativeStreamingEngine::load(path_str)
+        .map_err(|e| anyhow::anyhow!("Failed to load native Leafcutter GGUF engine for {}: {}", path_str, e))?;
+    let arc_engine = Arc::new(engine);
+    guard.insert(path_str.to_string(), Arc::clone(&arc_engine));
+    Ok(arc_engine)
+}
+
 /// Direct in-process native Leafcutter Rust GGUF stream runner
 pub fn query_native_leafcutter_stream(
     model_path: &Path,
@@ -404,11 +424,8 @@ pub fn query_native_leafcutter_stream(
     system_prompt: &str,
     mut on_token: impl FnMut(TokenType, &str),
 ) -> Result<ExecutionStats> {
-    use leafcutter::api::NativeStreamingEngine;
-
     let path_str = model_path.to_string_lossy();
-    let engine = NativeStreamingEngine::load(&path_str)
-        .map_err(|e| anyhow::anyhow!("Failed to load native Leafcutter GGUF engine for {}: {}", model_path.display(), e))?;
+    let engine = get_or_load_native_engine(&path_str)?;
 
     let full_prompt = if system_prompt.is_empty() {
         prompt.to_string()
@@ -485,8 +502,8 @@ pub async fn query_tier1_stream(
     let mut resp_opt: Option<reqwest::Response> = None;
 
     let mut attempt = 0;
-    let max_attempts = 2;
-    let mut delay_ms = 100u64;
+    let max_attempts = 3;
+    let mut delay_ms = 150u64;
 
     while attempt < max_attempts {
         attempt += 1;
@@ -524,7 +541,11 @@ pub async fn query_tier1_stream(
             Err(e) => {
                 http_err = Some(e.to_string());
                 if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let jitter = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0) % 100) as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms + jitter)).await;
                     delay_ms *= 2;
                 }
             }
