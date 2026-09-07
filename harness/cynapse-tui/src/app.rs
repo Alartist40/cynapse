@@ -175,6 +175,7 @@ pub struct TuiApp {
     pub auto_scroll: bool,
     pub session_mgr: SessionManager,
     pub session_id: String,
+    pub session_created_at: u64,
     pub stream_rx: Option<mpsc::UnboundedReceiver<StreamEvent>>,
     pub current_thinking_buf: String,
     pub current_response_buf: String,
@@ -213,6 +214,9 @@ pub struct TuiApp {
     // Persona System Manager
     pub persona_mgr: cynapse_core::persona::PersonaManager,
     pub selected_persona_idx: usize,
+    pub persona_editing: bool,
+    pub persona_edit_buffer: String,
+    pub persona_edit_cursor: usize,
 }
 
 impl TuiApp {
@@ -226,6 +230,10 @@ impl TuiApp {
     ) -> Self {
         let session_mgr = SessionManager::new();
         let session_id = SessionManager::generate_id();
+        let session_created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let hw_info = probe_hardware_info();
         Self {
             models_dir,
@@ -255,6 +263,7 @@ impl TuiApp {
             show_thinking: true,
             session_mgr,
             session_id,
+            session_created_at,
             stream_rx: None,
             current_thinking_buf: String::new(),
             current_response_buf: String::new(),
@@ -281,6 +290,9 @@ impl TuiApp {
             persona_mgr: cynapse_core::persona::PersonaManager::new(cynapse_core::persona::PersonaManager::default_dir())
                 .unwrap_or_else(|_| cynapse_core::persona::PersonaManager::new("./persona").unwrap()),
             selected_persona_idx: 0,
+            persona_editing: false,
+            persona_edit_buffer: String::new(),
+            persona_edit_cursor: 0,
         }
     }
 
@@ -398,6 +410,7 @@ impl TuiApp {
         self.autocomplete_idx = 0;
         let data = self.session_mgr.load_session(session_id)?;
         self.session_id = data.session_id;
+        self.session_created_at = data.created_at;
         self.active_model_name = data.model_name;
         self.messages = data
             .messages
@@ -424,7 +437,7 @@ impl TuiApp {
 
         let data = SessionData {
             session_id: self.session_id.clone(),
-            created_at: 0,
+            created_at: self.session_created_at,
             updated_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -712,6 +725,55 @@ impl TuiApp {
                                 continue;
                             }
 
+                            if self.modal == ActiveModal::PersonaManager && self.persona_editing {
+                                if key.modifiers.contains(KeyModifiers::CONTROL) && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S')) {
+                                    let personas = self.persona_mgr.list_personas();
+                                    if !personas.is_empty() {
+                                        let idx = self.selected_persona_idx.min(personas.len() - 1);
+                                        let name = &personas[idx];
+                                        if let Ok(_) = self.persona_mgr.write_file(name, &self.persona_edit_buffer) {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("✓ Persona file '{}.md' updated and saved.", name),
+                                                thinking: None,
+                                            });
+                                        }
+                                    }
+                                    self.persona_editing = false;
+                                    continue;
+                                }
+
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        self.persona_editing = false;
+                                    }
+                                    KeyCode::Left => {
+                                        self.persona_edit_cursor = self.persona_edit_cursor.saturating_sub(1);
+                                    }
+                                    KeyCode::Right => {
+                                        if self.persona_edit_cursor < self.persona_edit_buffer.len() {
+                                            self.persona_edit_cursor += 1;
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        self.persona_edit_buffer.insert(self.persona_edit_cursor, c);
+                                        self.persona_edit_cursor += 1;
+                                    }
+                                    KeyCode::Backspace => {
+                                        if self.persona_edit_cursor > 0 {
+                                            self.persona_edit_buffer.remove(self.persona_edit_cursor - 1);
+                                            self.persona_edit_cursor -= 1;
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        self.persona_edit_buffer.insert(self.persona_edit_cursor, '\n');
+                                        self.persona_edit_cursor += 1;
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+
                             match key.code {
                                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Tab => {
                                     self.modal = ActiveModal::None;
@@ -786,6 +848,19 @@ impl TuiApp {
                                 KeyCode::Char('s') | KeyCode::Char(' ') => match self.modal {
                                     ActiveModal::MemoryGraph => {
                                         self.galaxy_auto_spin = !self.galaxy_auto_spin;
+                                    }
+                                    _ => {}
+                                },
+                                KeyCode::Char('e') | KeyCode::Char('E') => match self.modal {
+                                    ActiveModal::PersonaManager => {
+                                        let personas = self.persona_mgr.list_personas();
+                                        if !personas.is_empty() {
+                                            let idx = self.selected_persona_idx.min(personas.len() - 1);
+                                            let name = &personas[idx];
+                                            self.persona_edit_buffer = self.persona_mgr.read_file_or_empty(name);
+                                            self.persona_edit_cursor = self.persona_edit_buffer.len();
+                                            self.persona_editing = true;
+                                        }
                                     }
                                     _ => {}
                                 },
@@ -1165,10 +1240,20 @@ impl TuiApp {
                                 self.current_response_buf.clear();
                                 self.auto_scroll = true; // Lock scroll to bottom for incoming response
 
-                                // Build System Prompt with Persona & Dendrite Memory Injection
+                                // Build System Prompt with Persona & Relevance-Gated Dendrite Memory Injection
                                 let persona_prompt = self.persona_mgr.build_system_prompt();
-                                let memory_prompt = self.dendrite_ctx.build_prompt(&trimmed, 4000);
-                                let system_prompt = format!("{}\n\n=== DENDRITE CONTEXT ===\n{}", persona_prompt, memory_prompt);
+                                let has_persona = !persona_prompt.trim().is_empty();
+
+                                // When persona is active, skip duplicate system preset headers and core identity nodes
+                                let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&trimmed, 4000, has_persona, has_persona);
+
+                                let system_prompt = if memory_prompt.trim().is_empty() {
+                                    persona_prompt
+                                } else if has_persona {
+                                    format!("{}\n\n{}", persona_prompt, memory_prompt)
+                                } else {
+                                    memory_prompt
+                                };
 
                                 // Spawn Non-blocking Async LLM Task
                                 let (tx, rx) = mpsc::unbounded_channel();
@@ -1782,9 +1867,15 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 .map(|(idx, cmd)| {
                     let is_selected = idx == self.autocomplete_idx;
                     let (cmd_style, desc_style) = if is_selected {
-                        (t.highlight_item(), Style::default().fg(Color::Rgb(40, 40, 40)))
+                        (
+                            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                        )
                     } else {
-                        (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), Style::default().fg(Color::Rgb(180, 180, 180)))
+                        (
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::White),
+                        )
                     };
 
                     let line = Line::from(vec![
@@ -1800,7 +1891,8 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .title(" Autocomplete Commands (Tab/Up/Down) ")
-                    .border_style(t.active_border_style()),
+                    .border_style(t.active_border_style())
+                    .style(Style::default().bg(Color::Rgb(30, 30, 30)).fg(Color::White)),
             );
             f.render_widget(dropdown_list, popup_area);
         }
@@ -2245,56 +2337,94 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 );
                 f.render_widget(list, chunks[0]);
 
-                // Right Panel: Persona Preview & System Prompt
+                // Right Panel: Persona Preview & Editor
                 let mut right_lines = Vec::new();
-                if let Some(selected_name) = personas.get(selected_idx) {
-                    let content = self.persona_mgr.read_file_or_empty(selected_name);
-                    let is_active = active_file.as_deref() == Some(selected_name.as_str());
-
-                    right_lines.push(Line::from(vec![
-                        Span::styled("Selected Persona File: ", Style::default().fg(Color::Cyan)),
-                        Span::styled(format!("{}.md", selected_name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                        if is_active {
-                            Span::styled("  ★ CURRENTLY ACTIVE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-                        } else {
-                            Span::raw("")
-                        },
-                    ]));
-                    right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
-                    right_lines.push(Line::from(Span::styled("File Content Preview:", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD))));
-
-                    for l in content.lines().take(12) {
-                        right_lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Gray))));
-                    }
-                    if content.lines().count() > 12 {
-                        right_lines.push(Line::from(Span::styled("  ... [content truncated]", Style::default().fg(Color::DarkGray))));
+                let panel_title = if self.persona_editing {
+                    if let Some(selected_name) = personas.get(selected_idx) {
+                        format!(" ✏️ Editing Persona File: {}.md [EDITING MODE] ", selected_name)
+                    } else {
+                        " ✏️ Editing Persona File [EDITING MODE] ".to_string()
                     }
                 } else {
-                    right_lines.push(Line::from(Span::styled("No persona files found in ~/.cynapse/persona/", Style::default().fg(Color::Red))));
-                }
-
-                right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
-                let active_status_str = match &active_file {
-                    Some(name) => format!("Custom Persona ({}.md)", name),
-                    None => "Default Identity (IDENTITY.md + SOUL.md + USER.md)".to_string(),
+                    " Persona Details & Controls ".to_string()
                 };
-                right_lines.push(Line::from(vec![
-                    Span::styled("Active Persona Mode: ", Style::default().fg(Color::Cyan)),
-                    Span::styled(active_status_str, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                ]));
 
-                right_lines.push(Line::from(""));
-                right_lines.push(Line::from(Span::styled("Controls:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
-                right_lines.push(Line::from("  • Up/Down Arrow : Navigate persona files"));
-                right_lines.push(Line::from("  • Enter         : Activate highlighted persona"));
-                right_lines.push(Line::from("  • r             : Reset to default persona identity"));
-                right_lines.push(Line::from("  • Esc / q       : Close persona manager modal"));
+                if self.persona_editing {
+                    right_lines.push(Line::from(vec![
+                        Span::styled("LIVE EDITING MODE", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::raw(" — Type text, press "),
+                        Span::styled("Ctrl+S", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                        Span::raw(" to save, or "),
+                        Span::styled("Esc", Style::default().fg(Color::Red)),
+                        Span::raw(" to cancel."),
+                    ]));
+                    right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+
+                    // Display editable content buffer with visible cursor
+                    let mut text_with_cursor = self.persona_edit_buffer.clone();
+                    let cursor_pos = self.persona_edit_cursor.min(text_with_cursor.len());
+                    text_with_cursor.insert(cursor_pos, '█');
+
+                    for line in text_with_cursor.lines().take(18) {
+                        right_lines.push(Line::from(Span::styled(format!(" {}", line), Style::default().fg(Color::White))));
+                    }
+                    if text_with_cursor.lines().count() > 18 {
+                        right_lines.push(Line::from(Span::styled("  ... [content continues below]", Style::default().fg(Color::DarkGray))));
+                    }
+
+                    right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                    right_lines.push(Line::from(Span::styled("Shortcuts: [Ctrl+S] Save File | [Esc] Cancel Editing", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+                } else {
+                    if let Some(selected_name) = personas.get(selected_idx) {
+                        let content = self.persona_mgr.read_file_or_empty(selected_name);
+                        let is_active = active_file.as_deref() == Some(selected_name.as_str());
+
+                        right_lines.push(Line::from(vec![
+                            Span::styled("Selected Persona File: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(format!("{}.md", selected_name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                            if is_active {
+                                Span::styled("  ★ CURRENTLY ACTIVE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                            } else {
+                                Span::raw("")
+                            },
+                        ]));
+                        right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                        right_lines.push(Line::from(Span::styled("File Content Preview:", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD))));
+
+                        for l in content.lines().take(11) {
+                            right_lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Gray))));
+                        }
+                        if content.lines().count() > 11 {
+                            right_lines.push(Line::from(Span::styled("  ... [content truncated]", Style::default().fg(Color::DarkGray))));
+                        }
+                    } else {
+                        right_lines.push(Line::from(Span::styled("No persona files found in ~/.cynapse/persona/", Style::default().fg(Color::Red))));
+                    }
+
+                    right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                    let active_status_str = match &active_file {
+                        Some(name) => format!("Custom Persona ({}.md)", name),
+                        None => "Default Identity (IDENTITY.md + SOUL.md + USER.md)".to_string(),
+                    };
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Active Persona Mode: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(active_status_str, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    ]));
+
+                    right_lines.push(Line::from(""));
+                    right_lines.push(Line::from(Span::styled("Controls:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+                    right_lines.push(Line::from("  • Up/Down Arrow : Navigate persona files"));
+                    right_lines.push(Line::from("  • Enter         : Activate highlighted persona"));
+                    right_lines.push(Line::from("  • e             : Edit highlighted persona file"));
+                    right_lines.push(Line::from("  • r             : Reset to default persona identity"));
+                    right_lines.push(Line::from("  • Esc / q       : Close persona manager modal"));
+                }
 
                 let preview_p = Paragraph::new(right_lines).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Plain)
-                        .title(" Persona Details & Controls ")
+                        .title(panel_title)
                         .border_style(Style::default().fg(Color::Cyan)),
                 );
                 f.render_widget(preview_p, chunks[1]);

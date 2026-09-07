@@ -13,10 +13,12 @@ use crate::store::DendriteStore;
 pub const DEFAULT_MAX_TOKENS: usize = 6000;
 /// 40% of the token budget for core identity nodes.
 pub const CORE_NODE_BUDGET: f64 = 0.40;
+/// Minimum relevance score threshold for retrieved knowledge nodes.
+pub const MIN_RELEVANCE_SCORE: f64 = 5.0;
 /// Maximum number of candidate nodes returned by `find_relevant` before scoring.
 const MAX_CANDIDATES: usize = 50;
 
-/// Core identity nodes always included first.
+/// Core identity nodes always included first (when persona is inactive).
 const CORE_IDS: [&str; 5] = ["identity", "cynapse_core", "soul", "agents", "tools"];
 
 struct CacheState {
@@ -75,6 +77,18 @@ impl DendriteContext {
     /// Return the system prompt. If `user_message` is non-empty it biases
     /// context toward relevant nodes; otherwise a cached general prompt.
     pub fn build_prompt(&self, user_message: &str, max_tokens: usize) -> String {
+        self.build_prompt_with_options(user_message, max_tokens, false, false)
+    }
+
+    /// Flexible system prompt builder allowing caller to skip duplicate system preset headers
+    /// and core identity nodes when a custom persona is active.
+    pub fn build_prompt_with_options(
+        &self,
+        user_message: &str,
+        max_tokens: usize,
+        skip_system_preset: bool,
+        skip_core_nodes: bool,
+    ) -> String {
         let effective_max_tokens = if max_tokens == 0 {
             self.default_max_tokens
         } else {
@@ -83,11 +97,19 @@ impl DendriteContext {
 
         // Message-specific context always recomputes without holding cache lock
         if !user_message.trim().is_empty() {
-            return assemble(&self.graph, self.store.as_deref(), user_message, effective_max_tokens, self.core_node_budget);
+            return assemble(
+                &self.graph,
+                self.store.as_deref(),
+                user_message,
+                effective_max_tokens,
+                self.core_node_budget,
+                skip_system_preset,
+                skip_core_nodes,
+            );
         }
 
-        // Fast path for empty message: check cache under lock
-        {
+        // Fast path for empty message: check cache under lock (only when default flags match)
+        if !skip_system_preset && !skip_core_nodes {
             if let Ok(state) = self.cache.lock() {
                 let now = Instant::now();
                 if !state.dirty && now.duration_since(state.cached_at) < state.cache_ttl && !state.cached_prompt.is_empty() {
@@ -97,13 +119,23 @@ impl DendriteContext {
         }
 
         // Cache miss: compute prompt without holding lock
-        let prompt = assemble(&self.graph, self.store.as_deref(), "", effective_max_tokens, self.core_node_budget);
+        let prompt = assemble(
+            &self.graph,
+            self.store.as_deref(),
+            "",
+            effective_max_tokens,
+            self.core_node_budget,
+            skip_system_preset,
+            skip_core_nodes,
+        );
         let now = Instant::now();
 
-        if let Ok(mut state) = self.cache.lock() {
-            state.dirty = false;
-            state.cached_prompt = prompt.clone();
-            state.cached_at = now;
+        if !skip_system_preset && !skip_core_nodes {
+            if let Ok(mut state) = self.cache.lock() {
+                state.dirty = false;
+                state.cached_prompt = prompt.clone();
+                state.cached_at = now;
+            }
         }
 
         prompt
@@ -128,37 +160,44 @@ fn assemble(
     user_message: &str,
     max_tokens: usize,
     core_budget_ratio: f64,
+    skip_system_preset: bool,
+    skip_core_nodes: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut used: usize = 0;
     let core_budget = ((max_tokens as f64) * core_budget_ratio) as usize;
 
-    // Always include core identity nodes first.
-    for id in CORE_IDS {
-        let node = match graph.get(id) {
-            Some(n) => n,
-            None => continue,
-        };
-        let cleaned = clean_node_content(&node.content);
-        if cleaned.is_empty() {
-            continue;
+    // 1. Core identity nodes (only included if not skipped by active persona)
+    if !skip_core_nodes {
+        for id in CORE_IDS {
+            let node = match graph.get(id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let cleaned = clean_node_content(&node.content);
+            if cleaned.is_empty() {
+                continue;
+            }
+            let part = format!("## {}\n\n{}", node.title, cleaned);
+            let cost = estimate_tokens(&part);
+            if used + cost > core_budget {
+                break;
+            }
+            parts.push(part);
+            used += cost;
         }
-        let part = format!("## {}\n\n{}", node.title, cleaned);
-        let cost = estimate_tokens(&part);
-        if used + cost > core_budget {
-            break;
-        }
-        parts.push(part);
-        used += cost;
     }
 
     if !user_message.trim().is_empty() {
-        // Conversation-relevant nodes (excluding TurnLogs to avoid prompt pollution).
+        // Conversation-relevant nodes (filtered by MIN_RELEVANCE_SCORE to prevent prompt bloat).
         let candidates = find_relevant(graph, store, user_message);
         let scored = score(&candidates, user_message);
-        for (node, _score) in scored {
+        for (node, rel_score) in scored {
+            if rel_score < MIN_RELEVANCE_SCORE {
+                continue; // Skip weak matches below relevance threshold
+            }
             if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
-                continue; // Skip core (already added) and ephemeral turn logs
+                continue; // Skip core (handled separately) and ephemeral turn logs
             }
             let cleaned = clean_node_content(&node.content);
             if cleaned.is_empty() {
@@ -193,17 +232,25 @@ fn assemble(
     }
 
     let prompt = parts.join("\n\n");
-    format!(
-        "=== CYNAPSE SYSTEM PRESET ===\n\
-        1. You are CYNAPSE — a local-first, modular, precise AI companion.\n\
-        2. Lead with the answer or immediate action on line 1. No greetings, preambles, or 'Great question!' openers.\n\
-        3. Number multi-step tasks clearly. Cap lists at maximum 5 items.\n\
-        4. End with exactly one concrete next action. No closers like 'Hope this helps!' or 'Let me know if you need anything else'.\n\
-        5. State cause and fix directly for errors. Be concise and brief.\n\
-        6. Never repeat system headers, section dividers, or internal tokens. Stop generation immediately when the response is complete.\n\n\
-        === DENDRITE KNOWLEDGE CONTEXT ===\n\
-        {prompt}"
-    )
+    if prompt.trim().is_empty() {
+        return String::new();
+    }
+
+    if skip_system_preset {
+        format!("=== DENDRITE KNOWLEDGE CONTEXT ===\n{}", prompt)
+    } else {
+        format!(
+            "=== CYNAPSE SYSTEM PRESET ===\n\
+            1. You are CYNAPSE — a local-first, modular, precise AI companion.\n\
+            2. Lead with the answer or immediate action on line 1. No greetings, preambles, or 'Great question!' openers.\n\
+            3. Number multi-step tasks clearly. Cap lists at maximum 5 items.\n\
+            4. End with exactly one concrete next action. No closers like 'Hope this helps!' or 'Let me know if you need anything else'.\n\
+            5. State cause and fix directly for errors. Be concise and brief.\n\
+            6. Never repeat system headers, section dividers, or internal tokens. Stop generation immediately when the response is complete.\n\n\
+            === DENDRITE KNOWLEDGE CONTEXT ===\n\
+            {prompt}"
+        )
+    }
 }
 
 fn find_relevant(graph: &Dendrite, store: Option<&DendriteStore>, user_message: &str) -> Vec<Node> {

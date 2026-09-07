@@ -454,7 +454,7 @@ pub fn query_native_leafcutter_stream(
     })
 }
 
-/// Real token-by-token streaming query runner (native Leafcutter runner or Tier 1 HTTP endpoint).
+/// Real token-by-token streaming query runner (HTTP endpoint first, native Leafcutter fallback).
 pub async fn query_tier1_stream(
     endpoint: &str,
     model_name: &str,
@@ -462,7 +462,135 @@ pub async fn query_tier1_stream(
     system_prompt: &str,
     mut on_token: impl FnMut(TokenType, &str),
 ) -> Result<ExecutionStats> {
-    // 1. Direct native Leafcutter execution if GGUF file exists on disk
+    // 1. Try HTTP endpoint (llama-server / Ollama) first
+    let client = reqwest::Client::new();
+    let start = Instant::now();
+    let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
+
+    let available_tags = fetch_ollama_models(endpoint).await;
+    let resolved_model = resolve_model_tag(model_name, &available_tags);
+
+    let payload = serde_json::json!({
+        "model": resolved_model,
+        "prompt": prompt,
+        "system": system_prompt,
+        "stream": true,
+        "options": {
+            "num_ctx": 4096,
+            "temperature": 0.7
+        }
+    });
+
+    let mut http_err: Option<String> = None;
+    let mut resp_opt: Option<reqwest::Response> = None;
+
+    let mut attempt = 0;
+    let max_attempts = 2;
+    let mut delay_ms = 100u64;
+
+    while attempt < max_attempts {
+        attempt += 1;
+        let req_builder = client.post(&url).json(&payload);
+
+        match req_builder.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                resp_opt = Some(resp);
+                break;
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND && resolved_model != model_name => {
+                let retry_payload = serde_json::json!({
+                    "model": model_name,
+                    "prompt": prompt,
+                    "system": system_prompt,
+                    "stream": true,
+                    "options": {
+                        "num_ctx": 4096,
+                        "temperature": 0.7
+                    }
+                });
+                if let Ok(retry_res) = client.post(&url).json(&retry_payload).send().await {
+                    if retry_res.status().is_success() {
+                        resp_opt = Some(retry_res);
+                        break;
+                    }
+                }
+                http_err = Some(format!("HTTP {}", resp.status()));
+                break;
+            }
+            Ok(resp) => {
+                http_err = Some(format!("HTTP {}", resp.status()));
+                break;
+            }
+            Err(e) => {
+                http_err = Some(e.to_string());
+                if attempt < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2;
+                }
+            }
+        }
+    }
+
+    if let Some(res) = resp_opt {
+        let mut stream = res.bytes_stream();
+        let mut tokens_generated = 0usize;
+        let mut is_thinking = false;
+        let mut buffer = String::new();
+
+        while let Some(item) = stream.next().await {
+            let chunk_bytes = item.context("Error reading stream chunk from LLM engine")?;
+            let text = String::from_utf8_lossy(&chunk_bytes);
+            buffer.push_str(&text);
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer.drain(..=pos);
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
+                    if let Some(token) = parsed.response {
+                        if !token.is_empty() {
+                            tokens_generated += 1;
+
+                            if token.contains("<think>") {
+                                is_thinking = true;
+                                let clean = token.replace("<think>", "");
+                                if !clean.is_empty() {
+                                    on_token(TokenType::Thinking, &clean);
+                                }
+                            } else if token.contains("</think>") {
+                                let clean = token.replace("</think>", "");
+                                if !clean.is_empty() {
+                                    on_token(TokenType::Thinking, &clean);
+                                }
+                                is_thinking = false;
+                            } else {
+                                let ttype = if is_thinking { TokenType::Thinking } else { TokenType::Response };
+                                on_token(ttype, &token);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
+        let tok_per_sec = tokens_generated as f64 / elapsed_sec;
+        let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
+
+        return Ok(ExecutionStats {
+            model_name: model_name.to_string(),
+            tokens_generated: tokens_generated.max(1),
+            elapsed_sec,
+            tok_per_sec,
+            avail_ram_gb,
+        });
+    }
+
+    // 2. Fallback to direct native Leafcutter execution if GGUF file exists on disk
     if let Some(local_path) = find_model_file_path(model_name) {
         let p = local_path.clone();
         let pr = prompt.to_string();
@@ -486,165 +614,12 @@ pub async fn query_tier1_stream(
         }
     }
 
-    let client = reqwest::Client::new();
-    let start = Instant::now();
-    let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
-
-    // Resolve model tag from Ollama endpoint if available
-    let available_tags = fetch_ollama_models(endpoint).await;
-    let resolved_model = resolve_model_tag(model_name, &available_tags);
-
-    let payload = serde_json::json!({
-        "model": resolved_model,
-        "prompt": prompt,
-        "system": system_prompt,
-        "stream": true,
-        "options": {
-            "num_ctx": 4096,
-            "temperature": 0.7
-        }
-    });
-
-    let mut attempt = 0;
-    let max_attempts = 3;
-    let mut delay_ms = 200u64;
-
-    let mut res = loop {
-        attempt += 1;
-        let req_builder = client.post(&url).json(&payload);
-
-        match req_builder.send().await {
-            Ok(resp) if resp.status().is_success() => break resp,
-            Ok(resp) if resp.status().is_server_error() && attempt < max_attempts => {
-                let jitter = (std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos())
-                    .unwrap_or(0) % 100) as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms + jitter)).await;
-                delay_ms *= 2;
-            }
-            Ok(resp) => break resp,
-            Err(_err) if attempt < max_attempts => {
-                let jitter = (std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos())
-                    .unwrap_or(0) % 100) as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms + jitter)).await;
-                delay_ms *= 2;
-            }
-            Err(err) => {
-                anyhow::bail!("Unable to connect to local LLM engine at {}: {}", endpoint, err);
-            }
-        }
-    };
-
-    // Retry once with raw model_name if resolved tag returned 404
-    if res.status() == reqwest::StatusCode::NOT_FOUND && resolved_model != model_name {
-        let retry_payload = serde_json::json!({
-            "model": model_name,
-            "prompt": prompt,
-            "system": system_prompt,
-            "stream": true,
-            "options": {
-                "num_ctx": 4096,
-                "temperature": 0.7
-            }
-        });
-
-        if let Ok(retry_res) = client
-            .post(&url)
-            .json(&retry_payload)
-            .send()
-            .await
-        {
-            if retry_res.status().is_success() {
-                res = retry_res;
-            }
-        }
-    }
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let err_body = res.text().await.unwrap_or_default();
-        let clean_err = err_body.trim();
-
-        if status == reqwest::StatusCode::NOT_FOUND {
-            anyhow::bail!(
-                "Model '{}' not found in local Cynapse engine catalog (HTTP 404).\nAvailable models: [{}]\nPlace GGUF models into ./models/ or download via Cynapse TUI.",
-                model_name, available_tags.join(", ")
-            );
-        }
-
-        if !clean_err.is_empty() {
-            anyhow::bail!("Local LLM engine returned HTTP error {}: {}", status, clean_err);
-        } else {
-            anyhow::bail!("Local LLM engine returned HTTP error: {}", status);
-        }
-    }
-
-    let mut stream = res.bytes_stream();
-    let mut tokens_generated = 0usize;
-    let mut is_thinking = false;
-    let mut buffer = String::new();
-
-    while let Some(item) = stream.next().await {
-        let chunk_bytes = item.context("Error reading stream chunk from LLM engine")?;
-        let text = String::from_utf8_lossy(&chunk_bytes);
-        buffer.push_str(&text);
-
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim().to_string();
-            buffer.drain(..=pos);
-
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
-                if let Some(token) = parsed.response {
-                    if !token.is_empty() {
-                        tokens_generated += 1;
-
-                        if token.contains("<think>") {
-                            is_thinking = true;
-                            let clean = token.replace("<think>", "");
-                            if !clean.is_empty() {
-                                on_token(TokenType::Thinking, &clean);
-                            }
-                        } else if token.contains("</think>") {
-                            let clean = token.replace("</think>", "");
-                            if !clean.is_empty() {
-                                on_token(TokenType::Thinking, &clean);
-                            }
-                            is_thinking = false;
-                        } else {
-                            let ttype = if is_thinking { TokenType::Thinking } else { TokenType::Response };
-                            on_token(ttype, &token);
-                        }
-                    }
-                }
-                if parsed.done == Some(true) {
-                    if let Some(ec) = parsed.eval_count {
-                        if ec > 0 {
-                            tokens_generated = ec;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
-    let tok_per_sec = tokens_generated as f64 / elapsed_sec;
-    let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
-
-    Ok(ExecutionStats {
-        model_name: resolved_model,
-        tokens_generated,
-        elapsed_sec,
-        tok_per_sec,
-        avail_ram_gb,
-    })
+    anyhow::bail!(
+        "Local LLM engine at {} is unreachable ({}) and no local GGUF file found for '{}'.",
+        endpoint,
+        http_err.unwrap_or_else(|| "Connection refused".into()),
+        model_name
+    )
 }
 
 /// Send keep_alive: 0 payload to local LLM engine to immediately free memory.
