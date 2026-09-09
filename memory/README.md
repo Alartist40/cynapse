@@ -15,8 +15,8 @@
    - Bi-directional backlink management (`links` and `backlinks`) updated automatically on every node mutation.
 
 3. **Hybrid Search & Prompt Assembly (`DendriteContext`)**:
-   - SQLite FTS5 porter-unicode tokenized search + in-memory BM25 ranker.
-   - Token-budgeted system prompt generation (40% identity budget + 60% message relevance / recent nodes).
+   - SQLite FTS5 porter-unicode tokenized search + in-memory BM25 ranker with `MIN_RELEVANCE_SCORE = 5.0` filtering.
+   - Token-budgeted system prompt generation with `build_prompt_with_options()` supporting `skip_system_preset` and `skip_core_nodes` when active custom personas are present.
    - 5-minute prompt cache with instant dirty-flag invalidation upon graph mutations.
 
 4. **Async Reflection Worker (`ReflectionWorker`)**:
@@ -29,11 +29,13 @@
 
 ```
 memory/
-├── dendrite_core/
-│   ├── mod.rs           # Core module re-exports
-│   ├── graph.rs         # In-memory graph, 4-tier model, BM25 ranker, wikilinks
-│   ├── store.rs         # SQLite persistence, FTS5 index & fallback tables
-│   ├── context.rs       # Token-budgeted system prompt builder & prompt cache
-│   └── reflection.rs    # Non-blocking async background reflection worker
+├── cynapse-memory/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs           # Core module re-exports
+│       ├── graph.rs         # In-memory graph, 4-tier model, BM25 ranker, wikilinks
+│       ├── store.rs         # SQLite persistence, FTS5 index & fallback tables
+│       ├── context.rs       # Token-budgeted system prompt builder & prompt cache
+│       └── reflection.rs    # Non-blocking async background reflection worker
 └── README.md
 ```

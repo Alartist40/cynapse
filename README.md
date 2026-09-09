@@ -136,10 +136,10 @@ Memory in Cynapse is modeled after biological neural networks. Ideas, facts, and
 - **GBNF Grammar Constraints**: Enforces valid JSON tool-call schema syntax, preventing output formatting panics offline.
 - **KV-Cache Slot Preservation**: Reuses prompt prefix KV-caches across conversation turns for near-zero prefix evaluation latency.
 - **Loop Guard Protection**: Active circular buffer detects and halts non-progressing repeated tool execution loops.
-- **Max Step Safeguards**: Configurable step limits
+- **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 5`) to prevent runaway recursive tool execution cycles.
 
 ### 🎭 System Persona Manager (`/persona`)
-- **Interactive TUI Modal**: Inspect available `.md` persona files in `~/.cynapse/persona/`, preview file contents and system prompt outputs in real-time, switch active personas (`Enter`), or reset to default identity (`r`).
+- **Interactive TUI Modal & Live Editor**: Inspect available `.md` persona files in `~/.cynapse/persona/`, press `e` to edit live with cursor navigation, `Ctrl+S` to save to disk, switch active personas (`Enter`), or reset to default identity (`r`).
 - **Dynamic Prompt Compiler**: Injects direct, high-character system instructions into every model prompt without generic LLM headers or preambles.
 
 ### 🩺 Cynapse Doctor Self-Healing Engine (`/doctor`)

@@ -58,8 +58,8 @@ Before loading models, the router evaluates host RAM and VRAM availability using
 $$\text{Memory Needed} = \text{Model Disk Size} + 1.5 \text{ GiB (KV Cache Headroom)}$$
 
 #### 2. Tier Selection Routing Logic
-- **Tier 1 (Fast Engine)**: Selected when model fits within host RAM or GPU offload is preferred. Uses Tokio async stream runner (`query_tier1_stream`) sending HTTP POST queries to local LLM server (`/api/generate`). Includes model tag matching (`/api/tags`) to resolve `.gguf` file names to registered tags with 404 retries.
-- **Tier 2 (Large GGUF Core)**: Selected when GGUF model size exceeds host RAM. Invokes Leafcutter pure Rust layer-streaming engine to stream weights from disk on demand.
+- **Tier 1 (Fast Engine - HTTP Accelerated Priority)**: Selected first for high-speed SIMD accelerated token generation (15–30+ tok/s). Uses Tokio async stream runner (`query_tier1_stream`) sending HTTP POST queries to local LLM server (`/api/generate` at `127.0.0.1:11434` / `11435`) with 3-attempt exponential backoff and 0..100ms jitter.
+- **Tier 2 (Large GGUF Core - Cached Native Fallback)**: Selected as offline fallback when HTTP endpoints are unreachable or when GGUF model size exceeds host RAM. Invokes Leafcutter pure Rust layer-streaming engine with `NATIVE_ENGINE_CACHE` (`Arc<NativeStreamingEngine>`) to avoid reloading GGUF weights on subsequent queries.
 - **Tier 3 (Large Safetensor Core)**: Selected when model uses Safetensors format. Invokes Leafcutter Safetensors engine.
 
 #### 3. System Hardware Telemetry (`probe_hardware_info()`)
@@ -83,8 +83,9 @@ Memory nodes are classified into 4 hierarchy tiers and grouped into 6 spinning s
 
 #### 2. Search & Two-Tier Hybrid Recall Architecture
 - **Full-Text Search**: SQLite FTS5 index for keyword lookups.
-- **Two-Tier Hybrid Scoring**: Combines lexical BM25 term frequency, specialization boost $\text{spec}(e)$, and exponential recency decay ($\gamma^{\Delta t}$):
+- **Two-Tier Hybrid Scoring & Relevance Gate**: Combines lexical BM25 term frequency, specialization boost $\text{spec}(e)$, and exponential recency decay ($\gamma^{\Delta t}$) with a `MIN_RELEVANCE_SCORE = 5.0` relevance threshold:
   $$\text{Score} = (\text{BM25} \cdot 0.95^{\Delta t}) + (4.0 \cdot \text{spec}(e)) + 0.3 \cdot (\text{Links} + \text{Backlinks})$$
+- **Prompt Deduplication (`build_prompt_with_options`)**: Bypasses duplicate system presets and core identity nodes (`CORE_IDS`) when custom personas (`IDENTITY.md`, `SOUL.md`) are active.
 - **Content Sanitization**: `clean_node_content` strips internal wiki-links (`Target: [[...]]`, `Linked: [[...]]`) before prompt injection.
 - **Turn Log Exclusion**: Ephemeral `TurnLog` nodes are stored in SQLite and visual topology, but excluded from RAG system prompt context insertion to prevent prompt bloat and model hallucinations.
 
