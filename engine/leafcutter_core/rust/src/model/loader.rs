@@ -237,7 +237,7 @@ impl GGUFModel {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|kb| kb * 1024)
-            .unwrap_or_else(|| config.max_seq_len.min(1024));
+            .unwrap_or(config.max_seq_len);
         let kv_cache_bytes = 2usize
             .saturating_mul(config.num_hidden_layers)
             .saturating_mul(config.num_key_value_heads)

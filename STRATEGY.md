@@ -11,279 +11,320 @@
 |-----------|--------|-------|
 | Core Framework | ✅ Stable | All 196 tests pass, clean working tree |
 | TUI/CLI | ✅ Stable | Persona editor, slash menu, theme system working |
-| Memory (Dendrite) | ✅ Stable | FTS5+BM25, relevance gating, reflection |
-| Engine Routing | ❌ Broken | 35B model classified as Tier 1 |
-| Inference Speed | ❌ Critical | 1-2 tok/s vs Ollama's 11 tok/s |
-| Streaming Quality | ⚠️ Suboptimal | No NDJSON, no buffering optimization |
+| Engine Routing | ✅ Fixed | 35B routes to Tier 2, dynamic headroom scaling |
+| Memory (Dendrite) | ⚠️ Partial | Graph structure real, galaxy visualization is decorative |
+| Inference Speed | ❌ Critical | 1-2 tok/s vs Ollama's 11 tok/s (still unresolved) |
+| Streaming Quality | ⚠️ Suboptimal | Buffered but not true NDJSON |
 
 ---
 
-## Round 1 Audit (2026-09-09)
+## Round 1 Audit — Resolved Items
 
-### Critical Issues
-
-#### 1. Engine Routing Broken — 35B Model Classified as Tier 1
-
-**File**: `engine/cynapse-engine/src/lib.rs:267-305`
-
-**Root Cause**: Routing logic only checks `needed_bytes <= ram_bytes` (total RAM), not available RAM. For the 35B model:
-- Model: 21.7GB + RESERVE_BYTES: 1.5GB = **23.2GB needed**
-- System RAM: **15GB total, ~6.6GB available**
-- `23.2GB <= 15GB` is false, BUT `prefer_gpu` is checked first
-
-The routing doesn't parse GGUF metadata to determine model parameter count. A 35B model needs Tier 2 (layer streaming) regardless of `prefer_gpu`.
-
-**Impact**: 35B model loads into RAM, thrashes, runs at 1-2 tok/s instead of using layer streaming.
-
-**Fix Required**:
-```rust
-pub fn route_model(model_path: &Path, prefer_gpu: bool) -> RouteDecision {
-    // Parse GGUF metadata for parameter count
-    let param_count = detect_parameter_count_from_gguf(model_path);
-    
-    let tier = if is_safetensors {
-        EngineTier::Tier3LargeSafetensor
-    } else if param_count > 20_000_000_000 {  // >20B params
-        EngineTier::Tier2LargeGguf  // Always Tier2 for large models
-    } else if prefer_gpu || needed_bytes <= ram_available_bytes {
-        EngineTier::Tier1Fast
-    } else {
-        EngineTier::Tier2LargeGguf
-    };
-}
-```
+| ID | Issue | Status | Resolution |
+|----|-------|--------|------------|
+| R1-01 | Engine routing broken for 35B | ✅ Resolved | `route_model` now uses `model_gb > 20.0 && needed_bytes > ram_bytes` gate |
+| R1-04 | RESERVE_BYTES too small | ✅ Resolved | `compute_reserve_bytes()` scales 1.0–8.0 GB by model size |
+| R1-06 | Streaming not NDJSON | ⚠️ Partial | Buffered line parsing, but not true NDJSON protocol |
 
 ---
 
-#### 2. Inference Speed Critical — 1-2 tok/s vs 11 tok/s
+## Round 2 Audit (2026-09-09) — Engine Changes
 
-**Root Causes**:
+### Verified: What Was Actually Implemented
 
-**A. No Batch Inference** (`engine/leafcutter_core/rust/src/api/mod.rs`)
+**1. Dynamic Headroom Scaling** (`lib.rs:9-20`) — ✅ Correct
 ```rust
-// Current: Single token generation
-for _ in 0..max_tokens - 1 {
-    let mut logits = self.forward_native(&[next_token])?;  // ← One token at a time!
+pub fn compute_reserve_bytes(model_bytes: u64) -> u64 {
+    let model_gb = model_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if model_gb <= 3.0 { 1GB }
+    else if model_gb <= 9.0 { 2.5GB }
+    else if model_gb <= 20.0 { 5GB }
+    else { 8GB }
 }
 ```
-Each token requires a full forward pass through 60+ layers. Ollama/llama.cpp uses `llama_decode()` with batch processing.
+Properly scales reserve for KV cache + activations. 35B model gets 8GB reserve.
 
-**B. Prefetch Disabled for Large Models** (`engine/leafcutter_core/rust/src/api/mod.rs:950-974`)
+**2. Routing Logic** (`lib.rs:306-314`) — ✅ Correct
 ```rust
-let use_prefetch = match std::env::var("LEAFCUTTER_PREFETCH").ok().as_deref() {
-    Some("0") | Some("false") => false,
-    Some("1") | Some("true") => true,
-    _ => {
-        let total_ram = crate::detect::probe_hardware().ram_total_mb;
-        let model_mb = (self.model.file.file_size_bytes() / (1024 * 1024)) as u64;
-        total_ram >= model_mb  // ← 15GB >= 21.7GB = false!
-    }
+let tier = if is_safetensors {
+    EngineTier::Tier3LargeSafetensor
+} else if model_gb > 20.0 && needed_bytes > ram_bytes {
+    EngineTier::Tier2LargeGguf  // ← 35B goes here
+} else if needed_bytes <= ram_bytes || (prefer_gpu && model_gb <= 12.0) {
+    EngineTier::Tier1Fast
+} else {
+    EngineTier::Tier2LargeGguf
 };
 ```
-35B model (21.7GB) doesn't fit in 15GB RAM → prefetch disabled → layers loaded sequentially from disk.
+The `model_gb > 20.0` gate prevents large models from entering Tier 1.
 
-**C. RESERVE_BYTES Too Small** (`lib.rs:9`)
+**3. Leafcutter detect.rs** (`detect.rs:270-312`) — ✅ Correct
+`choose_tier` mirrors the same dynamic reserve logic. Consistent with lib.rs.
+
+**4. Doctor Check** (`doctor.rs:121-159`) — ⚠️ Incomplete
+RAM check uses static thresholds (8GB/3GB/1GB) but doesn't reference the dynamic reserve tiers. Works but doesn't reflect actual model routing logic.
+
+**5. Main.rs Route Command** (`main.rs:79-92`) — ✅ Correct
+Passes `prefer_gpu: false` to `route_model`, so routing is purely size-based.
+
+### What Was NOT Implemented (Contrary to Commit Message)
+
+| Claimed | Actual |
+|---------|--------|
+| "NDJSON streaming pipeline" | Still `bytes_stream()` with manual newline parsing at `lib.rs:579-616` |
+| "Buffered NDJSON line parsing with chunk channels" | Buffer is just `String::new()`, no 64KB/8MB sizing |
+| "Layer cache sliding-window enabled" | No change to leafcutter engine code |
+
+---
+
+## Round 2 Audit — Dendrite Memory System
+
+### Question: Is the Galaxy View Legitimate?
+
+**Answer: NO. It is decorative, not functional.**
+
+The 3D galaxy renderer (`app.rs:2442-2603`) creates a visual impression of a galaxy but does NOT implement the gravitational/clustering model you described.
+
+#### What the Code Actually Does
+
+**Central Core** (`app.rs:2462-2470`):
+- Fixed yellow `✸` at coordinates (0,0,0). Hardcoded. Not computed from node importance.
+
+**Category Orbits** (`app.rs:2495-2510`):
 ```rust
-const RESERVE_BYTES: u64 = 1536 * 1024 * 1024;  // 1.5GB
+let category_clusters = [
+    (Meta, 6.0, 0.0 + anim_spin, ...),      // Fixed distance 6.0
+    (Preferences, 10.0, 1.2 + anim_spin, ...), // Fixed distance 10.0
+    (Personal, 14.0, 2.4 + anim_spin, ...),    // Fixed distance 14.0
+    (Engineering, 18.0, 3.6 + anim_spin, ...), // Fixed distance 18.0
+    (Episodic, 22.0, 4.8 + anim_spin, ...),    // Fixed distance 22.0
+    (Transient, 26.0, 5.8 + anim_spin, ...),   // Fixed distance 26.0
+];
 ```
-For 35B model:
-- 21.7GB weights
-- 4-8GB KV cache (35B, 4096 context)
-- 2-4GB activations
-- **Total: 27-33GB**
-- 1.5GB reserve doesn't account for KV cache → thrashing
+Each category has a **predetermined orbit radius**. There is NO gravitational computation. The "pull" is just a fixed number.
 
-**D. No GPU Offloading**
-Leafcutter native engine is CPU-only. Ollama uses llama.cpp with CUDA/Metal via `-ngl 99`.
+**Node Placement** (`app.rs:2515-2557`):
+```rust
+let local_radius = 2.0 + ((idx % 4) as f32 * 1.5);
+let local_angle = (idx as f32 * 1.4) + anim_spin * 1.5;
+```
+Nodes are placed in a **spiral pattern within their category** using modular arithmetic. Position depends on `idx` (insertion order), NOT on content similarity or link strength.
 
-**Impact**: 5-10x slower than Ollama on same hardware.
+**Edge Drawing** (`app.rs:2559-2570`):
+- Only draws a **single midpoint dot** between connected nodes, not the full edge line.
+- Multiple edges can overwrite the same midpoint.
+
+#### What's Missing (Compared to Your Vision)
+
+| Your Vision | Actual Implementation | Gap |
+|-------------|----------------------|-----|
+| Biggest memory in center | Fixed `✸` at (0,0,0) | Central mass is decorative |
+| Similar themes cluster together | Fixed orbit radius per category | No content-based clustering |
+| Gravitational pull on planets/moons | Modular arithmetic positioning | No force simulation |
+| Galaxy grows organically | Nodes placed by insertion order | No dynamic restructuring |
+| Connected nodes orbit together | Category-based grouping only | Links don't affect position |
+
+### What IS Real in Dendrite
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Wiki-link parsing `[[target]]` | ✅ Working | `graph.rs:12-15` regex |
+| Backlink maintenance | ✅ Working | Auto-wired on upsert |
+| Node categories | ✅ Working | `NodeCategory` enum with tag-based classification |
+| BM25 search | ✅ Working | `graph.rs:422-486` |
+| FTS5 + SQLite persistence | ✅ Working | `store.rs` with triggers |
+| Relevance gating | ✅ Working | `MIN_RELEVANCE_SCORE = 5.0` |
+| Multi-hop traversal | ✅ Working | BFS 1/2/3 hop |
+| Recency decay scoring | ✅ Working | `0.95^age_days` in `context.rs:340` |
+| Spec index | ✅ Working | Weighted sum of tags + links + tier |
+
+### What's Broken in Dendrite
+
+**1. Graph Has No Spatial Model**
+`Dendrite` is a flat `HashMap<String, Node>`. Nodes have no x/y/z coordinates. The galaxy renderer computes positions on-the-fly from insertion order, not from graph structure.
+
+**2. `category()` is Shallow** (`graph.rs:161-188`)
+```rust
+pub fn category(&self) -> NodeCategory {
+    for tag in &self.tags {
+        let t = tag.to_lowercase();
+        if t.contains("pref") || t.contains("like") ... { return Preferences; }
+        if t.contains("code") || t.contains("rust") ... { return Engineering; }
+    }
+    // fallback by node_type
+}
+```
+Only checks first matching tag. A node tagged `#rust #favorite` returns `Preferences` (first match), not `Engineering`.
+
+**3. `spec_index()` is Naive** (`graph.rs:191-201`)
+```rust
+pub fn spec_index(&self) -> f32 {
+    let tag_score = (self.tags.len() as f32 * 0.25).min(0.5);
+    let link_score = ((self.links.len() + self.backlinks.len()) as f32 * 0.1).min(0.3);
+    let tier_base = match self.node_type.tier() { 3 => 0.9, 2 => 0.7, ... };
+    (tier_base + tag_score + link_score).min(1.0)
+}
+```
+More tags = higher spec index, regardless of tag quality. A node with 10 random tags scores higher than one with 2 meaningful tags.
+
+**4. No Content Similarity Clustering**
+Two nodes about "Rust error handling" don't cluster together unless they explicitly `[[link]]` to each other. There's no embedding or semantic similarity.
+
+**5. Growth Model is Static**
+New nodes are added at the "edge" of their category orbit. The galaxy doesn't reorganize when new nodes arrive. No force-directed layout.
 
 ---
 
-#### 3. Streaming Quality Suboptimal
+## Round 2 Audit — Unresolved Engine Issues
 
-**File**: `engine/cynapse-engine/src/lib.rs:555-612`
+| ID | Issue | Priority | Status |
+|----|-------|----------|--------|
+| R2-01 | No batch inference (single token forward pass) | Critical | Open |
+| R2-02 | Prefetch logic not verified for 35B | High | Open |
+| R2-03 | No GPU offloading in native engine | High | Open |
+| R2-04 | NDJSON protocol not implemented | Medium | Open |
+| R2-05 | `prefer_gpu` guard at `lib.rs:310` allows Tier 1 for `model_gb <= 12.0` | Medium | Open |
 
-**Issues**:
-- Uses `bytes_stream()` with manual newline parsing
-- No NDJSON protocol (Ollama uses `application/x-ndjson`)
-- No streaming buffer optimization (Ollama uses 64KB initial, 8MB max)
-- No channel-based pipeline (Ollama decouples inference from HTTP response)
+---
 
-**Ollama's Approach**:
-```go
-// Server: NDJSON streaming
-c.Header("Content-Type", "application/x-ndjson")
-c.Stream(func(w io.Writer) bool {
-    val, ok := <-ch
-    bts, _ := json.Marshal(val)
-    bts = append(bts, '\n')
-    w.Write(bts)
-    return true
-})
+## Next Strategic Direction: Dendrite Memory Overhaul
+
+### Goal
+Transform Dendrite from a flat graph with decorative visualization into a true **self-organizing knowledge galaxy** where:
+- Central nodes (high connectivity) form the core
+- Similar nodes cluster by content, not just tags
+- Links create gravitational attraction between nodes
+- The galaxy reorganizes as it grows
+- The visualization reflects actual graph structure
+
+### Phase 1: Spatial Graph Model (Immediate)
+
+**Add coordinates to nodes:**
+```rust
+pub struct Node {
+    // ... existing fields ...
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub mass: f32,  // = spec_index * (1 + backlinks.len())
+}
 ```
 
-**Impact**: Token delivery less smooth, higher latency perception.
+**Implement force-directed layout:**
+- Repulsion between all nodes (Coulomb's law)
+- Attraction along edges (Hooke's law: spring force)
+- Central gravity toward origin (galaxy core)
+- Category-specific gravity wells (sub-clusters)
 
----
+```rust
+fn simulate_forces(graph: &Dendrite, iterations: usize) {
+    for _ in 0..iterations {
+        for node in graph.all() {
+            // Repulsion from all other nodes
+            for other in graph.all() {
+                if node.id != other.id {
+                    let dx = node.x - other.x;
+                    let dist = dx.norm().max(0.1);
+                    let force = REPULSION / (dist * dist);
+                    node.velocity += force * dx.normalize();
+                }
+            }
+            // Attraction along edges
+            for link_id in &node.links {
+                if let Some(target) = graph.get(link_id) {
+                    let dx = target.position - node.position;
+                    let dist = dx.norm();
+                    let force = SPRING_K * (dist - REST_LENGTH);
+                    node.velocity += force * dx.normalize();
+                }
+            }
+            // Central gravity
+            let to_center = -node.position;
+            node.velocity += CENTRAL_GRAVITY * to_center.normalize();
+        }
+        // Apply velocities with damping
+        for node in graph.all_mut() {
+            node.position += node.velocity * DAMPING;
+            node.velocity *= DAMPING;
+        }
+    }
+}
+```
 
-### Status of Round 1 Audit Items
+### Phase 2: Content-Based Clustering (Short-term)
 
-| ID | Issue | Priority | Status | Resolution / Notes |
-|----|-------|----------|--------|---------------------|
-| R1-01 | Engine routing broken for large models | Critical | ✅ Resolved | Fixed in `cynapse-engine::route_model` & `detect::choose_tier`. 35B models route strictly to Tier 2 Layer Streaming. |
-| R1-02 | No batch inference in native engine | Critical | In Progress | Prompt prefill evaluated in batches; token-by-token generation with sliding window. |
-| R1-03 | Prefetch disabled for large models | High | In Progress | Layer cache sliding-window enabled for models exceeding RAM. |
-| R1-04 | RESERVE_BYTES too small | High | ✅ Resolved | Implemented `compute_reserve_bytes()` dynamically scaling 1.0GB–8.0GB based on model size. |
-| R1-05 | No GPU offloading | High | Open | FFI / llama-server bridge provides GPU offload where available. |
-| R1-06 | Streaming not NDJSON | Medium | ✅ Resolved | Buffered NDJSON line parsing with chunk channels integrated into `query_tier1_stream`. |
+**Replace tag-based `category()` with embedding similarity:**
+- Compute lightweight TF-IDF or MinHash for each node's content
+- Use similarity to assign cluster membership
+- Category orbits become dynamic, not fixed
 
----
+**Implement `attract()` method:**
+```rust
+impl Dendrite {
+    pub fn attract(&mut self, node_a: &str, node_b: &str, strength: f32) {
+        // Increase link weight between similar nodes
+        // Pull their coordinates closer during next layout pass
+    }
+}
+```
 
-## Strategic Direction
+### Phase 3: Dynamic Galaxy Growth (Medium-term)
 
-### Phase 1: Fix Routing & Performance (Immediate)
+**On each `upsert()`:**
+1. Compute new node's content fingerprint
+2. Find nearest cluster center
+3. Place node at cluster edge with initial velocity
+4. Run 10-20 force simulation steps to settle
+5. Update visualization coordinates
 
-**Goal**: Make 35B model route correctly and run at acceptable speed.
+**On each `delete()`:**
+1. Remove node
+2. Re-run局部layout for affected cluster
+3. Galaxy contracts naturally
 
-1. **Fix routing logic** — Parse GGUF metadata for parameter count, apply size-based heuristics
-2. **Dynamic RESERVE_BYTES** — Scale reserve based on model size (8GB for >10GB models)
-3. **Enable prefetch for large models** — Override RAM check when model is >15GB
-4. **Integrate llama.cpp as primary backend** — Already exists as `FfiEngine`, needs proper wiring
+### Phase 4: Visualization Overhaul (Medium-term)
 
-### Phase 2: Engine Architecture (Short-term)
+**Replace current renderer with force-directed layout:**
+- Nodes positioned by actual (x,y,z) coordinates
+- Full edge lines (not midpoint dots)
+- Node size proportional to `mass`
+- Category shown by color, not orbit radius
+- Zoom/pan/rotate with real 3D perspective
 
-**Goal**: Match Ollama's performance characteristics.
-
-1. **llama.cpp FFI Integration**
-   - Use existing `FfiEngine` for Tier 1 instead of HTTP subprocess
-   - Enable GPU offloading via CUDA/Metal
-   - Implement batch inference via `llama_decode()`
-
-2. **NDJSON Streaming Protocol**
-   - Match Ollama's `application/x-ndjson` format
-   - Implement channel-based pipeline (inference → channel → HTTP response)
-   - Add 64KB/8MB buffer sizing
-
-3. **KV Cache Management**
-   - Implement prompt caching (`cache_prompt: true`)
-   - Add context shifting for long conversations
-   - VRAM-based context sizing
-
-### Phase 3: Advanced Features (Medium-term)
-
-**Goal**: Exceed Ollama's capabilities with Colibri-inspired architecture.
-
-1. **Tiered Memory Hierarchy** (from Colibri)
-   - Treat VRAM/RAM/disk as single memory hierarchy
-   - Per-layer LRU cache with learned pin decisions
-   - PILOT prefetch (router-lookahead thread)
-
-2. **Batch-Union Optimization** (from Colibri)
-   - Read each unique expert once per batch, not once per token
-   - Critical for MoE models
-
-3. **Speculative Decoding**
-   - MTP draft heads for 2-3x speedup
-   - Grammar-forced drafts for structured output
-
-4. **Multi-Backend Execution** (from llama.cpp)
-   - Abstract backend interface (CPU/CUDA/Metal/Vulkan)
-   - Automatic backend selection via hardware detection
-   - Graph reuse across ubatches
-
-### Phase 4: Production Hardening (Long-term)
-
-**Goal**: Enterprise-grade reliability and performance.
-
-1. **Process Isolation** (from Ollama)
-   - Spawn llama-server as subprocess for crash isolation
-   - HTTP communication layer for reliability
-   - Dynamic GPU backend loading
-
-2. **Memory Management**
-   - VRAM prediction and eviction
-   - Semaphore-based concurrency control
-   - Automatic context sizing based on available memory
-
-3. **Monitoring & Telemetry**
-   - Per-device VRAM accounting
-   - Routing heat maps (Colibri `.coli_usage` style)
-   - Performance regression testing
-
----
-
-## Reference Architecture Comparison
-
-### What Makes Ollama Fast
-
-| Feature | Ollama | Cynapse | Gap |
-|---------|--------|---------|-----|
-| Inference Backend | llama.cpp (C++) | Leafcutter (Rust) | Ollama has mature SIMD/GPU kernels |
-| Batch Processing | `llama_decode()` with ubatch | Single token forward pass | 5-10x slower |
-| GPU Offloading | CUDA/Metal via `-ngl` | CPU-only | No GPU acceleration |
-| KV Cache | Paged attention, prompt caching | Basic | Missing optimization |
-| Streaming | NDJSON with channel pipeline | Manual bytes_stream | Less smooth |
-| Process Isolation | Subprocess per model | In-process | Crash risk |
-| Memory Management | VRAM prediction, eviction | Static RESERVE_BYTES | Thrashing |
-
-### What Makes Colibri Fast (for Large Models)
-
-| Feature | Colibri | Cynapse | Gap |
-|---------|---------|---------|-----|
-| Memory Tiering | VRAM/RAM/disk hierarchy | RAM only | No disk streaming |
-| Expert Caching | Per-layer LRU + learned pins | None | No caching |
-| Prefetch | PILOT (router-lookahead) | Disabled for large models | No overlap |
-| Batch-Union | Read expert once per batch | N/A (no MoE) | Not implemented |
-| Speculative Decoding | MTP heads | None | No speedup |
-
-### What Makes AirLLM Work (for Memory-Constrained)
-
-| Feature | AirLLM | Cynapse | Gap |
-|---------|--------|---------|-----|
-| Hook-Based Streaming | Pre/post hooks per module | None | Not implemented |
-| Disk-as-Memory | Stream weights on-demand | Load entire model | Memory inefficient |
-| Pinned Memory Prefetch | 2GB pinned for faster copy | None | No optimization |
+**Add interaction:**
+- Click node to inspect content
+- Drag node to reposition (manual override)
+- Highlight 1-hop neighborhood on hover
+- Show path between any two nodes
 
 ---
 
 ## Performance Targets
 
-| Metric | Current | Ollama | Target |
-|--------|---------|--------|--------|
-| 9B Model (Q4_K_M) | ~2-3 tok/s | ~11 tok/s | 10+ tok/s |
-| 35B Model (Q4_K_M) | ~1-2 tok/s | ~5-7 tok/s | 5+ tok/s |
-| First Token Latency | 5-10s | 1-2s | <2s |
-| Streaming Smoothness | Choppy | Smooth | Smooth |
-| Memory Usage | Thrashing | Stable | Stable |
-
----
-
-## Next Action Items
-
-1. [ ] Parse GGUF metadata for parameter count in routing
-2. [ ] Implement dynamic RESERVE_BYTES based on model size
-3. [ ] Enable prefetch for large models with override flag
-4. [ ] Wire FfiEngine as primary backend for Tier 1
-5. [ ] Implement NDJSON streaming protocol
-6. [ ] Add prompt caching to KV cache
-7. [ ] Benchmark 9B model vs Ollama baseline
-8. [ ] Document GPU offloading requirements
+| Metric | Current | Target |
+|--------|---------|--------|
+| Galaxy renders actual graph structure | No (decorative) | Yes |
+| Node clustering by content | No (tag-based) | Yes (TF-IDF/embedding) |
+| Links affect spatial position | No | Yes (spring force) |
+| Galaxy reorganizes on growth | No | Yes (force-directed) |
+| Edge rendering complete | No (midpoint dots) | Yes (full lines) |
+| 9B inference speed | ~2-3 tok/s | 10+ tok/s |
+| 35B inference speed | ~1-2 tok/s | 5+ tok/s |
 
 ---
 
 ## Lessons Learned
 
-1. **Never trust `prefer_gpu` flag** — Parse actual hardware capabilities
-2. **RAM check must use available, not total** — `/proc/meminfo` MemAvailable
-3. **Large models need dynamic reserves** — 1.5GB is insufficient for 35B
-4. **Batch inference is non-negotiable** — Single-token forward pass is 5-10x slower
-5. **NDJSON beats manual parsing** — Match Ollama's streaming protocol
-6. **Process isolation matters** — In-process inference risks entire TUI crash
-7. **GPU offloading is table stakes** — CPU-only is unacceptable for production
+1. **Visualization ≠ Function** — Pretty ASCII art doesn't mean the underlying model works
+2. **Spatial models need spatial data** — Graph must store coordinates, not compute them on-the-fly
+3. **Category by tag is fragile** — First-match wins, ignores tag quality
+4. **Force-directed layouts are the standard** — D3.js, Graphviz, Cytoscape all use this
+5. **Growth requires reorganization** — Static placement = dead galaxy
+6. **Edges are the signal** — Links encode relationship strength; use them for clustering
+7. **Mass = importance** — High-connectivity nodes should be larger and more central
 
 ---
 
 *Last Updated: 2026-09-09*
-*Audit Round: 1*
-*Next Review: After Phase 1 completion*
+*Audit Round: 2*
+*Next Review: After Dendrite spatial model implementation*

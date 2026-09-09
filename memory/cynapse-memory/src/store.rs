@@ -202,7 +202,7 @@ impl DendriteStore {
             let tags: String = row.get(4)?;
             let links: String = row.get(5)?;
             let backlinks: String = row.get(6)?;
-            Ok(Node {
+            let mut node = Node {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 content: row.get(2)?,
@@ -212,13 +212,23 @@ impl DendriteStore {
                 backlinks: serde_json::from_str(&backlinks).unwrap_or_default(),
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
-            })
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                vx: 0.0,
+                vy: 0.0,
+                vz: 0.0,
+                mass: 1.0,
+            };
+            node.mass = node.compute_mass();
+            Ok(node)
         })?;
 
         for node in rows {
             let node = node.context("reading node row")?;
             graph.insert_hydrated(node);
         }
+        graph.simulate_forces(20);
         Ok(())
     }
 

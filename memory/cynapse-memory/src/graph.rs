@@ -140,8 +140,8 @@ impl NodeCategory {
     }
 }
 
-/// A single knowledge node in the graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A single knowledge node in the graph with spatial 3D physics coordinates.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: String,
     pub title: String,
@@ -154,6 +154,16 @@ pub struct Node {
     pub backlinks: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 3D Spatial coordinates in the galaxy topology
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Physics velocity vectors
+    pub vx: f32,
+    pub vy: f32,
+    pub vz: f32,
+    /// Gravitational mass computed from specialization index and connectivity
+    pub mass: f32,
 }
 
 impl Node {
@@ -200,11 +210,24 @@ impl Node {
         (tier_base + tag_score + link_score).min(1.0)
     }
 
+    /// Compute gravitational mass based on specialization and connection degree.
+    pub fn compute_mass(&self) -> f32 {
+        let spec = self.spec_index();
+        let degree = (self.links.len() + self.backlinks.len()) as f32;
+        let tier_weight = match self.node_type.tier() {
+            3 => 3.5, // Identity / Core
+            2 => 2.2, // Procedure / Concept
+            1 => 1.5, // Fact / Event
+            _ => 0.8, // TurnLog
+        };
+        (spec * tier_weight * (1.0 + degree * 0.35)).max(0.5)
+    }
+
     /// Create a minimal placeholder for a node that is referenced by a
     /// `[[link]]` but has no content yet.
     #[allow(dead_code)]
     pub fn placeholder(id: String, now: i64) -> Node {
-        Node {
+        let mut n = Node {
             title: id.clone(),
             id,
             content: String::new(),
@@ -214,7 +237,16 @@ impl Node {
             backlinks: Vec::new(),
             created_at: now,
             updated_at: now,
-        }
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            mass: 1.0,
+        };
+        n.mass = n.compute_mass();
+        n
     }
 }
 
@@ -283,11 +315,47 @@ impl Dendrite {
 
     /// Insert a hydrated node directly (used by the store on load). Skips
     /// backlink recalculation because backlinks are already stored.
-    pub fn insert_hydrated(&self, node: Node) {
+    pub fn insert_hydrated(&self, mut node: Node) {
+        node.mass = node.compute_mass();
         lock_inner(&self.inner).nodes.insert(node.id.clone(), node);
     }
 
-    /// Create or fully replace a node, re-wiring all backlinks.
+    /// Step the 3D force-directed physics layout across all nodes in the galaxy.
+    pub fn simulate_forces(&self, iterations: usize) {
+        let mut inner = lock_inner(&self.inner);
+        Self::simulate_forces_inner(&mut inner, iterations);
+    }
+
+    /// Pull two nodes closer in 3D coordinate space by applying a mutual gravitational impulse.
+    pub fn attract(&self, node_a: &str, node_b: &str, strength: f32) {
+        let mut inner = lock_inner(&self.inner);
+        if let (Some(a), Some(b)) = (inner.nodes.get(node_a).cloned(), inner.nodes.get(node_b).cloned()) {
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let dz = b.z - a.z;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.1);
+            let force = (strength * 2.0).min(10.0);
+
+            if let Some(na) = inner.nodes.get_mut(node_a) {
+                na.vx += (dx / dist) * force;
+                na.vy += (dy / dist) * force;
+                na.vz += (dz / dist) * force;
+            }
+            if let Some(nb) = inner.nodes.get_mut(node_b) {
+                nb.vx -= (dx / dist) * force;
+                nb.vy -= (dy / dist) * force;
+                nb.vz += (dz / dist) * force;
+            }
+        }
+    }
+
+    /// Identify the supermassive central node (highest gravitational mass / connectivity).
+    pub fn supermassive_node(&self) -> Option<Node> {
+        let inner = lock_inner(&self.inner);
+        inner.nodes.values().max_by(|a, b| a.mass.partial_cmp(&b.mass).unwrap_or(std::cmp::Ordering::Equal)).cloned()
+    }
+
+    /// Create or fully replace a node, re-wiring all backlinks and relaxing galaxy layout.
     pub fn upsert(
         &self,
         id: &str,
@@ -314,6 +382,7 @@ impl Dendrite {
             }
         }
 
+        let total_nodes = inner.nodes.len();
         let node = match inner.nodes.entry(id.to_string()) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let n = e.get_mut();
@@ -323,10 +392,14 @@ impl Dendrite {
                 n.tags = tags;
                 n.links = links.clone();
                 n.updated_at = now;
+                n.mass = n.compute_mass();
                 n.clone()
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let n = Node {
+                let count = e.key().len() + total_nodes;
+                let initial_radius = 8.0 + (count % 5) as f32 * 2.0;
+                let initial_angle = count as f32 * 1.6;
+                let mut n = Node {
                     id: id.to_string(),
                     title: title.to_string(),
                     content: content.to_string(),
@@ -336,23 +409,32 @@ impl Dendrite {
                     backlinks: Vec::new(),
                     created_at: now,
                     updated_at: now,
+                    x: initial_radius * initial_angle.cos(),
+                    y: ((count % 3) as f32 - 1.0) * 2.5,
+                    z: initial_radius * initial_angle.sin(),
+                    vx: 0.0,
+                    vy: 0.0,
+                    vz: 0.0,
+                    mass: 1.0,
                 };
+                n.mass = n.compute_mass();
                 e.insert(n.clone());
                 n
             }
         };
 
-        // Wire new backlinks — only for targets that already exist in the
-        // graph.  We no longer create placeholder nodes for unresolved
-        // `[[links]]` because documentation code spans and hypothetical
-        // references were populating the graph with empty ghost nodes.
+        // Wire new backlinks — only for targets that already exist in the graph.
         for link in &links {
             if let Some(target) = inner.nodes.get_mut(link) {
                 if !target.backlinks.contains(&node.id) {
                     target.backlinks.push(node.id.clone());
+                    target.mass = target.compute_mass();
                 }
             }
         }
+
+        // Run force simulation relaxation pass so the galaxy reorganizes organically
+        Self::simulate_forces_inner(&mut inner, 15);
 
         drop(inner);
         self.notify();
@@ -369,13 +451,134 @@ impl Dendrite {
         for n in inner.nodes.values_mut() {
             n.links = remove_str(&n.links, id);
             n.backlinks = remove_str(&n.backlinks, id);
+            n.mass = n.compute_mass();
         }
 
         inner.nodes.remove(id);
+        Self::simulate_forces_inner(&mut inner, 10);
         drop(inner);
         self.notify();
         true
     }
+
+/// Internal force simulation engine.
+/// Simulates Coulomb repulsion, Hooke spring attraction, central gravity, and damping.
+fn simulate_forces_inner(inner: &mut DendriteInner, iterations: usize) {
+    if inner.nodes.is_empty() {
+        return;
+    }
+
+    const REPULSION_K: f32 = 60.0;
+    const SPRING_K: f32 = 0.06;
+    const SPRING_REST: f32 = 5.0;
+    const CENTRAL_G: f32 = 0.04;
+    const DAMPING: f32 = 0.88;
+    const DT: f32 = 0.3;
+    const MAX_FORCE: f32 = 12.0;
+
+    let node_ids: Vec<String> = inner.nodes.keys().cloned().collect();
+    let n = node_ids.len();
+
+    for _ in 0..iterations {
+        let mut forces: HashMap<String, (f32, f32, f32)> = HashMap::new();
+        for id in &node_ids {
+            forces.insert(id.clone(), (0.0, 0.0, 0.0));
+        }
+
+        // 1. Repulsion between all pairs
+        for i in 0..n {
+            let id1 = &node_ids[i];
+            let n1 = match inner.nodes.get(id1) {
+                Some(node) => node,
+                None => continue,
+            };
+            let (p1x, p1y, p1z, m1) = (n1.x, n1.y, n1.z, n1.mass);
+
+            for j in (i + 1)..n {
+                let id2 = &node_ids[j];
+                let n2 = match inner.nodes.get(id2) {
+                    Some(node) => node,
+                    None => continue,
+                };
+                let (p2x, p2y, p2z, m2) = (n2.x, n2.y, n2.z, n2.mass);
+
+                let mut dx = p1x - p2x;
+                let mut dy = p1y - p2y;
+                let mut dz = p1z - p2z;
+                let mut dist_sq = dx * dx + dy * dy + dz * dz;
+                if dist_sq < 0.04 {
+                    dx = ((i as f32 * 1.3).sin() * 0.2) + 0.1;
+                    dy = ((j as f32 * 1.7).cos() * 0.2) + 0.1;
+                    dz = 0.1;
+                    dist_sq = dx * dx + dy * dy + dz * dz;
+                }
+
+                let dist = dist_sq.sqrt();
+                let rep_force = (REPULSION_K * m1 * m2 / dist_sq).min(MAX_FORCE);
+                let (fx, fy, fz) = (dx / dist * rep_force, dy / dist * rep_force, dz / dist * rep_force);
+
+                if let Some(f1) = forces.get_mut(id1) {
+                    f1.0 += fx; f1.1 += fy; f1.2 += fz;
+                }
+                if let Some(f2) = forces.get_mut(id2) {
+                    f2.0 -= fx; f2.1 -= fy; f2.2 -= fz;
+                }
+            }
+        }
+
+        // 2. Spring attraction along links & backlinks
+        for (id, node) in inner.nodes.iter() {
+            let p1 = (node.x, node.y, node.z);
+            for target_id in &node.links {
+                if let Some(target) = inner.nodes.get(target_id) {
+                    let dx = target.x - p1.0;
+                    let dy = target.y - p1.1;
+                    let dz = target.z - p1.2;
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.1);
+                    let displacement = dist - SPRING_REST;
+                    let spring_f = (SPRING_K * displacement).clamp(-MAX_FORCE, MAX_FORCE);
+                    let (fx, fy, fz) = (dx / dist * spring_f, dy / dist * spring_f, dz / dist * spring_f);
+
+                    if let Some(f1) = forces.get_mut(id) {
+                        f1.0 += fx; f1.1 += fy; f1.2 += fz;
+                    }
+                    if let Some(f2) = forces.get_mut(target_id) {
+                        f2.0 -= fx; f2.1 -= fy; f2.2 -= fz;
+                    }
+                }
+            }
+        }
+
+        // 3. Central Core Gravity (pull toward center of mass)
+        for (id, node) in inner.nodes.iter() {
+            let dist_sq = node.x * node.x + node.y * node.y + node.z * node.z;
+            let dist = dist_sq.sqrt().max(0.1);
+            let core_f = CENTRAL_G * node.mass * dist;
+            if let Some(f) = forces.get_mut(id) {
+                f.0 -= (node.x / dist) * core_f;
+                f.1 -= (node.y / dist) * core_f;
+                f.2 -= (node.z / dist) * core_f;
+            }
+        }
+
+        // 4. Velocity integration & position update
+        for (id, (fx, fy, fz)) in forces {
+            if let Some(node) = inner.nodes.get_mut(&id) {
+                let ax = fx / node.mass.max(0.1);
+                let ay = fy / node.mass.max(0.1);
+                let az = fz / node.mass.max(0.1);
+
+                node.vx = (node.vx + ax * DT) * DAMPING;
+                node.vy = (node.vy + ay * DT) * DAMPING;
+                node.vz = (node.vz + az * DT) * DAMPING;
+
+                node.x += node.vx * DT;
+                node.y += node.vy * DT;
+                node.z += node.vz * DT;
+            }
+        }
+    }
+}
 
     pub fn get(&self, id: &str) -> Option<Node> {
         lock_inner(&self.inner).nodes.get(id).cloned()

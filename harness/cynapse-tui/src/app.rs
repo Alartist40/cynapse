@@ -2459,21 +2459,11 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         let cos_p = pitch.cos();
         let sin_p = pitch.sin();
 
-        // 1. Central Core Mass / Black Hole Center
-        let cx1 = 0.0 * cos_y - 0.0 * sin_y;
-        let cz1 = 0.0 * sin_y + 0.0 * cos_y;
-        let cy1 = 0.0 * cos_p - cz1 * sin_p;
-        let cpx = (center_x + cx1 * 0.7) as i32;
-        let cpy = (center_y + cy1 * 0.35) as i32;
-        if cpx >= 0 && cpx < width as i32 && cpy >= 0 && cpy < height as i32 {
-            grid[cpy as usize][cpx as usize] = ('✸', Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-        }
-
-        // 2. Background Starfield
+        // 1. Background Cosmic Starfield
         let star_seeds = [
-            (-24.0, 10.0, -15.0), (22.0, -14.0, 18.0), (-18.0, -20.0, -10.0),
-            (25.0, 18.0, 12.0), (-30.0, 5.0, 20.0), (15.0, -25.0, -22.0),
-            (-10.0, 28.0, 5.0), (28.0, -8.0, -18.0), (-5.0, -32.0, 14.0),
+            (-34.0, 15.0, -25.0), (32.0, -18.0, 28.0), (-28.0, -25.0, -15.0),
+            (35.0, 22.0, 18.0), (-40.0, 8.0, 30.0), (22.0, -30.0, -28.0),
+            (-15.0, 35.0, 8.0), (38.0, -12.0, -25.0), (-8.0, -38.0, 20.0),
         ];
 
         for (sx, sy, sz) in star_seeds {
@@ -2489,52 +2479,23 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             }
         }
 
-        // 3. Category Cluster Center Orbits around Central Star
-        let anim_spin = self.galaxy_anim_spin;
-
-        let category_clusters = [
-            (cynapse_memory::graph::NodeCategory::Meta, 6.0, 0.0 + anim_spin, Color::Green, "Meta"),
-            (cynapse_memory::graph::NodeCategory::Preferences, 10.0, 1.2 + anim_spin, Color::Yellow, "Preferences"),
-            (cynapse_memory::graph::NodeCategory::Personal, 14.0, 2.4 + anim_spin, Color::LightMagenta, "Personal"),
-            (cynapse_memory::graph::NodeCategory::Engineering, 18.0, 3.6 + anim_spin, Color::Cyan, "Engineering"),
-            (cynapse_memory::graph::NodeCategory::Episodic, 22.0, 4.8 + anim_spin, Color::White, "Episodic"),
-            (cynapse_memory::graph::NodeCategory::Transient, 26.0, 5.8 + anim_spin, Color::DarkGray, "Oort Cloud"),
-        ];
-
-        let mut cluster_centers: std::collections::HashMap<cynapse_memory::graph::NodeCategory, (f32, f32, f32)> = std::collections::HashMap::new();
-        for (cat, dist, base_angle, _color, _name) in category_clusters {
-            let cx = dist * base_angle.cos();
-            let cz = dist * base_angle.sin();
-            let cy = (base_angle * 0.5).sin() * 2.0;
-            cluster_centers.insert(cat, (cx, cy, cz));
-        }
-
+        // 2. Map Real 3D Spatial Nodes onto Screen Grid
         let mut node_coords: std::collections::HashMap<String, (i32, i32)> = std::collections::HashMap::new();
 
-        // 4. Map Dendrite Nodes into Sub-Galaxy Orbits
-        for (idx, node) in nodes.iter().enumerate() {
+        for node in &nodes {
             let cat = node.category();
-            let (ccx, ccy, ccz) = cluster_centers.get(&cat).cloned().unwrap_or((0.0, 0.0, 0.0));
 
-            let local_radius = 2.0 + ((idx % 4) as f32 * 1.5);
-            let local_angle = (idx as f32 * 1.4) + anim_spin * 1.5;
+            // 3D rotation transform from actual force-directed physics coordinates
+            let x1 = node.x * cos_y - node.z * sin_y;
+            let z1 = node.x * sin_y + node.z * cos_y;
+            let y1 = node.y * cos_p - z1 * sin_p;
 
-            let raw_x = ccx + local_radius * local_angle.cos();
-            let raw_z = ccz + local_radius * local_angle.sin();
-            let raw_y = ccy + ((idx % 3) as f32 - 1.0) * 1.5;
-
-            // 3D rotation transform
-            let x1 = raw_x * cos_y - raw_z * sin_y;
-            let z1 = raw_x * sin_y + raw_z * cos_y;
-            let y1 = raw_y * cos_p - z1 * sin_p;
-
-            let px = (center_x + x1 * 0.7) as i32;
-            let py = (center_y + y1 * 0.35) as i32;
+            let px = (center_x + x1 * 1.6) as i32;
+            let py = (center_y + y1 * 0.8) as i32;
 
             if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
                 node_coords.insert(node.id.clone(), (px, py));
 
-                let spec = node.spec_index();
                 let cat_color = match cat {
                     cynapse_memory::graph::NodeCategory::Personal => Color::LightMagenta,
                     cynapse_memory::graph::NodeCategory::Engineering => Color::Cyan,
@@ -2544,9 +2505,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     cynapse_memory::graph::NodeCategory::Transient => Color::DarkGray,
                 };
 
-                let (ch, style) = if spec > 0.75 {
+                let (ch, style) = if node.mass >= 2.5 {
                     ('★', Style::default().fg(cat_color).add_modifier(Modifier::BOLD))
-                } else if spec > 0.5 {
+                } else if node.mass >= 1.3 {
                     ('✦', Style::default().fg(cat_color))
                 } else {
                     ('●', Style::default().fg(cat_color).add_modifier(Modifier::DIM))
@@ -2556,14 +2517,29 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             }
         }
 
-        // 5. Draw Synapse Edge Links between connected memory nodes
+        // 3. Central Supermassive Anchor
+        let supermassive = self.graph.supermassive_node();
+        let core_pos = supermassive.as_ref().map(|n| (n.x, n.y, n.z)).unwrap_or((0.0, 0.0, 0.0));
+        let cx1 = core_pos.0 * cos_y - core_pos.2 * sin_y;
+        let cz1 = core_pos.0 * sin_y + core_pos.2 * cos_y;
+        let cy1 = core_pos.1 * cos_p - cz1 * sin_p;
+        let cpx = (center_x + cx1 * 1.6) as i32;
+        let cpy = (center_y + cy1 * 0.8) as i32;
+        if cpx >= 0 && cpx < width as i32 && cpy >= 0 && cpy < height as i32 {
+            grid[cpy as usize][cpx as usize] = ('✸', Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        }
+
+        // 4. Draw Full Line Synaptic Filaments between connected memory nodes
         for edge in &edges {
             if let (Some(&(x1, y1)), Some(&(x2, y2))) = (node_coords.get(&edge.0), node_coords.get(&edge.1)) {
-                let mid_x = (x1 + x2) / 2;
-                let mid_y = (y1 + y2) / 2;
-                if mid_x >= 0 && mid_x < width as i32 && mid_y >= 0 && mid_y < height as i32 {
-                    if grid[mid_y as usize][mid_x as usize].0 == ' ' {
-                        grid[mid_y as usize][mid_x as usize] = ('·', Style::default().fg(Color::DarkGray));
+                let steps = ((x2 - x1).abs().max((y2 - y1).abs())).clamp(1, 30);
+                for s in 1..steps {
+                    let ix = x1 + (x2 - x1) * s / steps;
+                    let iy = y1 + (y2 - y1) * s / steps;
+                    if ix >= 0 && ix < width as i32 && iy >= 0 && iy < height as i32 {
+                        if grid[iy as usize][ix as usize].0 == ' ' {
+                            grid[iy as usize][ix as usize] = ('·', Style::default().fg(Color::DarkGray));
+                        }
                     }
                 }
             }

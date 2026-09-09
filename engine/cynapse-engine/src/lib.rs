@@ -331,11 +331,71 @@ pub struct ExecutionStats {
 }
 
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+struct StreamMessage {
+    content: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    content: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamChoice {
+    delta: Option<StreamDelta>,
+    text: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
 struct StreamChunk {
     response: Option<String>,
+    content: Option<String>,
+    message: Option<StreamMessage>,
+    choices: Option<Vec<StreamChoice>>,
+    #[allow(dead_code)]
     done: Option<bool>,
+    #[allow(dead_code)]
     eval_count: Option<usize>,
+}
+
+impl StreamChunk {
+    fn extract_token(&self) -> Option<String> {
+        if let Some(r) = &self.response {
+            if !r.is_empty() {
+                return Some(r.clone());
+            }
+        }
+        if let Some(c) = &self.content {
+            if !c.is_empty() {
+                return Some(c.clone());
+            }
+        }
+        if let Some(m) = &self.message {
+            if let Some(c) = &m.content {
+                if !c.is_empty() {
+                    return Some(c.clone());
+                }
+            }
+        }
+        if let Some(choices) = &self.choices {
+            if let Some(first) = choices.first() {
+                if let Some(d) = &first.delta {
+                    if let Some(c) = &d.content {
+                        if !c.is_empty() {
+                            return Some(c.clone());
+                        }
+                    }
+                }
+                if let Some(t) = &first.text {
+                    if !t.is_empty() {
+                        return Some(t.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,7 +585,10 @@ pub async fn query_tier1_stream(
 
     while attempt < max_attempts {
         attempt += 1;
-        let req_builder = client.post(&url).json(&payload);
+        let req_builder = client
+            .post(&url)
+            .header("Accept", "application/x-ndjson, text/event-stream, application/json")
+            .json(&payload);
 
         match req_builder.send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -543,7 +606,13 @@ pub async fn query_tier1_stream(
                         "temperature": 0.7
                     }
                 });
-                if let Ok(retry_res) = client.post(&url).json(&retry_payload).send().await {
+                if let Ok(retry_res) = client
+                    .post(&url)
+                    .header("Accept", "application/x-ndjson, text/event-stream, application/json")
+                    .json(&retry_payload)
+                    .send()
+                    .await
+                {
                     if retry_res.status().is_success() {
                         resp_opt = Some(retry_res);
                         break;
@@ -574,7 +643,7 @@ pub async fn query_tier1_stream(
         let mut stream = res.bytes_stream();
         let mut tokens_generated = 0usize;
         let mut is_thinking = false;
-        let mut buffer = String::new();
+        let mut buffer = String::with_capacity(65536);
 
         while let Some(item) = stream.next().await {
             let chunk_bytes = item.context("Error reading stream chunk from LLM engine")?;
@@ -582,15 +651,23 @@ pub async fn query_tier1_stream(
             buffer.push_str(&text);
 
             while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
+                let mut line = buffer[..pos].trim().to_string();
                 buffer.drain(..=pos);
 
                 if line.is_empty() {
                     continue;
                 }
 
+                if line.starts_with("data:") {
+                    line = line.trim_start_matches("data:").trim().to_string();
+                }
+
+                if line == "[DONE]" {
+                    break;
+                }
+
                 if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
-                    if let Some(token) = parsed.response {
+                    if let Some(token) = parsed.extract_token() {
                         if !token.is_empty() {
                             tokens_generated += 1;
 
