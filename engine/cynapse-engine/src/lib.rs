@@ -5,8 +5,21 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
-/// Headroom reserve: 1.5 GiB working space for KV cache + activations
-const RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
+/// Dynamic headroom reserve calculation: scales based on model parameter/disk footprint.
+pub fn compute_reserve_bytes(model_bytes: u64) -> u64 {
+    let model_gb = model_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if model_gb <= 3.0 {
+        1024 * 1024 * 1024 // 1.0 GiB for small models (<= 3B)
+    } else if model_gb <= 9.0 {
+        2560 * 1024 * 1024 // 2.5 GiB for medium models (3B - 9B)
+    } else if model_gb <= 20.0 {
+        5120 * 1024 * 1024 // 5.0 GiB for 10B-20B models
+    } else {
+        8192 * 1024 * 1024 // 8.0 GiB for 35B+ models (KV cache + large activations)
+    }
+}
+
+pub const DEFAULT_RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineTier {
@@ -283,13 +296,18 @@ pub fn route_model(model_path: &Path, prefer_gpu: bool) -> RouteDecision {
         fs::metadata(model_path).map(|m| m.len()).unwrap_or(0)
     };
 
+    let reserve_bytes = compute_reserve_bytes(model_bytes);
+    let needed_bytes = model_bytes.saturating_add(reserve_bytes);
     let model_size_mb = model_bytes as f64 / 1_048_576.0;
-    let needed_bytes = model_bytes.saturating_add(RESERVE_BYTES);
     let ram_needed_mb = needed_bytes as f64 / 1_048_576.0;
 
+    let model_gb = model_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    // Large models (>20GB / >20B params) exceeding available memory must route to Tier 2 layer streaming
     let tier = if is_safetensors {
         EngineTier::Tier3LargeSafetensor
-    } else if prefer_gpu || needed_bytes <= ram_bytes {
+    } else if model_gb > 20.0 && needed_bytes > ram_bytes {
+        EngineTier::Tier2LargeGguf
+    } else if needed_bytes <= ram_bytes || (prefer_gpu && model_gb <= 12.0) {
         EngineTier::Tier1Fast
     } else {
         EngineTier::Tier2LargeGguf

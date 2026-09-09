@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
             println!("Target Model Path:  {}", target.display());
             println!("Model Disk Size:    {:.2} MB", decision.model_size_mb);
             println!("Available Host RAM: {} MB", decision.ram_available_mb);
-            println!("Memory Needed:      {:.2} MB (Model + 1.5GB Headroom Reserve)", decision.ram_needed_mb);
+            println!("Memory Needed:      {:.2} MB (Model + Dynamic Headroom Reserve)", decision.ram_needed_mb);
             println!("----------------------------------------------------------------------");
             println!("SELECTED ENGINE TIER: {}", decision.tier.label());
             println!("======================================================================");

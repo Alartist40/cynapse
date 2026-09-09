@@ -123,20 +123,28 @@ impl CynapseDoctor {
         let avail_ram_mb = hw.ram_avail_mb;
         let total_ram_mb = hw.ram_total_mb;
 
-        if avail_ram_mb >= 4000 {
+        if avail_ram_mb >= 8000 {
             DoctorItem {
                 subsystem: "Hardware".into(),
                 check_name: "Host RAM & Safety Headroom".into(),
                 status: DoctorStatus::Pass,
-                detail: format!("Total RAM: {} MB | Available: {} MB (Sufficient for LLM inference)", total_ram_mb, avail_ram_mb),
+                detail: format!("Total RAM: {} MB | Available: {} MB (Sufficient for medium/large models with up to 8GB reserve)", total_ram_mb, avail_ram_mb),
                 fix_recommendation: None,
             }
-        } else if avail_ram_mb >= 1500 {
+        } else if avail_ram_mb >= 3000 {
+            DoctorItem {
+                subsystem: "Hardware".into(),
+                check_name: "Host RAM & Safety Headroom".into(),
+                status: DoctorStatus::Pass,
+                detail: format!("Total RAM: {} MB | Available: {} MB (Sufficient for 0.5B-7B models; 35B+ uses Tier 2 layer streaming)", total_ram_mb, avail_ram_mb),
+                fix_recommendation: None,
+            }
+        } else if avail_ram_mb >= 1000 {
             DoctorItem {
                 subsystem: "Hardware".into(),
                 check_name: "Host RAM & Safety Headroom".into(),
                 status: DoctorStatus::Warning,
-                detail: format!("Available RAM is {} MB. Recommend small quantized models (0.5B - 3B Q4_K_M).", avail_ram_mb),
+                detail: format!("Available RAM is {} MB. Recommend small quantized models (0.5B - 3B Q4_K_M) with 1.0GB reserve.", avail_ram_mb),
                 fix_recommendation: Some("Close background applications to free RAM.".into()),
             }
         } else {
@@ -144,7 +152,7 @@ impl CynapseDoctor {
                 subsystem: "Hardware".into(),
                 check_name: "Host RAM & Safety Headroom".into(),
                 status: DoctorStatus::Failed,
-                detail: format!("Critical low RAM! Available: {} MB (Minimum 1.5GB needed).", avail_ram_mb),
+                detail: format!("Critical low RAM! Available: {} MB (Minimum 1.0GB needed).", avail_ram_mb),
                 fix_recommendation: Some("Free memory or enable swap space before running LLM models.".into()),
             }
         }

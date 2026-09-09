@@ -280,12 +280,31 @@ pub fn choose_tier(
         return Tier::StreamingCpu;
     }
     let (total_mb, avail_mb) = meminfo_mb();
-    let ram_mb = if total_mb > 0 { total_mb } else { ram_available_mb };
+    let ram_mb = if ram_available_mb > 0 {
+        ram_available_mb
+    } else if avail_mb > 0 {
+        avail_mb
+    } else {
+        total_mb
+    };
     let total_ram_bytes = ram_mb.saturating_mul(1024 * 1024);
-    // Reserve 1.5 GiB headroom for OS + KV cache + activations
-    const RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
-    let need = model_size_bytes.saturating_add(RESERVE_BYTES);
-    if need <= total_ram_bytes {
+
+    // Dynamic reserve scaling based on model size (1.0GB up to 8.0GB for 35B+)
+    let model_gb = model_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let reserve_bytes: u64 = if model_gb <= 3.0 {
+        1024 * 1024 * 1024 // 1.0 GiB
+    } else if model_gb <= 9.0 {
+        2560 * 1024 * 1024 // 2.5 GiB
+    } else if model_gb <= 20.0 {
+        5120 * 1024 * 1024 // 5.0 GiB
+    } else {
+        8192 * 1024 * 1024 // 8.0 GiB for 35B+ models
+    };
+
+    let need = model_size_bytes.saturating_add(reserve_bytes);
+    if model_gb > 20.0 && need > total_ram_bytes {
+        Tier::StreamingCpu
+    } else if need <= total_ram_bytes {
         Tier::FastCpu
     } else {
         Tier::StreamingCpu
