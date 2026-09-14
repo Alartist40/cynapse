@@ -29,9 +29,12 @@ use tokio::sync::mpsc;
 
 use cynapse_core::offline_agent::{validate_gbnf_tool_call, LoopGuard};
 use cynapse_core::session::{SessionData, SessionManager, SessionMessage};
-use cynapse_engine::{fetch_native_models, probe_hardware_info, query_tier1_stream, unload_model, SystemHardwareInfo, TokenType};
+use cynapse_engine::{
+    fetch_native_models, probe_hardware_info, query_model_stream, route_model,
+    unload_model, EngineTier, SystemHardwareInfo, TokenType,
+};
 use cynapse_memory::context::DendriteContext;
-use cynapse_memory::graph::{Dendrite, NodeType};
+use cynapse_memory::graph::Dendrite;
 use cynapse_memory::store::DendriteStore;
 use crate::terminal::TuiRuntimeGuard;
 use crate::theme::AppTheme;
@@ -106,15 +109,14 @@ pub struct SlashCommand {
 }
 
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
-    SlashCommand { name: "/help", description: "Display keyboard shortcuts & help menu" },
+    SlashCommand { name: "/help", description: "Display commands & keyboard controls" },
+    SlashCommand { name: "/dendrite", description: "Open interactive Dendrite Graph & 3D Planetary Memory Atlas" },
     SlashCommand { name: "/model", description: "Open interactive model selector" },
-    SlashCommand { name: "/pull", description: "Download GGUF model from HuggingFace (hardware curated)" },
-    SlashCommand { name: "/persona", description: "Manage agent personality markdown files (IDENTITY, SOUL, USER, custom .md)" },
+    SlashCommand { name: "/theme", description: "Cycle visual color theme (Dark Slate, Neon, Amber, Matrix, Nord)" },
     SlashCommand { name: "/doctor", description: "Run self-healing Cynapse Doctor system diagnostic & recovery" },
-    SlashCommand { name: "/memory", description: "View 3D Galaxy Memory Atlas topology" },
-    SlashCommand { name: "/drawer", description: "Open interactive Dendrite Memory drawer inspector" },
+    SlashCommand { name: "/pull", description: "Download GGUF model from HuggingFace (hardware curated)" },
+    SlashCommand { name: "/persona", description: "Manage agent personality markdown files (IDENTITY, SOUL, USER)" },
     SlashCommand { name: "/thinking", description: "Toggle collapsible model thinking/reasoning blocks" },
-    SlashCommand { name: "/theme", description: "Cycle visual color theme (Dark Slate, Neon, Amber, Matrix)" },
     SlashCommand { name: "/unload", description: "Unload active LLM model from RAM immediately to free memory" },
     SlashCommand { name: "/session", description: "Open saved sessions manager" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
@@ -122,35 +124,62 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
 ];
 
 pub const ASCII_BANNER: &[&str] = &[
-    "                                                          ",
-    "                              +####+.                     ",
-    "                            =##***=:..::                  ",
-    "                            +#****::..::.                 ",
-    "                    -=-     ##*****=..:                   ",
-    "                   :+***: :   +####*+#=                   ",
-    "                -=-  -++       +#     ++=+:               ",
-    "              =+==--: :-       =:     +##%%#=             ",
-    "              =##++##:  .      -     :######+             ",
-    "          +@@@@#++*=     :+####=  :==*#####*:             ",
-    "          @@@@@@        .#####*### ...+++++=..            ",
-    "           %@@=:..:=+-..++++##*##%+  .::......            ",
-    "             .......:++--##****###   .........            ",
-    "             ........=:  #***+*#*-     .   ..             ",
-    "              ......---:-    -=:   =- :**++++             ",
-    "              .......      =*=.:+***-.=+=-::::.           ",
-    "             .........     +--===****===    ..-           ",
-    "            .....  .::      --=++**+==**:....--           ",
-    "             ..:=====::.    -=*++****. .=+.++%@#          ",
-    "              .=====**=++ .  :-***=-       *@@@@@         ",
-    "               =***+**                  +++*%%%%*         ",
-    "               =@@@%%+      -      .  +*: .##.            ",
-    "                 #@#*:     =+       =:      -:            ",
-    "                     .:  :*#+      -=+:                   ",
-    "                     ::..-***#*+=   +**=                  ",
-    "                    .:....=***#.                          ",
-    "                     .:.:=***#+                           ",
-    "                       -#####=                            ",
+    r#"                    +####+.            "#,
+    r#"                  =##***=:..::         "#,
+    r#"                  +#****::..::.        "#,
+    r#"          -=-     ##*****=..:          "#,
+    r#"         :+***: :   +####*+#=          "#,
+    r#"      -=-  -++       +#     ++=+:      "#,
+    r#"    =+==--: :-       =:     +##%%#=    "#,
+    r#"    =##++##:  .      -     :######+    "#,
+    r#"+@@@@#++*=     :+####=  :==*#####*:    "#,
+    r#"@@@@@@        .#####*### ...+++++=..   "#,
+    r#" %@@=:..:=+-..++++##*##%+  .::......   "#,
+    r#"   .......:++--##****###   .........   "#,
+    r#"   ........=:  #***+*#*-     .   ..    "#,
+    r#"    ......---:-    -=:   =- :**++++    "#,
+    r#"    .......      =*=.:+***-.=+=-::::.  "#,
+    r#"   .........     +--===****===    ..-  "#,
+    r#"  .....  .::      --=++**+==**:....--  "#,
+    r#"   ..:=====::.    -=*++****. .=+.++%@# "#,
+    r#"    .=====**=++ .  :-***=-       *@@@@@"#,
+    r#"     =***+**                  +++*%%%%*"#,
+    r#"     =@@@%%+      -      .  +*: .##.   "#,
+    r#"       #@#*:     =+       =:      -:   "#,
+    r#"           .:  :*#+      -=+:          "#,
+    r#"           ::..-***#*+=   +**=         "#,
+    r#"          .:....=***#.                 "#,
+    r#"           .:.:=***#+                  "#,
+    r#"             -#####=                   "#,
 ];
+
+pub fn render_synapse_ascii_line(line: &str, indent: usize, theme: &AppTheme) -> Line<'static> {
+    let mut spans = Vec::new();
+    if indent > 0 {
+        spans.push(Span::raw(" ".repeat(indent)));
+    }
+    let mut curr_str = String::new();
+    let mut curr_style = Style::default();
+
+    for ch in line.chars() {
+        let st = theme.ascii_char_style(ch);
+
+        if st == curr_style {
+            curr_str.push(ch);
+        } else {
+            if !curr_str.is_empty() {
+                spans.push(Span::styled(curr_str.clone(), curr_style));
+                curr_str.clear();
+            }
+            curr_style = st;
+            curr_str.push(ch);
+        }
+    }
+    if !curr_str.is_empty() {
+        spans.push(Span::styled(curr_str, curr_style));
+    }
+    Line::from(spans)
+}
 
 pub struct TuiApp {
     pub models_dir: PathBuf,
@@ -158,6 +187,7 @@ pub struct TuiApp {
     pub active_model_quant: String,
     pub active_model_size: String,
     pub active_model_source: String,
+    pub active_tier: EngineTier,
     pub tier1_endpoint: String,
     pub graph: Arc<Dendrite>,
     pub store: Option<Arc<DendriteStore>>,
@@ -235,12 +265,14 @@ impl TuiApp {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let hw_info = probe_hardware_info();
+        let initial_tier = route_model(&models_dir.join(&active_model_name), false).tier;
         Self {
             models_dir,
             active_model_name,
             active_model_quant: "Q4_K_M".into(),
             active_model_size: "398 MB".into(),
             active_model_source: "Local File".into(),
+            active_tier: initial_tier,
             tier1_endpoint,
             graph,
             store,
@@ -253,7 +285,7 @@ impl TuiApp {
                 thinking: None,
             }],
             modal: ActiveModal::None,
-            theme: AppTheme::AmberCRT,
+            theme: crate::theme::load_theme(),
             is_generating: false,
             last_tok_per_sec: 4.8,
             last_latency_sec: 0.0,
@@ -296,6 +328,12 @@ impl TuiApp {
         }
     }
 
+    /// Re-evaluates active engine tier based on current model size and host RAM.
+    pub fn recompute_tier(&mut self) {
+        let model_path = self.models_dir.join(&self.active_model_name);
+        self.active_tier = route_model(&model_path, false).tier;
+    }
+
     /// Auto-detect available models on disk and Leafcutter engine, setting a valid active model.
     pub async fn auto_detect_model(&mut self) {
         let scanned = self.scan_all_models().await;
@@ -303,6 +341,7 @@ impl TuiApp {
             if self.active_model_name.is_empty() || self.active_model_name == "ministral-3:3b" {
                 self.active_model_name = "(No model loaded — use /pull)".into();
             }
+            self.recompute_tier();
             return;
         }
 
@@ -314,6 +353,7 @@ impl TuiApp {
                 self.active_model_quant = local.quant.clone();
                 self.active_model_size = local.size_str.clone();
                 self.active_model_source = local.source.clone();
+                self.recompute_tier();
                 return;
             }
         }
@@ -329,6 +369,7 @@ impl TuiApp {
             self.active_model_size = first.size_str.clone();
             self.active_model_source = first.source.clone();
         }
+        self.recompute_tier();
     }
 
     pub fn scroll_up(&mut self, delta: u16) {
@@ -355,7 +396,8 @@ impl TuiApp {
         if self.input_cursor == 0 || self.input.is_empty() {
             return;
         }
-        let text_before = &self.input[..self.input_cursor];
+        let safe_cursor = self.input.char_indices().map(|(i, _)| i).chain(std::iter::once(self.input.len())).filter(|&i| i <= self.input_cursor).last().unwrap_or(0);
+        let text_before = &self.input[..safe_cursor];
         let mut chars: Vec<(usize, char)> = text_before.char_indices().collect();
         if chars.is_empty() {
             return;
@@ -384,25 +426,96 @@ impl TuiApp {
         self.input_cursor = target_idx;
     }
 
+    pub fn preload_active_model(&self) {
+        let endpoint = self.tier1_endpoint.clone();
+        let model_name = self.active_model_name.clone();
+        tokio::spawn(async move {
+            let _ = cynapse_engine::preload_model(&endpoint, &model_name).await;
+        });
+    }
+
     fn execute_tool_and_format(&mut self, call: &cynapse_core::offline_agent::ToolCall) -> (String, bool) {
-        let name = &call.name;
+        let name = call.name.as_str();
         let args = &call.arguments;
 
-        let arg1 = args.get("path")
-            .or_else(|| args.get("query"))
-            .or_else(|| args.get("command"))
-            .or_else(|| args.get("arg1"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let (arg1, arg2): (String, Option<String>) = match name {
+            "write_file" => {
+                let path = args.get("path")
+                    .or_else(|| args.get("file"))
+                    .or_else(|| args.get("filename"))
+                    .or_else(|| args.get("filepath"))
+                    .or_else(|| args.get("arg1"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content = args.get("content")
+                    .or_else(|| args.get("text"))
+                    .or_else(|| args.get("body"))
+                    .or_else(|| args.get("data"))
+                    .or_else(|| args.get("arg2"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (path.to_string(), content)
+            }
+            "read_file" => {
+                let path = args.get("path")
+                    .or_else(|| args.get("file"))
+                    .or_else(|| args.get("filename"))
+                    .or_else(|| args.get("filepath"))
+                    .or_else(|| args.get("arg1"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (path.to_string(), None)
+            }
+            "grep" => {
+                let pattern = args.get("pattern")
+                    .or_else(|| args.get("query"))
+                    .or_else(|| args.get("regex"))
+                    .or_else(|| args.get("arg1"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let dir = args.get("dir")
+                    .or_else(|| args.get("path"))
+                    .or_else(|| args.get("directory"))
+                    .or_else(|| args.get("arg2"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (pattern.to_string(), dir)
+            }
+            "execute_command" => {
+                let cmd = args.get("command")
+                    .or_else(|| args.get("cmd"))
+                    .or_else(|| args.get("script"))
+                    .or_else(|| args.get("arg1"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (cmd.to_string(), None)
+            }
+            _ => {
+                let a1 = args.get("path")
+                    .or_else(|| args.get("query"))
+                    .or_else(|| args.get("command"))
+                    .or_else(|| args.get("arg1"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let a2 = args.get("content")
+                    .or_else(|| args.get("dir"))
+                    .or_else(|| args.get("arg2"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (a1.to_string(), a2)
+            }
+        };
 
-        let arg2 = args.get("content")
-            .or_else(|| args.get("dir"))
-            .or_else(|| args.get("arg2"))
-            .and_then(|v| v.as_str());
-
-        match cynapse_core::execute_tool(name, arg1, arg2) {
-            Ok(output) => (output, true),
-            Err(e) => (format!("Tool execution error: {}", e), false),
+        match cynapse_core::execute_tool(name, &arg1, arg2.as_deref()) {
+            Ok(output) => {
+                let compressed = cynapse_core::compressor::compress_tool_result(&output, false, None);
+                (compressed.summary, true)
+            }
+            Err(e) => {
+                let err_str = format!("Tool execution error: {}", e);
+                let compressed = cynapse_core::compressor::compress_tool_result(&err_str, true, None);
+                (compressed.summary, false)
+            }
         }
     }
 
@@ -412,6 +525,7 @@ impl TuiApp {
         self.session_id = data.session_id;
         self.session_created_at = data.created_at;
         self.active_model_name = data.model_name;
+        self.recompute_tier();
         self.messages = data
             .messages
             .into_iter()
@@ -451,6 +565,7 @@ impl TuiApp {
 
     pub async fn run(&mut self) -> Result<()> {
         self.auto_detect_model().await;
+        self.preload_active_model();
 
         let _guard = TuiRuntimeGuard::enter()?;
         let mut stdout = io::stdout();
@@ -559,6 +674,7 @@ impl TuiApp {
                         self.active_model_size = found.size_str.clone();
                         self.active_model_source = found.source.clone();
                     }
+                    self.recompute_tier();
                     self.messages.push(ChatMessage {
                         role: "system".into(),
                         content: format!("✓ Download Complete: Saved and activated model '{}'", st.model_name),
@@ -574,7 +690,7 @@ impl TuiApp {
     async fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
             self.anim_tick += 1;
-            if self.anim_tick % 30 == 0 {
+            if self.anim_tick % 150 == 0 {
                 self.hw_info = probe_hardware_info();
             }
             if self.modal == ActiveModal::MemoryGraph && self.galaxy_auto_spin {
@@ -667,21 +783,25 @@ impl TuiApp {
                                             self.puller_step = PullerStep::CuratedList;
                                         }
                                         KeyCode::Left => {
-                                            self.custom_pull_cursor = self.custom_pull_cursor.saturating_sub(1);
+                                            if let Some((idx, _)) = self.custom_pull_url[..self.custom_pull_cursor].char_indices().last() {
+                                                self.custom_pull_cursor = idx;
+                                            } else {
+                                                self.custom_pull_cursor = 0;
+                                            }
                                         }
                                         KeyCode::Right => {
-                                            if self.custom_pull_cursor < self.custom_pull_url.len() {
-                                                self.custom_pull_cursor += 1;
+                                            if let Some(ch) = self.custom_pull_url[self.custom_pull_cursor..].chars().next() {
+                                                self.custom_pull_cursor += ch.len_utf8();
                                             }
                                         }
                                         KeyCode::Char(c) => {
                                             self.custom_pull_url.insert(self.custom_pull_cursor, c);
-                                            self.custom_pull_cursor += 1;
+                                            self.custom_pull_cursor += c.len_utf8();
                                         }
                                         KeyCode::Backspace => {
-                                            if self.custom_pull_cursor > 0 {
-                                                self.custom_pull_url.remove(self.custom_pull_cursor - 1);
-                                                self.custom_pull_cursor -= 1;
+                                            if let Some((idx, _)) = self.custom_pull_url[..self.custom_pull_cursor].char_indices().last() {
+                                                self.custom_pull_url.drain(idx..self.custom_pull_cursor);
+                                                self.custom_pull_cursor = idx;
                                             }
                                         }
                                         KeyCode::Enter => {
@@ -889,6 +1009,8 @@ impl TuiApp {
                                             self.active_model_quant = scanned[idx].quant.clone();
                                             self.active_model_size = scanned[idx].size_str.clone();
                                             self.active_model_source = scanned[idx].source.clone();
+                                            self.recompute_tier();
+                                            self.preload_active_model();
                                             self.messages.push(ChatMessage {
                                                 role: "system".into(),
                                                 content: format!("Switched active model to: {}", self.active_model_name),
@@ -1001,10 +1123,7 @@ impl TuiApp {
                         // General Input Field & Viewport Navigation Handling
                         match key.code {
                             KeyCode::Tab => {
-                                if !self.input.starts_with('/') {
-                                    self.selected_memory_idx = 0;
-                                    self.modal = ActiveModal::MemoryDrawer;
-                                }
+                                // Typing '/' opens command palette; Tab does not hijack chat focus
                             }
                             KeyCode::Esc => {
                                 self.input.clear();
@@ -1012,12 +1131,10 @@ impl TuiApp {
                                 self.modal = ActiveModal::None;
                             }
                             KeyCode::Left => {
-                                self.input_cursor = self.input_cursor.saturating_sub(1);
+                                self.input_cursor = self.input.char_indices().map(|(i, _)| i).filter(|&i| i < self.input_cursor).last().unwrap_or(0);
                             }
                             KeyCode::Right => {
-                                if self.input_cursor < self.input.len() {
-                                    self.input_cursor += 1;
-                                }
+                                self.input_cursor = self.input.char_indices().map(|(i, _)| i).find(|&i| i > self.input_cursor).unwrap_or(self.input.len());
                             }
                             KeyCode::Home => {
                                 self.input_cursor = 0;
@@ -1026,20 +1143,26 @@ impl TuiApp {
                                 self.input_cursor = self.input.len();
                             }
                             KeyCode::Char(c) => {
-                                self.input.insert(self.input_cursor, c);
-                                self.input_cursor += 1;
+                                let safe_cursor = self.input.char_indices().map(|(i, _)| i).chain(std::iter::once(self.input.len())).filter(|&i| i <= self.input_cursor).last().unwrap_or(0);
+                                self.input.insert(safe_cursor, c);
+                                self.input_cursor = safe_cursor + c.len_utf8();
                                 self.autocomplete_idx = 0;
                             }
                             KeyCode::Backspace => {
                                 if self.input_cursor > 0 {
-                                    self.input.remove(self.input_cursor - 1);
-                                    self.input_cursor -= 1;
+                                    if let Some(prev_idx) = self.input.char_indices().map(|(i, _)| i).filter(|&i| i < self.input_cursor).last() {
+                                        self.input.remove(prev_idx);
+                                        self.input_cursor = prev_idx;
+                                    }
                                 }
                                 self.autocomplete_idx = 0;
                             }
                             KeyCode::Delete => {
                                 if self.input_cursor < self.input.len() {
-                                    self.input.remove(self.input_cursor);
+                                    if let Some(target_idx) = self.input.char_indices().map(|(i, _)| i).find(|&i| i >= self.input_cursor) {
+                                        self.input.remove(target_idx);
+                                        self.input_cursor = target_idx;
+                                    }
                                 }
                                 self.autocomplete_idx = 0;
                             }
@@ -1056,6 +1179,9 @@ impl TuiApp {
                                 self.scroll_down(1);
                             }
                             KeyCode::Enter => {
+                                if self.is_generating {
+                                    continue;
+                                }
                                 let trimmed = self.input.trim().to_string();
                                 if trimmed.is_empty() {
                                     continue;
@@ -1083,6 +1209,7 @@ impl TuiApp {
 
                                 if trimmed == "/theme" {
                                     self.theme = self.theme.next();
+                                    crate::theme::save_theme(self.theme);
                                     self.messages.push(ChatMessage {
                                         role: "system".into(),
                                         content: format!("Switched visual theme to: {}", self.theme.name()),
@@ -1156,7 +1283,7 @@ impl TuiApp {
                                     continue;
                                 }
 
-                                if trimmed == "/memory" || trimmed == "/dendrite" || trimmed == "/graph" || trimmed == "/mem" {
+                                if trimmed == "/galaxy" || trimmed == "/memory" || trimmed == "/dendrite" || trimmed == "/graph" || trimmed == "/mem" {
                                     self.modal = ActiveModal::MemoryGraph;
                                     continue;
                                 }
@@ -1171,9 +1298,11 @@ impl TuiApp {
                                     let arg = trimmed.split_whitespace().nth(1).unwrap_or("");
                                     if !arg.is_empty() {
                                         self.active_model_name = arg.to_string();
+                                        self.recompute_tier();
+                                        self.preload_active_model();
                                         self.messages.push(ChatMessage {
                                             role: "system".into(),
-                                            content: format!("Active model updated to: {}", self.active_model_name),
+                                            content: format!("Active model updated to: {} [{}]", self.active_model_name, self.active_tier.label()),
                                             thinking: None,
                                         });
                                     }
@@ -1240,31 +1369,35 @@ impl TuiApp {
                                 self.current_response_buf.clear();
                                 self.auto_scroll = true; // Lock scroll to bottom for incoming response
 
-                                // Build System Prompt with Persona & Relevance-Gated Dendrite Memory Injection
+                                // Build Two-Zone Prompt: Zone A (Invariant Prefix) & Zone B (Variable Tail)
+                                let is_conversational = cynapse_memory::context::is_conversational_query(&trimmed);
                                 let persona_prompt = self.persona_mgr.build_system_prompt();
-                                let has_persona = !persona_prompt.trim().is_empty();
-
-                                // When persona is active, skip duplicate system preset headers and core identity nodes
-                                let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&trimmed, 4000, has_persona, has_persona);
-
-                                let system_prompt = if memory_prompt.trim().is_empty() {
-                                    persona_prompt
-                                } else if has_persona {
-                                    format!("{}\n\n{}", persona_prompt, memory_prompt)
+                                // Dendrite is disconnected for testing: pure harness/engine isolation
+                                let memory_prompt = String::new();
+                                let system_prompt = if is_conversational {
+                                    cynapse_core::offline_agent::compile_conversational_prefix(&persona_prompt)
                                 } else {
-                                    memory_prompt
+                                    cynapse_core::offline_agent::compile_zone_a_prefix(&persona_prompt)
                                 };
+
+                                let history_context: String = self.messages.iter().rev().skip(1).take(6).collect::<Vec<_>>().into_iter().rev()
+                                    .map(|m| format!("{}: {}", m.role.to_uppercase(), m.content))
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+
+                                let prompt = cynapse_core::offline_agent::compile_zone_b_tail(&memory_prompt, &history_context, &trimmed);
 
                                 // Spawn Non-blocking Async LLM Task
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 self.stream_rx = Some(rx);
 
+                                let tier = self.active_tier;
                                 let endpoint = self.tier1_endpoint.clone();
                                 let model_name = self.active_model_name.clone();
-                                let prompt = trimmed.clone();
 
                                 tokio::spawn(async move {
-                                    let res = query_tier1_stream(
+                                    let res = query_model_stream(
+                                        tier,
                                         &endpoint,
                                         &model_name,
                                         &prompt,
@@ -1345,8 +1478,11 @@ impl TuiApp {
                     let mut triggered_reprompt = false;
                     const MAX_AGENT_STEPS: usize = 5;
 
-                    // Offline Agent: GBNF tool call check & circular LoopGuard intervention
-                    if let Ok(tool_call) = validate_gbnf_tool_call(&self.current_response_buf) {
+                    // Offline Agent: GBNF tool call check (response buffer fallback to thinking buffer) & circular LoopGuard intervention
+                    let detected_tool = validate_gbnf_tool_call(&self.current_response_buf)
+                        .or_else(|_| validate_gbnf_tool_call(&self.current_thinking_buf));
+
+                    if let Ok(tool_call) = detected_tool {
                         if self.agent_step_count >= MAX_AGENT_STEPS {
                             self.messages.push(ChatMessage {
                                 role: "system".into(),
@@ -1359,6 +1495,20 @@ impl TuiApp {
                                 Ok(()) => {
                                     self.agent_step_count += 1;
                                     let (tool_output, ok) = self.execute_tool_and_format(&tool_call);
+                                    let assistant_content = if self.current_response_buf.trim().is_empty() {
+                                        format!("Executing tool `{}`", tool_call.name)
+                                    } else {
+                                        self.current_response_buf.clone()
+                                    };
+                                    self.messages.push(ChatMessage {
+                                        role: "assistant".into(),
+                                        content: assistant_content,
+                                        thinking: if self.current_thinking_buf.is_empty() {
+                                            None
+                                        } else {
+                                            Some(self.current_thinking_buf.clone())
+                                        },
+                                    });
                                     self.messages.push(ChatMessage {
                                         role: "system".into(),
                                         content: format!("🔧 Tool Call [{}] Executed (Step {}/{}):\n{}", tool_call.name, self.agent_step_count, MAX_AGENT_STEPS, tool_output),
@@ -1376,19 +1526,24 @@ impl TuiApp {
 
                                         let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
                                         let persona_prompt = self.persona_mgr.build_system_prompt();
-                                        let has_persona = !persona_prompt.trim().is_empty();
-                                        let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&tool_output, 4000, has_persona, has_persona);
-                                        let system_prompt = format!("{}\n\n=== DENDRITE CONTEXT ===\n{}", persona_prompt, memory_prompt);
+                                        // Dendrite disconnected for testing
+                                        let memory_prompt = String::new();
+                                        let system_prompt = cynapse_core::offline_agent::compile_zone_a_prefix(&persona_prompt);
                                         let endpoint = self.tier1_endpoint.clone();
                                         let model_name = self.active_model_name.clone();
-                                        let prompt = if user_msg.is_empty() {
-                                            format!("Tool Result for {}:\n{}\n\nContinue resolution.", tool_call.name, tool_output)
-                                        } else {
-                                            format!("User Request: {}\n\nTool Result for {}:\n{}\n\nContinue resolution.", user_msg, tool_call.name, tool_output)
-                                        };
 
+                                        let history_context: String = self.messages.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev()
+                                            .map(|m| format!("{}: {}", m.role.to_uppercase(), m.content))
+                                            .collect::<Vec<_>>()
+                                            .join("\n\n");
+
+                                        let tool_instruction = format!("Tool Result for `{}`:\n{}\n\nContinue resolution of user request: {}", tool_call.name, tool_output, user_msg);
+                                        let prompt = cynapse_core::offline_agent::compile_zone_b_tail(&memory_prompt, &history_context, &tool_instruction);
+
+                                        let tier = self.active_tier;
                                         tokio::spawn(async move {
-                                            let res = query_tier1_stream(
+                                            let res = query_model_stream(
+                                                tier,
                                                 &endpoint,
                                                 &model_name,
                                                 &prompt,
@@ -1442,30 +1597,16 @@ impl TuiApp {
                         if !user_msg.is_empty() {
                             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                             let turn_id = format!("turn_{}", now);
-                            let excerpt = if user_msg.len() > 25 { format!("{}...", &user_msg[..25]) } else { user_msg.clone() };
+                            let excerpt = user_msg.chars().take(25).collect::<String>();
                             let title = format!("Turn: {}", excerpt);
                             let content = format!("User: {}\n\nAssistant: {}", user_msg, self.current_response_buf);
 
-                            let node = self.graph.upsert(&turn_id, &title, &content, NodeType::TurnLog, Some(vec!["#conversation".into(), "#turn".into()]));
-                            if let Some(ref st) = self.store {
-                                let _ = st.save(&node);
-                            }
-
-                            // Automatic Atomic Fact & Topic Extraction
-                            let lower_msg = user_msg.to_lowercase();
-                            if lower_msg.contains("favourite") || lower_msg.contains("favorite") || lower_msg.contains("love") || lower_msg.contains("like") || lower_msg.contains("remember") || lower_msg.contains("is ") {
-                                let fact_id = format!("fact_{}", now);
-                                let fact_title = format!("User Fact: {}", excerpt);
-                                let fact_content = format!("User preference / fact: {}", user_msg);
-
-                                let fact_node = self.graph.upsert(&fact_id, &fact_title, &fact_content, NodeType::AtomicFact, Some(vec!["#preference".into(), "#user_fact".into(), "#memory".into()]));
-                                if let Some(ref st) = self.store {
-                                    let _ = st.save(&fact_node);
-                                }
-                            }
+                            // Dendrite is disconnected for testing: skip graph upserts and store writes
+                            let _ = (turn_id, excerpt, title, content);
                         }
 
                         self.is_generating = false;
+                        finished = true;
                     }
                 }
                 StreamEvent::Error(err) => {
@@ -1613,7 +1754,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             ]));
         } else if trimmed.starts_with("> ") {
             lines.push(Line::from(vec![
-                Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled("    │ ", theme.dim_text()),
                 Span::styled(trimmed[2..].to_string(), Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
             ]));
         } else {
@@ -1643,101 +1784,245 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             ])
             .split(f.area());
 
-        // 1. Top Header Bar (Clean rounded block with BorderType::Rounded)
-        let header_text = vec![Line::from(vec![
-            Span::styled("CYNAPSE TUI", t.header_title()),
-        ])];
+        // If 3D Galaxy Atlas view is active, render it across the full middle canvas (no overlapping modal borders)
+        if self.modal == ActiveModal::MemoryGraph {
+            self.render_3d_galaxy_atlas(f, main_chunks[1]);
 
-        let header = Paragraph::new(header_text)
+            // Bottom Prompt Input Bar
+            let input_text = vec![Line::from(vec![
+                Span::styled("・> ", t.prompt_prefix()),
+                Span::raw(&self.input),
+            ])];
+            let input_bar = Paragraph::new(input_text)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title("").border_style(t.prompt_prefix()));
+            f.render_widget(input_bar, main_chunks[2]);
+            return;
+        }
+
+        // 1. Top Header Bar (Jcode-style Pill Navigation & Status)
+        let (_nodes, _edges) = self.graph.topology();
+        let screen_w = f.area().width;
+        let header_spans = if screen_w < 90 {
+            // Compact Header for small terminals
+            vec![
+                Span::styled(" ◖", Style::default().fg(Color::Cyan)),
+                Span::styled("CYNAPSE", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("◗ ", Style::default().fg(Color::Cyan)),
+                Span::styled("v0.1.0", t.dim_text()),
+                Span::styled(" │ ", t.dim_text()),
+                Span::styled(&self.active_model_name, t.active_model()),
+                Span::styled(" │ ", t.dim_text()),
+                Span::styled(format!("{:.1}G", self.hw_info.ram_used_mb as f64 / 1024.0), Style::default().fg(Color::Green)),
+                Span::styled(" │ ", t.dim_text()),
+                Span::styled(format!("[{}]", t.name()), t.dim_text()),
+            ]
+        } else {
+            // Full Header for standard/wide terminals
+            vec![
+                Span::styled(" ◖", Style::default().fg(Color::Cyan)),
+                Span::styled("CYNAPSE", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("◗ ", Style::default().fg(Color::Cyan)),
+                Span::styled("v0.1.0", t.dim_text()),
+                Span::styled("  │  ", t.dim_text()),
+                Span::styled("Model: ", t.dim_text()),
+                Span::styled(&self.active_model_name, t.active_model()),
+                Span::styled(format!(" ({})", self.active_model_quant), Style::default().fg(Color::Green)),
+                Span::styled("  │  ", t.dim_text()),
+                Span::styled("Engine: ", t.dim_text()),
+                Span::styled(
+                    if self.is_generating {
+                        "● Running"
+                    } else {
+                        match self.active_tier {
+                            EngineTier::Tier1Fast => "○ Tier 1 Fast",
+                            EngineTier::Tier2LargeGguf => "○ Tier 2 Stream",
+                            EngineTier::Tier3LargeSafetensor => "○ Tier 3 Stream",
+                        }
+                    },
+                    if self.is_generating {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        match self.active_tier {
+                            EngineTier::Tier1Fast => Style::default().fg(Color::Green),
+                            EngineTier::Tier2LargeGguf => Style::default().fg(Color::Cyan),
+                            EngineTier::Tier3LargeSafetensor => Style::default().fg(Color::Magenta),
+                        }
+                    },
+                ),
+                Span::styled("  │  ", t.dim_text()),
+                Span::styled("Dendrite: ", t.dim_text()),
+                Span::styled("Disconnected (Test)", Style::default().fg(Color::Yellow)),
+                Span::styled("  │  ", t.dim_text()),
+                Span::styled(format!("[{}]", t.name()), t.dim_text()),
+            ]
+        };
+
+        let header = Paragraph::new(vec![Line::from(header_spans)])
             .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title("").border_style(t.active_border_style()));
         f.render_widget(header, main_chunks[0]);
 
-        // 2. Middle Content Area: COLIBRI STYLE REARRANGEMENT
-        // Split horizontally: [LEFT SIDEBAR (26%), RIGHT CHAT VIEWPORT (74%)]
-        let middle_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(26),
-                Constraint::Percentage(74),
-            ])
-            .split(main_chunks[1]);
-
-        let sidebar_area = middle_chunks[0];
-        let viewport_area = middle_chunks[1];
-
-        // 2A. LEFT SIDEBAR PANEL (Clean System Telemetry & Model Stats with Rounded Borders)
-        let (nodes, edges) = self.graph.topology();
-
-        // Calculate RAM usage bar
-        let used_gb = self.hw_info.ram_used_mb as f64 / 1024.0;
-        let total_gb = self.hw_info.ram_total_mb as f64 / 1024.0;
-        let pct = self.hw_info.ram_used_pct.min(100.0).max(0.0);
-        let filled_blocks = ((pct / 100.0) * 8.0) as usize;
-        let ram_bar_str = format!("[{}{}] {:.0}%", "█".repeat(filled_blocks), "░".repeat(8 - filled_blocks), pct);
-
-        let cpu_short = if self.hw_info.cpu_brand.len() > 22 {
-            format!("{}...", &self.hw_info.cpu_brand[..20])
+        // 2. Middle Content Area: Responsive Layout (learn from jcode)
+        // On narrow terminals (< 90 cols), collapse sidebar to give full width to conversation viewport.
+        // On standard terminals (>= 90 cols), use fixed 28-column sidebar.
+        let (sidebar_area, viewport_area) = if screen_w < 90 {
+            (Rect::default(), main_chunks[1])
         } else {
-            self.hw_info.cpu_brand.clone()
+            let middle_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(28),
+                    Constraint::Min(40),
+                ])
+                .split(main_chunks[1]);
+            (middle_chunks[0], middle_chunks[1])
         };
 
-        let label_style = Style::default().fg(Color::Rgb(160, 160, 160));
-        let sidebar_lines = vec![
-            Line::from(Span::styled("CYNAPSE CORE", t.header_title())),
-            Line::from(""),
-            Line::from(Span::styled("HARDWARE TELEMETRY", t.header_title())),
-            Line::from(vec![Span::styled(" CPU: ", label_style), Span::styled(format!("{} ({}c)", cpu_short, self.hw_info.cpu_cores), Style::default().fg(Color::White))]),
-            Line::from(vec![Span::styled(" RAM: ", label_style), Span::raw(format!("{:.1}/{:.1} GB", used_gb, total_gb))]),
-            Line::from(vec![Span::styled(" Bar: ", label_style), Span::styled(ram_bar_str, Style::default().fg(Color::Cyan))]),
-            Line::from(vec![Span::styled(" GPU: ", label_style), Span::styled(&self.hw_info.gpu_info, Style::default().fg(Color::Green))]),
-            Line::from(""),
-            Line::from(Span::styled("MODEL DETAILS", t.header_title())),
-            Line::from(vec![Span::styled(" Name: ", label_style), Span::styled(&self.active_model_name, t.active_model())]),
-            Line::from(vec![Span::styled(" Quant: ", label_style), Span::styled(&self.active_model_quant, Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Size:  ", label_style), Span::styled(&self.active_model_size, Style::default().fg(Color::Magenta))]),
-            Line::from(vec![Span::styled(" Src:   ", label_style), Span::raw(&self.active_model_source)]),
-            Line::from(""),
-            Line::from(Span::styled("ENGINE TIER", t.header_title())),
-            Line::from(vec![Span::styled(" Tier:  ", label_style), Span::styled("Tier 1 Fast", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Speed: ", label_style), Span::raw(format!("{:.1} tok/s", self.last_tok_per_sec))]),
-            Line::from(vec![Span::styled(" Lat:   ", label_style), Span::raw(format!("{:.2} s", self.last_latency_sec))]),
-            Line::from(""),
-            Line::from(Span::styled("EXECUTION PIPELINE", t.header_title())),
-            Line::from(vec![Span::styled(" FTS5:  ", label_style), Span::styled("✓ Active", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Ranker:", label_style), Span::styled("✓ BM25 + Spec", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" GBNF:  ", label_style), Span::styled("✓ Schema Check", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" RAG:   ", label_style), Span::styled("✓ 4k Budget", Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled(" Engine:", label_style), Span::styled(if self.is_generating { "• Running..." } else { "✓ Idle" }, if self.is_generating { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Green) })]),
-            Line::from(""),
-            Line::from(Span::styled("VISUAL THEME", t.header_title())),
-            Line::from(vec![Span::styled(" Theme: ", label_style), Span::styled(t.name(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
-            Line::from(""),
-            Line::from(Span::styled("DENDRITE MEMORY", t.header_title())),
-            Line::from(vec![Span::styled(" Nodes: ", label_style), Span::styled(nodes.len().to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
-            Line::from(vec![Span::styled(" Links: ", label_style), Span::styled(edges.len().to_string(), Style::default().fg(Color::Cyan))]),
-            Line::from(vec![Span::styled(" DB:    ", label_style), Span::raw("FTS5 + Spec Ranker")]),
-        ];
+        // 2A. LEFT SIDEBAR PANEL (Only rendered on terminals >= 90 cols)
+        if sidebar_area.width >= 24 {
+            let used_gb = self.hw_info.ram_used_mb as f64 / 1024.0;
+            let total_gb = self.hw_info.ram_total_mb as f64 / 1024.0;
+            let pct = self.hw_info.ram_used_pct.min(100.0).max(0.0);
+            let filled_blocks = ((pct / 100.0) * 8.0) as usize;
+            let ram_bar_str = format!("[{}{}] {:.0}%", "█".repeat(filled_blocks), "░".repeat(8 - filled_blocks), pct);
 
-        let sidebar = Paragraph::new(sidebar_lines)
-            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Sidebar ").border_style(t.border_style()));
-        f.render_widget(sidebar, sidebar_area);
+            let cpu_short = if self.hw_info.cpu_brand.len() > 14 {
+                format!("{}...", &self.hw_info.cpu_brand[..12])
+            } else {
+                self.hw_info.cpu_brand.clone()
+            };
 
-        // 2B. RIGHT CHAT HISTORY VIEWPORT (Jcode-style Background ASCII Art & Paragraph Text Wrap)
+            let label_style = t.dim_text();
+            let value_style = Style::default().fg(Color::White);
+            let section_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+            let sidebar_lines = vec![
+                Line::from(vec![
+                    Span::styled("◖ ", Style::default().fg(Color::Cyan)),
+                    Span::styled("TELEMETRY", section_style),
+                    Span::styled(" ◗", Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![Span::styled(" CPU : ", label_style), Span::styled(format!("{}c", self.hw_info.cpu_cores), value_style), Span::styled(format!(" {}", cpu_short), t.dim_text())]),
+                Line::from(vec![Span::styled(" RAM : ", label_style), Span::styled(format!("{:.1}/{:.1}G", used_gb, total_gb), value_style)]),
+                Line::from(vec![Span::styled(" Bar : ", label_style), Span::styled(format!("{}", ram_bar_str), Style::default().fg(Color::Cyan))]),
+                Line::from(vec![Span::styled(" GPU : ", label_style), Span::styled(&self.hw_info.gpu_info, Style::default().fg(Color::Green))]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("◖ ", Style::default().fg(Color::Yellow)),
+                    Span::styled("ACTIVE MODEL", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ◗", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![Span::styled(" Name: ", label_style), Span::styled(if self.active_model_name.len() > 18 { format!("{}...", &self.active_model_name[..16]) } else { self.active_model_name.clone() }, t.active_model())]),
+                Line::from(vec![Span::styled(" Spec: ", label_style), Span::styled(&self.active_model_quant, Style::default().fg(Color::Green)), Span::styled(" │ ", t.dim_text()), Span::styled(&self.active_model_size, Style::default().fg(Color::LightMagenta))]),
+                Line::from(vec![
+                    Span::styled(" Tier: ", label_style),
+                    Span::styled(
+                        self.active_tier.label(),
+                        match self.active_tier {
+                            EngineTier::Tier1Fast => Style::default().fg(Color::Green),
+                            EngineTier::Tier2LargeGguf => Style::default().fg(Color::Cyan),
+                            EngineTier::Tier3LargeSafetensor => Style::default().fg(Color::Magenta),
+                        },
+                    ),
+                    Span::styled(format!(" {:.0}t/s", self.last_tok_per_sec), t.dim_text()),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("◖ ", Style::default().fg(Color::Magenta)),
+                    Span::styled("DENDRITE MEMORY", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ◗", Style::default().fg(Color::Magenta)),
+                ]),
+                Line::from(vec![Span::styled(" State: ", label_style), Span::styled("Disconnected", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
+                Line::from(vec![Span::styled(" Mode : ", label_style), Span::styled("Isolated Test", Style::default().fg(Color::Cyan))]),
+                Line::from(vec![Span::styled(" Cmd  : ", label_style), Span::styled("/dendrite for atlas", t.dim_text())]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("◖ ", Style::default().fg(Color::Rgb(100, 180, 255))),
+                    Span::styled("COMMANDS", Style::default().fg(Color::Rgb(100, 180, 255)).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ◗", Style::default().fg(Color::Rgb(100, 180, 255))),
+                ]),
+                Line::from(vec![Span::styled(" /help    ", Style::default().fg(Color::Cyan)), Span::styled("Palette", value_style)]),
+                Line::from(vec![Span::styled(" /dendrite", Style::default().fg(Color::Yellow)), Span::styled("3D Atlas", value_style)]),
+                Line::from(vec![Span::styled(" /model   ", Style::default().fg(Color::Green)), Span::styled("Switch Model", value_style)]),
+                Line::from(vec![Span::styled(" /theme   ", Style::default().fg(Color::Magenta)), Span::styled("Theme Switch", value_style)]),
+                Line::from(vec![Span::styled(" /doctor  ", Style::default().fg(Color::LightBlue)), Span::styled("Diagnostics", value_style)]),
+                Line::from(vec![Span::styled(" Type '/' for all", t.dim_text())]),
+            ];
+
+            let sidebar = Paragraph::new(sidebar_lines)
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Sidebar ").border_style(t.border_style()));
+            f.render_widget(sidebar, sidebar_area);
+        }
+
+        // 2B. RIGHT CHAT HISTORY VIEWPORT (Jcode-style Synapse Neural Logo & Transcript)
         let mut chat_lines = Vec::new();
-
         let has_user_prompts = self.messages.iter().any(|m| m.role == "user");
 
-        // Render full Centered ASCII Artwork logo when starting / clear state
+        // Render Centered Synapse Neural Logo when starting / clear state
         if !has_user_prompts {
+            let vp_w = viewport_area.width.saturating_sub(2) as usize;
+
             chat_lines.push(Line::from(""));
+
+            // Full 27-line neural synapse brand ASCII art (Always rendered, perfectly centered)
+            let art_w = 39;
+            let pad = (vp_w.saturating_sub(art_w)) / 2;
             for line in ASCII_BANNER {
-                chat_lines.push(Line::from(Span::styled(*line, t.header_title())));
+                chat_lines.push(render_synapse_ascii_line(line, pad, &self.theme));
             }
             chat_lines.push(Line::from(""));
-            chat_lines.push(Line::from(Span::styled("                      CYNAPSE LOCAL AGENT SYSTEM", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
-            chat_lines.push(Line::from(Span::styled("             Pure Rust LLM Engine + Dendrite 4-Tier Memory Graph", Style::default().fg(Color::Rgb(170, 170, 170)))));
+
+            // Clean, dynamically centered welcome lozenge
+            let title_text = "✦ CYNAPSE LOCAL AGENT SYSTEM ✦";
+            let sub_text = "Pure Rust Engine  •  Dendrite 3D Planetary Galaxy";
+            let box_w: usize = 54.min(vp_w.saturating_sub(2));
+            let box_pad = " ".repeat((vp_w.saturating_sub(box_w)) / 2);
+
+            chat_lines.push(Line::from(vec![
+                Span::raw(box_pad.clone()),
+                Span::styled(format!("╭{}╮", "─".repeat(box_w.saturating_sub(2))), Style::default().fg(Color::Cyan)),
+            ]));
+            chat_lines.push(Line::from(vec![
+                Span::raw(box_pad.clone()),
+                Span::styled("│", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{:^width$}", title_text, width = box_w.saturating_sub(2)), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("│", Style::default().fg(Color::Cyan)),
+            ]));
+            chat_lines.push(Line::from(vec![
+                Span::raw(box_pad.clone()),
+                Span::styled("│", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{:^width$}", sub_text, width = box_w.saturating_sub(2)), t.dim_text()),
+                Span::styled("│", Style::default().fg(Color::Cyan)),
+            ]));
+            chat_lines.push(Line::from(vec![
+                Span::raw(box_pad),
+                Span::styled(format!("╰{}╯", "─".repeat(box_w.saturating_sub(2))), Style::default().fg(Color::Cyan)),
+            ]));
             chat_lines.push(Line::from(""));
-            chat_lines.push(Line::from(Span::styled(" Type your prompt below to start conversation... (Try /help, /model, /memory, /thinking)", Style::default().fg(Color::Cyan))));
+
+            // Centered command chips
+            let chip_len = 54;
+            let chip_pad = " ".repeat((vp_w.saturating_sub(chip_len)) / 2);
+            chat_lines.push(Line::from(vec![
+                Span::raw(chip_pad),
+                Span::styled("◖ /help ◗", Style::default().fg(Color::Cyan)),
+                Span::raw("   "),
+                Span::styled("◖ /dendrite ◗", Style::default().fg(Color::Yellow)),
+                Span::raw("   "),
+                Span::styled("◖ /model ◗", Style::default().fg(Color::Green)),
+                Span::raw("   "),
+                Span::styled("◖ /theme ◗", Style::default().fg(Color::Magenta)),
+                Span::raw("   "),
+                Span::styled("◖ /doctor ◗", Style::default().fg(Color::LightBlue)),
+            ]));
+            chat_lines.push(Line::from(""));
+
+            let prompt_hint = "Type your prompt below to chat, or type '/' for commands...";
+            let hint_pad = " ".repeat((vp_w.saturating_sub(prompt_hint.chars().count())) / 2);
+            chat_lines.push(Line::from(vec![
+                Span::raw(hint_pad),
+                Span::styled(prompt_hint, t.dim_text()),
+            ]));
             chat_lines.push(Line::from(""));
         } else {
             for msg in &self.messages {
@@ -1779,12 +2064,20 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             }
         }
 
-        // Pulse loading animation frames during stream generation
-        let pulse_frames = ["・>・・", "・・>・", "・・・>", "・・・・"];
-        let pulse_str = pulse_frames[self.anim_tick % pulse_frames.len()];
+        // Jcode-style Braille spinner animation during stream generation
+        const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = SPINNER_FRAMES[self.anim_tick % SPINNER_FRAMES.len()];
 
         if self.is_generating {
-            chat_lines.push(Line::from(Span::styled(format!("Generating {}", pulse_str), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+            let label = if !self.current_thinking_buf.is_empty() && self.current_response_buf.is_empty() {
+                format!("  {} Thinking...", spinner)
+            } else {
+                format!("  {} Responding...", spinner)
+            };
+            chat_lines.push(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
             if !self.current_thinking_buf.is_empty() {
                 if self.show_thinking {
                     chat_lines.push(Line::from(Span::styled("  ▼ [Thinking... (Press Ctrl+T to collapse)]", t.thinking_header())));
@@ -1809,7 +2102,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         let total_visual_lines = calculate_visual_lines(&chat_lines, inner_width);
         let max_scroll = (total_visual_lines as u16).saturating_sub(inner_height as u16);
         self.last_max_scroll.store(max_scroll, Ordering::Relaxed);
-        let effective_scroll = if self.auto_scroll {
+        let effective_scroll = if !has_user_prompts {
+            self.scroll_offset.min(max_scroll)
+        } else if self.auto_scroll {
             max_scroll
         } else {
             self.scroll_offset.min(max_scroll)
@@ -1844,7 +2139,8 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             let input_area = main_chunks[2];
             let inner_w = input_area.width.saturating_sub(2) as usize;
             if inner_w > 0 {
-                let total_offset = 4 + self.input[..self.input_cursor].chars().count();
+                let safe_cursor = self.input.char_indices().map(|(i, _)| i).chain(std::iter::once(self.input.len())).filter(|&i| i <= self.input_cursor).last().unwrap_or(0);
+                let total_offset = 4 + self.input[..safe_cursor].chars().count();
                 let row_offset = (total_offset / inner_w) as u16;
                 let col_offset = (total_offset % inner_w) as u16;
                 let cursor_x = input_area.x + 1 + col_offset;
@@ -1873,13 +2169,13 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     let is_selected = idx == self.autocomplete_idx;
                     let (cmd_style, desc_style) = if is_selected {
                         (
-                            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
-                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                            Style::default().fg(Color::White).bg(Color::Rgb(40, 75, 140)).add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Rgb(225, 235, 255)).bg(Color::Rgb(40, 75, 140)),
                         )
                     } else {
                         (
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                            Style::default().fg(Color::White),
+                            Style::default().fg(Color::Rgb(215, 220, 230)),
                         )
                     };
 
@@ -1895,9 +2191,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(" Autocomplete Commands (Tab/Up/Down) ")
+                    .title(" Commands (Tab/Up/Down/Enter) ")
                     .border_style(t.active_border_style())
-                    .style(Style::default().bg(Color::Rgb(30, 30, 30)).fg(Color::White)),
+                    .style(Style::default().bg(Color::Rgb(25, 28, 38)).fg(Color::White)),
             );
             f.render_widget(dropdown_list, popup_area);
         }
@@ -1928,7 +2224,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Line::from("  • PgUp / PgDn       : Scroll conversation viewport"),
                     Line::from("  • Esc / q           : Dismiss popup or close modal"),
                     Line::from(""),
-                    Line::from(Span::styled("Press Esc or q to return", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("Press Esc or q to return", t.dim_text())),
                 ];
 
                 let modal = Paragraph::new(help_text)
@@ -1995,10 +2291,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 f.render_widget(modal, area);
             }
             ActiveModal::MemoryGraph => {
-                let area = centered_rect(88, 80, f.area());
-                f.render_widget(Clear, area);
-
-                self.render_3d_galaxy_atlas(f, area);
+                // Handled in primary viewport canvas
             }
             ActiveModal::ModelList => {
                 let area = centered_rect(80, 65, f.area());
@@ -2050,7 +2343,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         Span::styled(prefix, style),
                         Span::styled(format!("{:<28} ", s.session_id), style),
                         Span::styled(format!("Model: {:<20} ", s.model_name), Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("({} msgs)", msg_count), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("({} msgs)", msg_count), t.dim_text()),
                     ]);
                     items.push(ListItem::new(line));
                 }
@@ -2087,7 +2380,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         cynapse_memory::graph::NodeCategory::Preferences => Color::Yellow,
                         cynapse_memory::graph::NodeCategory::Meta => Color::Green,
                         cynapse_memory::graph::NodeCategory::Episodic => Color::White,
-                        cynapse_memory::graph::NodeCategory::Transient => Color::DarkGray,
+                        cynapse_memory::graph::NodeCategory::Transient => Color::Rgb(145, 150, 170),
                     };
 
                     let spec = n.spec_index();
@@ -2153,7 +2446,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         items.push(ListItem::new(Line::from(vec![
                             Span::styled(custom_prefix, custom_style),
                             Span::styled("[ 🔗 Custom Hugging Face Model... ] ", custom_style),
-                            Span::styled("Paste custom Repo ID or GGUF URL", Style::default().fg(Color::DarkGray)),
+                            Span::styled("Paste custom Repo ID or GGUF URL", t.dim_text()),
                         ])));
 
                         let list = List::new(items).block(
@@ -2180,7 +2473,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                                 Span::raw(&self.custom_pull_url),
                             ]),
                             Line::from(""),
-                            Line::from(Span::styled("Press Enter to choose quantization tier (Q4_K_M, Q5_K_M, Q8_0, F16) │ Esc to back", Style::default().fg(Color::DarkGray))),
+                            Line::from(Span::styled("Press Enter to choose quantization tier (Q4_K_M, Q5_K_M, Q8_0, F16) │ Esc to back", t.dim_text())),
                         ];
 
                         let modal = Paragraph::new(text).block(
@@ -2233,7 +2526,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                                 lines.push(Line::from(Span::styled("✓ DOWNLOAD COMPLETE!", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
                                 lines.push(Line::from("──────────────────────────────────────────────────────────"));
                                 lines.push(Line::from(vec![
-                                    Span::styled(" Saved & Activated: ", Style::default().fg(Color::DarkGray)),
+                                    Span::styled(" Saved & Activated: ", t.dim_text()),
                                     Span::styled(&st.model_name, t.active_model()),
                                 ]));
                                 lines.push(Line::from(""));
@@ -2249,13 +2542,13 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                                 let downloaded_mb = st.downloaded_bytes as f64 / 1_048_576.0;
                                 let total_mb = st.total_bytes as f64 / 1_048_576.0;
 
-                                lines.push(Line::from(vec![Span::styled(" Model: ", Style::default().fg(Color::DarkGray)), Span::styled(&st.model_name, t.active_model())]));
-                                lines.push(Line::from(vec![Span::styled(" Speed: ", Style::default().fg(Color::DarkGray)), Span::styled(format!("{:.2} MB/s", st.speed_mbps), Style::default().fg(Color::Green))]));
-                                lines.push(Line::from(vec![Span::styled(" Size:  ", Style::default().fg(Color::DarkGray)), Span::raw(format!("{:.1} / {:.1} MB", downloaded_mb, total_mb))]));
+                                lines.push(Line::from(vec![Span::styled(" Model: ", t.dim_text()), Span::styled(&st.model_name, t.active_model())]));
+                                lines.push(Line::from(vec![Span::styled(" Speed: ", t.dim_text()), Span::styled(format!("{:.2} MB/s", st.speed_mbps), Style::default().fg(Color::Green))]));
+                                lines.push(Line::from(vec![Span::styled(" Size:  ", t.dim_text()), Span::raw(format!("{:.1} / {:.1} MB", downloaded_mb, total_mb))]));
                                 lines.push(Line::from(""));
                                 lines.push(Line::from(Span::styled(bar_str, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
                                 lines.push(Line::from(""));
-                                lines.push(Line::from(Span::styled("Download running in background. Press Esc/q to dismiss window.", Style::default().fg(Color::DarkGray))));
+                                lines.push(Line::from(Span::styled("Download running in background. Press Esc/q to dismiss window.", t.dim_text())));
                             }
                         } else {
                             lines.push(Line::from(vec![
@@ -2374,7 +2667,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         right_lines.push(Line::from(Span::styled(format!(" {}", line), Style::default().fg(Color::White))));
                     }
                     if text_with_cursor.lines().count() > 18 {
-                        right_lines.push(Line::from(Span::styled("  ... [content continues below]", Style::default().fg(Color::DarkGray))));
+                        right_lines.push(Line::from(Span::styled("  ... [content continues below]", t.dim_text())));
                     }
 
                     right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
@@ -2400,7 +2693,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                             right_lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Gray))));
                         }
                         if content.lines().count() > 11 {
-                            right_lines.push(Line::from(Span::styled("  ... [content truncated]", Style::default().fg(Color::DarkGray))));
+                            right_lines.push(Line::from(Span::styled("  ... [content truncated]", t.dim_text())));
                         }
                     } else {
                         right_lines.push(Line::from(Span::styled("No persona files found in ~/.cynapse/persona/", Style::default().fg(Color::Red))));
@@ -2444,9 +2737,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         let width = area.width.saturating_sub(4) as usize;
         let height = area.height.saturating_sub(6) as usize;
 
-        let (nodes, edges) = self.graph.topology();
+        let (nodes, _edges) = self.graph.topology();
 
-        // Canvas grid buffer
+        // Canvas grid buffer initialized to clean empty space
         let mut grid: Vec<Vec<(char, Style)>> = vec![vec![(' ', Style::default()); width]; height];
 
         let yaw = self.galaxy_yaw;
@@ -2459,11 +2752,11 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         let cos_p = pitch.cos();
         let sin_p = pitch.sin();
 
-        // 1. Background Cosmic Starfield
+        // 1. Faint, Minimal Cosmic Background Starfield
         let star_seeds = [
-            (-34.0, 15.0, -25.0), (32.0, -18.0, 28.0), (-28.0, -25.0, -15.0),
-            (35.0, 22.0, 18.0), (-40.0, 8.0, 30.0), (22.0, -30.0, -28.0),
-            (-15.0, 35.0, 8.0), (38.0, -12.0, -25.0), (-8.0, -38.0, 20.0),
+            (-32.0, 14.0, -22.0), (28.0, -16.0, 24.0), (-24.0, -20.0, -12.0),
+            (30.0, 18.0, 15.0), (-35.0, 7.0, 26.0), (20.0, -25.0, -24.0),
+            (-12.0, 28.0, 7.0), (32.0, -10.0, -20.0),
         ];
 
         for (sx, sy, sz) in star_seeds {
@@ -2471,87 +2764,134 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             let z1 = sx * sin_y + sz * cos_y;
             let y1 = sy * cos_p - z1 * sin_p;
 
-            let px = (center_x + x1 * 0.7) as i32;
-            let py = (center_y + y1 * 0.35) as i32;
+            let px = (center_x + x1 * 0.8) as i32;
+            let py = (center_y + y1 * 0.4) as i32;
 
             if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
-                grid[py as usize][px as usize] = ('.', Style::default().fg(Color::DarkGray));
+                grid[py as usize][px as usize] = ('.', Style::default().fg(Color::Rgb(55, 55, 75)));
             }
         }
 
-        // 2. Map Real 3D Spatial Nodes onto Screen Grid
-        let mut node_coords: std::collections::HashMap<String, (i32, i32)> = std::collections::HashMap::new();
-
-        for node in &nodes {
-            let cat = node.category();
-
-            // 3D rotation transform from actual force-directed physics coordinates
-            let x1 = node.x * cos_y - node.z * sin_y;
-            let z1 = node.x * sin_y + node.z * cos_y;
-            let y1 = node.y * cos_p - z1 * sin_p;
-
-            let px = (center_x + x1 * 1.6) as i32;
-            let py = (center_y + y1 * 0.8) as i32;
-
-            if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
-                node_coords.insert(node.id.clone(), (px, py));
-
-                let cat_color = match cat {
-                    cynapse_memory::graph::NodeCategory::Personal => Color::LightMagenta,
-                    cynapse_memory::graph::NodeCategory::Engineering => Color::Cyan,
-                    cynapse_memory::graph::NodeCategory::Preferences => Color::Yellow,
-                    cynapse_memory::graph::NodeCategory::Meta => Color::Green,
-                    cynapse_memory::graph::NodeCategory::Episodic => Color::White,
-                    cynapse_memory::graph::NodeCategory::Transient => Color::DarkGray,
-                };
-
-                let (ch, style) = if node.mass >= 2.5 {
-                    ('★', Style::default().fg(cat_color).add_modifier(Modifier::BOLD))
-                } else if node.mass >= 1.3 {
-                    ('✦', Style::default().fg(cat_color))
-                } else {
-                    ('●', Style::default().fg(cat_color).add_modifier(Modifier::DIM))
-                };
-
-                grid[py as usize][px as usize] = (ch, style);
+        // 2. Clean Planetary Orbital Tracks (Cleanly spaced dashed guides, no dense clumping)
+        let planetary_tracks = [9.0f32, 16.0f32, 23.0f32, 30.0f32, 37.0f32];
+        for r in planetary_tracks {
+            let steps = 32;
+            for s in 0..steps {
+                let theta = (s as f32) * (2.0 * std::f32::consts::PI / (steps as f32));
+                let rx = r * theta.cos();
+                let rz = r * theta.sin();
+                let ry = 0.0;
+                let x1 = rx * cos_y - rz * sin_y;
+                let z1 = rx * sin_y + rz * cos_y;
+                let y1 = ry * cos_p - z1 * sin_p;
+                let px = (center_x + x1 * 0.85) as i32;
+                let py = (center_y + y1 * 0.42) as i32;
+                if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
+                    if grid[py as usize][px as usize].0 == ' ' {
+                        grid[py as usize][px as usize] = ('·', Style::default().fg(Color::Rgb(40, 44, 60)));
+                    }
+                }
             }
         }
 
-        // 3. Central Supermassive Anchor
+        // 3. Central Sun: The Biggest Memory (Core) anchored at the Center
+        let cpx = center_x as i32;
+        let cpy = center_y as i32;
         let supermassive = self.graph.supermassive_node();
-        let core_pos = supermassive.as_ref().map(|n| (n.x, n.y, n.z)).unwrap_or((0.0, 0.0, 0.0));
-        let cx1 = core_pos.0 * cos_y - core_pos.2 * sin_y;
-        let cz1 = core_pos.0 * sin_y + core_pos.2 * cos_y;
-        let cy1 = core_pos.1 * cos_p - cz1 * sin_p;
-        let cpx = (center_x + cx1 * 1.6) as i32;
-        let cpy = (center_y + cy1 * 0.8) as i32;
-        if cpx >= 0 && cpx < width as i32 && cpy >= 0 && cpy < height as i32 {
-            grid[cpy as usize][cpx as usize] = ('✸', Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        let supermassive_id = supermassive.as_ref().map(|n| n.id.as_str());
+
+        if cpy >= 0 && cpy < height as i32 {
+            if cpx >= 1 && cpx + 1 < width as i32 {
+                grid[cpy as usize][(cpx - 1) as usize] = ('✦', Style::default().fg(Color::Yellow));
+                grid[cpy as usize][cpx as usize] = ('✸', Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD));
+                grid[cpy as usize][(cpx + 1) as usize] = ('✦', Style::default().fg(Color::Yellow));
+            } else if cpx >= 0 && cpx < width as i32 {
+                grid[cpy as usize][cpx as usize] = ('✸', Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD));
+            }
         }
 
-        // 4. Draw Full Line Synaptic Filaments between connected memory nodes
-        for edge in &edges {
-            if let (Some(&(x1, y1)), Some(&(x2, y2))) = (node_coords.get(&edge.0), node_coords.get(&edge.1)) {
-                let steps = ((x2 - x1).abs().max((y2 - y1).abs())).clamp(1, 30);
-                for s in 1..steps {
-                    let ix = x1 + (x2 - x1) * s / steps;
-                    let iy = y1 + (y2 - y1) * s / steps;
-                    if ix >= 0 && ix < width as i32 && iy >= 0 && iy < height as i32 {
-                        if grid[iy as usize][ix as usize].0 == ' ' {
-                            grid[iy as usize][ix as usize] = ('·', Style::default().fg(Color::DarkGray));
+        // 4. Planetary Category Systems Orbiting the Sun
+        // Each major category is a Planet with its own orbital distance, speed, and moons
+        let planet_specs = [
+            (cynapse_memory::graph::NodeCategory::Meta, 9.0f32, 0.045f32, 0.0f32, "Meta", Color::Green),
+            (cynapse_memory::graph::NodeCategory::Engineering, 16.0f32, 0.032f32, 1.3f32, "Engineering", Color::Cyan),
+            (cynapse_memory::graph::NodeCategory::Personal, 23.0f32, 0.024f32, 2.6f32, "Personal", Color::LightMagenta),
+            (cynapse_memory::graph::NodeCategory::Preferences, 30.0f32, 0.018f32, 3.9f32, "Preferences", Color::Yellow),
+            (cynapse_memory::graph::NodeCategory::Episodic, 37.0f32, 0.013f32, 5.2f32, "Episodic", Color::Rgb(140, 180, 255)),
+        ];
+
+        // Group non-core nodes by category
+        let mut category_nodes: std::collections::HashMap<cynapse_memory::graph::NodeCategory, Vec<&cynapse_memory::graph::Node>> = std::collections::HashMap::new();
+        for node in &nodes {
+            if Some(node.id.as_str()) != supermassive_id {
+                category_nodes.entry(node.category()).or_default().push(node);
+            }
+        }
+
+        for (cat, orbit_r, speed, angle_offset, _planet_name, planet_color) in planet_specs {
+            // Planet orbital rotation around the Sun
+            let current_angle = angle_offset + yaw + self.galaxy_anim_spin * speed;
+            let px_3d = orbit_r * current_angle.cos();
+            let pz_3d = orbit_r * current_angle.sin();
+            let py_3d = 0.6 * (current_angle * 1.5).sin();
+
+            let x1 = px_3d * cos_y - pz_3d * sin_y;
+            let z1 = px_3d * sin_y + pz_3d * cos_y;
+            let y1 = py_3d * cos_p - z1 * sin_p;
+
+            let planet_px = (center_x + x1 * 0.85) as i32;
+            let planet_py = (center_y + y1 * 0.42) as i32;
+
+            // Draw Planet Glyph (Pure dot representation without overlapping text labels)
+            if planet_px >= 0 && planet_px < width as i32 && planet_py >= 0 && planet_py < height as i32 {
+                grid[planet_py as usize][planet_px as usize] = ('●', Style::default().fg(planet_color).add_modifier(Modifier::BOLD));
+            }
+
+            // Draw Moons (Memories belonging to this category) revolving around the Planet
+            if let Some(nodes_in_cat) = category_nodes.get(&cat) {
+                for (idx, node) in nodes_in_cat.iter().enumerate() {
+                    let moon_r = 2.2f32 + (idx as f32 % 3.0) * 1.2f32;
+                    let moon_speed = 0.12f32 + (idx as f32 % 2.0) * 0.04f32;
+                    let moon_angle = (idx as f32 * 1.4) + self.galaxy_anim_spin * moon_speed;
+
+                    let mx_3d = px_3d + moon_r * moon_angle.cos();
+                    let mz_3d = pz_3d + moon_r * moon_angle.sin();
+                    let my_3d = py_3d + moon_r * 0.3 * moon_angle.sin();
+
+                    let mx1 = mx_3d * cos_y - mz_3d * sin_y;
+                    let mz1 = mx_3d * sin_y + mz_3d * cos_y;
+                    let my1 = my_3d * cos_p - mz1 * sin_p;
+
+                    let moon_px = (center_x + mx1 * 0.85) as i32;
+                    let moon_py = (center_y + my1 * 0.42) as i32;
+
+                    if moon_px >= 0 && moon_px < width as i32 && moon_py >= 0 && moon_py < height as i32 {
+                        // Don't overwrite the planet or sun
+                        if grid[moon_py as usize][moon_px as usize].0 == ' ' || grid[moon_py as usize][moon_px as usize].0 == '·' || grid[moon_py as usize][moon_px as usize].0 == '.' {
+                            let moon_glyph = if node.mass >= 2.0 { '✦' } else { '•' };
+                            grid[moon_py as usize][moon_px as usize] = (moon_glyph, Style::default().fg(planet_color));
                         }
                     }
                 }
             }
         }
 
-        // 3. Convert grid to lines
+        // 5. Convert grid to lines
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled("DENDRITE 3D GALAXY MEMORY ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" (Nodes: {} | Edges: {} | Auto-Spin: {})", nodes.len(), edges.len(), if self.galaxy_auto_spin { "ON" } else { "OFF" })),
+            Span::styled("🌌 DENDRITE PLANETARY GALAXY ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" ◖ ", t.dim_text()),
+            Span::styled("Sun: ✸ Core", Style::default().fg(Color::Rgb(255, 215, 0))),
+            Span::styled(" │ ", t.dim_text()),
+            Span::styled("Planets: ● Category Clusters", Style::default().fg(Color::Cyan)),
+            Span::styled(" │ ", t.dim_text()),
+            Span::styled("Moons: • Memory Facts", Style::default().fg(Color::LightMagenta)),
+            Span::styled(" │ ", t.dim_text()),
+            Span::styled(format!("Orbit: {}", if self.galaxy_auto_spin { "ON" } else { "PAUSED" }), if self.galaxy_auto_spin { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Yellow) }),
+            Span::styled(" ◗", t.dim_text()),
         ]));
-        lines.push(Line::from("──────────────────────────────────────────────────────────────────────────"));
+        let sep_str = "─".repeat(width);
+        lines.push(Line::from(Span::styled(&sep_str, t.border_style())));
 
         for row in grid {
             let mut spans = Vec::new();
@@ -2561,17 +2901,22 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             lines.push(Line::from(spans));
         }
 
-        lines.push(Line::from("──────────────────────────────────────────────────────────────────────────"));
+        lines.push(Line::from(Span::styled(&sep_str, t.border_style())));
         lines.push(Line::from(vec![
-            Span::styled("Controls: ", Style::default().fg(Color::DarkGray)),
-            Span::raw("Arrow Keys: Rotate 3D Yaw/Pitch │ Space/s: Toggle Auto-Spin │ Esc/q: Exit Dendrite"),
+            Span::styled("Controls: ", t.dim_text()),
+            Span::styled("Arrow Keys", Style::default().fg(Color::Cyan)),
+            Span::styled(": 3D Pitch/Yaw  │  ", t.dim_text()),
+            Span::styled("Space", Style::default().fg(Color::Yellow)),
+            Span::styled(": Toggle Spin  │  ", t.dim_text()),
+            Span::styled("Esc / q", Style::default().fg(Color::LightMagenta)),
+            Span::styled(": Return to Chat", t.dim_text()),
         ]));
 
         let atlas_widget = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" 3D Dendrite Memory Galaxy Visualizer ")
+                .title(" 🌌 Dendrite 3D Planetary Galaxy ")
                 .border_style(t.active_border_style()),
         );
 
@@ -2586,24 +2931,41 @@ fn calculate_visual_lines(lines: &[Line], width: usize) -> usize {
     let mut total = 0;
     for line in lines {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        if text.is_empty() {
+        if text.trim().is_empty() {
             total += 1;
             continue;
         }
-        let mut cur_len = 0;
-        for word in text.split_whitespace() {
-            let word_len = word.chars().count();
-            if cur_len == 0 {
-                cur_len = word_len;
-            } else if cur_len + 1 + word_len <= width {
-                cur_len += 1 + word_len;
-            } else {
+
+        // Subdivide by explicit newlines if any span contains them
+        for sub_line in text.split('\n') {
+            if sub_line.trim().is_empty() {
                 total += 1;
-                cur_len = word_len.min(width);
+                continue;
             }
-        }
-        if cur_len > 0 {
-            total += 1;
+
+            let leading_spaces = sub_line.chars().take_while(|c| c.is_whitespace()).count();
+            let mut cur_col = leading_spaces;
+            let mut line_count = 1;
+            let mut first_word = true;
+
+            for word in sub_line.split_whitespace() {
+                let w_len = word.chars().count();
+                if first_word {
+                    first_word = false;
+                    if cur_col + w_len <= width {
+                        cur_col += w_len;
+                    } else {
+                        line_count += (cur_col + w_len).saturating_sub(1) / width;
+                        cur_col = (cur_col + w_len) % width;
+                    }
+                } else if cur_col + 1 + w_len <= width {
+                    cur_col += 1 + w_len;
+                } else {
+                    line_count += 1;
+                    cur_col = w_len.min(width);
+                }
+            }
+            total += line_count;
         }
     }
     total

@@ -189,27 +189,31 @@ fn assemble(
     }
 
     if !user_message.trim().is_empty() {
-        // Conversation-relevant nodes (filtered by MIN_RELEVANCE_SCORE to prevent prompt bloat).
-        let candidates = find_relevant(graph, store, user_message);
-        let scored = score(&candidates, user_message);
-        for (node, rel_score) in scored {
-            if rel_score < MIN_RELEVANCE_SCORE {
-                continue; // Skip weak matches below relevance threshold
+        if !is_conversational_query(user_message) {
+            // Conversation-relevant nodes: require actual lexical/BM25 match (bm25_score > 0)
+            // and enforce strict threshold to prevent prompt bloat and response hallucinations.
+            let min_threshold = if skip_core_nodes { 12.0 } else { MIN_RELEVANCE_SCORE };
+            let candidates = find_relevant(graph, store, user_message);
+            let scored = score(&candidates, user_message);
+            for (node, rel_score) in scored {
+                if rel_score < min_threshold {
+                    continue; // Skip weak matches below relevance threshold
+                }
+                if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
+                    continue; // Skip core (handled separately) and ephemeral turn logs
+                }
+                let cleaned = clean_node_content(&node.content);
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let part = format!("## {}\n\n{}", node.title, cleaned);
+                let cost = estimate_tokens(&part);
+                if used + cost > max_tokens {
+                    break;
+                }
+                parts.push(part);
+                used += cost;
             }
-            if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
-                continue; // Skip core (handled separately) and ephemeral turn logs
-            }
-            let cleaned = clean_node_content(&node.content);
-            if cleaned.is_empty() {
-                continue;
-            }
-            let part = format!("## {}\n\n{}", node.title, cleaned);
-            let cost = estimate_tokens(&part);
-            if used + cost > max_tokens {
-                break;
-            }
-            parts.push(part);
-            used += cost;
         }
     } else {
         // No message context: recently updated non-core nodes.
@@ -254,6 +258,9 @@ fn assemble(
 }
 
 fn find_relevant(graph: &Dendrite, store: Option<&DendriteStore>, user_message: &str) -> Vec<Node> {
+    if is_conversational_query(user_message) {
+        return Vec::new();
+    }
     let mut seen = HashSet::new();
     let mut out: Vec<Node> = Vec::new();
 
@@ -268,7 +275,8 @@ fn find_relevant(graph: &Dendrite, store: Option<&DendriteStore>, user_message: 
 
     let add_with_neighbors = |n: &Node, out: &mut Vec<Node>, seen: &mut HashSet<String>| {
         add_node(n, out, seen);
-        for neighbor in graph.neighbors_2hop(&n.id) {
+        // Include up to 2 direct 1-hop neighbors to preserve context without flooding prompt
+        for neighbor in graph.neighbors(&n.id).into_iter().take(2) {
             add_node(&neighbor, out, seen);
         }
     };
@@ -339,6 +347,11 @@ fn score(nodes: &[Node], query: &str) -> Vec<ScoredNode> {
             let age_days = (now - n.updated_at).max(0) as f64 / 86400.0;
             let recency_decay = 0.95f64.powf(age_days);
 
+            // If the node has zero lexical match with the query, do not award structural boosts
+            if bm25_score <= 0.0 {
+                return (n.clone(), 0.0);
+            }
+
             // Specialization index boost spec(e)
             let spec_boost = n.spec_index() as f64;
 
@@ -381,6 +394,49 @@ pub fn estimate_tokens(text: &str) -> usize {
     ((char_count / 4) + (word_count / 2)).max(1)
 }
 
+/// Returns true if the query is a greeting, pleasantry, or short casual conversational opener.
+pub fn is_conversational_query(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let cleaned: String = trimmed
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>()
+        .to_lowercase();
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.is_empty() {
+        return true;
+    }
+
+    let exact_phrases = [
+        "hi", "hey", "hello", "yo", "sup", "howdy", "hiya",
+        "hey there", "hello there", "hi there", "yo there",
+        "good morning", "good afternoon", "good evening", "good day",
+        "how are you", "how are you doing", "hows it going", "how is it going",
+        "whats up", "what is up", "who are you", "what can you do", "ping", "test",
+        "hey man", "hey bro", "hey friend", "hey cynapse", "hello cynapse"
+    ];
+    let joined = words.join(" ");
+    if exact_phrases.iter().any(|&p| p == joined) {
+        return true;
+    }
+
+    let greeting_lead_words = ["hi", "hey", "hello", "yo", "howdy", "hiya", "greetings"];
+    if words.len() <= 4 && greeting_lead_words.contains(&words[0]) {
+        let non_greeting_words: Vec<&str> = words.iter()
+            .copied()
+            .filter(|w| !["hi", "hey", "hello", "yo", "howdy", "hiya", "there", "mate", "cynapse", "assistant", "friend", "man", "bro", "you"].contains(w))
+            .collect();
+        if non_greeting_words.is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn stop_words() -> &'static HashSet<&'static str> {
     static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
     WORDS.get_or_init(|| {
@@ -395,6 +451,7 @@ fn stop_words() -> &'static HashSet<&'static str> {
             "some", "time", "would", "there", "their", "could", "other", "after", "first", "never",
             "these", "think", "where", "being", "every", "great", "might", "shall", "still",
             "those", "while", "about", "should",
+            "hey", "hello", "hi", "yo", "sup", "please", "thanks", "thank", "cynapse",
         ]
         .into_iter()
         .collect()
@@ -403,4 +460,27 @@ fn stop_words() -> &'static HashSet<&'static str> {
 
 fn is_stop_word(w: &str) -> bool {
     stop_words().contains(w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_conversational_query() {
+        assert!(is_conversational_query("hey there"));
+        assert!(is_conversational_query("hello"));
+        assert!(is_conversational_query("hi"));
+        assert!(is_conversational_query("yo"));
+        assert!(is_conversational_query("good morning"));
+        assert!(is_conversational_query("how are you"));
+        assert!(is_conversational_query("hey cynapse!"));
+        assert!(is_conversational_query("  hello there   "));
+
+        // Task queries must NOT be conversational
+        assert!(!is_conversational_query("find files in src/"));
+        assert!(!is_conversational_query("hey search for auth.rs"));
+        assert!(!is_conversational_query("what is quicksort algorithm"));
+        assert!(!is_conversational_query("run cargo build --release"));
+    }
 }

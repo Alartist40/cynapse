@@ -77,7 +77,18 @@ async fn main() -> Result<()> {
             session.list_models();
         }
         Some(Commands::Route { model_path }) => {
-            let target = model_path.unwrap_or_else(|| models_dir.join("model.gguf"));
+            let target = if let Some(ref p) = model_path {
+                let p_str = p.to_string_lossy();
+                if let Some((_, resolved_path)) = session.resolve_model_by_name_or_index(&p_str) {
+                    resolved_path
+                } else {
+                    p.clone()
+                }
+            } else if let Some((_, resolved_path)) = session.resolve_model_by_name_or_index(&session.active_model_name) {
+                resolved_path
+            } else {
+                models_dir.join("model.gguf")
+            };
             let decision = route_model(&target, false);
             println!("======================================================================");
             println!("             🧠 CYNAPSE SEMANTIC HARDWARE & MODEL ROUTER              ");
@@ -128,7 +139,12 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Run { target }) => {
             if let Some(t) = target {
-                session.active_model_name = t;
+                if let Some((resolved_name, resolved_path)) = session.resolve_model_by_name_or_index(&t) {
+                    session.active_model_name = resolved_name;
+                    session.active_model_path = resolved_path;
+                } else {
+                    session.active_model_name = t;
+                }
             }
             if cli.cli {
                 session.run_cli_loop_with_resume(cli.resume.as_deref()).await?;

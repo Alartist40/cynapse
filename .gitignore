@@ -5,3 +5,6 @@
 *.db-wal
 *.db-shm
 /data
+/models/*.gguf
+/engine/leafcutter_core/rust/target
+.agents/skills/unlazy/

@@ -71,6 +71,15 @@ Mode: High Efficiency & Direct Execution
             fs::write(&user_path, default_user)?;
         }
 
+        let memory_path = self.persona_dir.join("MEMORY.md");
+        if !memory_path.exists() {
+            let default_memory = r#"# Active Working Memory
+- Mode: Direct local execution
+- Knowledge Store: Dendrite SQLite FTS5 graph database
+"#;
+            fs::write(&memory_path, default_memory)?;
+        }
+
         Ok(())
     }
 
@@ -134,6 +143,7 @@ Mode: High Efficiency & Direct Execution
         let identity = self.read_file_or_empty("IDENTITY.md");
         let soul = self.read_file_or_empty("SOUL.md");
         let user = self.read_file_or_empty("USER.md");
+        let memory = self.read_file_or_empty("MEMORY.md");
 
         let mut parts = Vec::new();
         if !identity.trim().is_empty() {
@@ -144,6 +154,9 @@ Mode: High Efficiency & Direct Execution
         }
         if !user.trim().is_empty() {
             parts.push(format!("=== USER PROFILE ===\n{}", user.trim()));
+        }
+        if !memory.trim().is_empty() {
+            parts.push(format!("=== ACTIVE WORKING MEMORY ===\n{}", memory.trim()));
         }
 
         if parts.is_empty() {
@@ -168,10 +181,12 @@ mod tests {
         assert!(personas.contains(&"IDENTITY".to_string()));
         assert!(personas.contains(&"SOUL".to_string()));
         assert!(personas.contains(&"USER".to_string()));
+        assert!(personas.contains(&"MEMORY".to_string()));
 
         let prompt = mgr.build_system_prompt();
         assert!(prompt.contains("Cynapse Core Identity"));
         assert!(prompt.contains("Soul & Behavior Protocol"));
+        assert!(prompt.contains("Active Working Memory"));
     }
 
     #[test]

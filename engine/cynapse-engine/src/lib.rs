@@ -1,19 +1,22 @@
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+
+pub mod daemon;
+pub mod slots;
 
 /// Dynamic headroom reserve calculation: scales based on model parameter/disk footprint.
 pub fn compute_reserve_bytes(model_bytes: u64) -> u64 {
     let model_gb = model_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     if model_gb <= 3.0 {
-        1024 * 1024 * 1024 // 1.0 GiB for small models (<= 3B)
-    } else if model_gb <= 9.0 {
-        2560 * 1024 * 1024 // 2.5 GiB for medium models (3B - 9B)
+        512 * 1024 * 1024 // 512 MiB for small models (<= 3B)
+    } else if model_gb <= 12.0 {
+        1536 * 1024 * 1024 // 1.5 GiB for medium models (3B - 12B, e.g. 9B needs ~1.5 GB KV cache)
     } else if model_gb <= 20.0 {
-        5120 * 1024 * 1024 // 5.0 GiB for 10B-20B models
+        3072 * 1024 * 1024 // 3.0 GiB for 13B-20B models
     } else {
         8192 * 1024 * 1024 // 8.0 GiB for 35B+ models (KV cache + large activations)
     }
@@ -31,9 +34,17 @@ pub enum EngineTier {
 impl EngineTier {
     pub fn label(self) -> &'static str {
         match self {
-            EngineTier::Tier1Fast => "Tier 1 (Fast llama.cpp/Ollama API)",
-            EngineTier::Tier2LargeGguf => "Tier 2 (Leafcutter Rust GGUF Layer Streaming)",
-            EngineTier::Tier3LargeSafetensor => "Tier 3 (Leafcutter Rust Safetensor Streaming)",
+            EngineTier::Tier1Fast => "Tier 1 Fast (llama.cpp)",
+            EngineTier::Tier2LargeGguf => "Tier 2 Stream (Leafcutter)",
+            EngineTier::Tier3LargeSafetensor => "Tier 3 Stream (Safetensors)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            EngineTier::Tier1Fast => "Tier 1 Fast",
+            EngineTier::Tier2LargeGguf => "Tier 2 Stream",
+            EngineTier::Tier3LargeSafetensor => "Tier 3 Stream",
         }
     }
 }
@@ -59,6 +70,90 @@ pub fn available_ram_mb() -> u64 {
         }
     }
     4096
+}
+
+pub fn total_ram_mb() -> u64 {
+    if let Ok(text) = fs::read_to_string("/proc/meminfo") {
+        for line in text.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(kb) = line.split_whitespace().nth(1) {
+                    if let Ok(val) = kb.parse::<u64>() {
+                        return val / 1024;
+                    }
+                }
+            }
+        }
+    }
+    16384
+}
+
+/// Identifies dedicated or integrated GPU hardware, driver, and acceleration capabilities.
+pub fn detect_gpu_info() -> String {
+    // 1. Query lspci for VGA/3D display controllers
+    if let Ok(output) = std::process::Command::new("lspci").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let lower = line.to_lowercase();
+                if lower.contains("vga compatible controller") || lower.contains("3d controller") || lower.contains("display controller") {
+                    if let Some(idx) = line.find(':') {
+                        let after_first = &line[idx + 1..];
+                        let desc = if let Some(idx2) = after_first.find(':') {
+                            after_first[idx2 + 1..].trim()
+                        } else {
+                            after_first.trim()
+                        };
+                        let clean = desc
+                            .trim_start_matches("Advanced Micro Devices, Inc. [AMD/ATI] ")
+                            .trim_start_matches("NVIDIA Corporation ")
+                            .trim_start_matches("Intel Corporation ");
+
+                        let vulkan_available = Path::new("/usr/bin/vulkaninfo").exists();
+                        let vulkan_tag = if vulkan_available { " (Vulkan)" } else { "" };
+
+                        if clean.contains("Cezanne") {
+                            return format!("AMD Radeon Vega (Cezanne){}", vulkan_tag);
+                        } else if clean.contains("Renoir") {
+                            return format!("AMD Radeon Graphics{}", vulkan_tag);
+                        } else if clean.contains("Radeon") {
+                            let part = clean.split(" [").next().unwrap_or(clean);
+                            return format!("AMD {}{}", part, vulkan_tag);
+                        } else if clean.len() > 24 {
+                            return format!("{}{}", &clean[..24], vulkan_tag);
+                        } else {
+                            return format!("{}{}", clean, vulkan_tag);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Sysfs DRM card scanning
+    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            if fname_str.starts_with("card") && fname_str[4..].chars().all(|c| c.is_ascii_digit()) {
+                let uevent_path = entry.path().join("device").join("uevent");
+                if let Ok(uevent) = fs::read_to_string(&uevent_path) {
+                    if uevent.contains("DRIVER=amdgpu") {
+                        return "AMD Radeon Graphics (Vulkan)".to_string();
+                    } else if uevent.contains("DRIVER=nvidia") {
+                        return "NVIDIA GPU (CUDA / Vulkan)".to_string();
+                    } else if uevent.contains("DRIVER=i915") || uevent.contains("DRIVER=xe") {
+                        return "Intel Graphics (Vulkan)".to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    if Path::new("/proc/driver/nvidia/gpus").exists() {
+        return "NVIDIA GPU (CUDA)".to_string();
+    }
+
+    "CPU Tier (Host RAM)".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,10 +217,7 @@ pub fn probe_hardware_info() -> SystemHardwareInfo {
         0.0
     };
 
-    let mut gpu_info = "CPU Tier (Host RAM)".to_string();
-    if Path::new("/proc/driver/nvidia/gpus").exists() || Path::new("/sys/class/drm/card0").exists() {
-        gpu_info = "GPU / Hardware Accel".to_string();
-    }
+    let gpu_info = detect_gpu_info();
 
     SystemHardwareInfo {
         cpu_brand,
@@ -277,9 +369,10 @@ pub async fn fetch_ollama_models(endpoint: &str) -> Vec<String> {
     fetch_native_models(endpoint).await
 }
 
-pub fn route_model(model_path: &Path, prefer_gpu: bool) -> RouteDecision {
+pub fn route_model(model_path: &Path, _prefer_gpu: bool) -> RouteDecision {
     let ram_mb = available_ram_mb();
-    let ram_bytes = ram_mb * 1024 * 1024;
+    let total_mb = total_ram_mb();
+    let total_bytes = total_mb * 1024 * 1024;
 
     let is_dir = model_path.is_dir();
     let is_safetensors = if is_dir {
@@ -302,15 +395,17 @@ pub fn route_model(model_path: &Path, prefer_gpu: bool) -> RouteDecision {
     let ram_needed_mb = needed_bytes as f64 / 1_048_576.0;
 
     let model_gb = model_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    // Large models (>20GB / >20B params) exceeding available memory must route to Tier 2 layer streaming
+    // Models exceeding 85% of host physical RAM capacity (e.g. 35B/70B models > 16GB on a 16GB host)
+    // require Tier 2 Leafcutter pure-Rust layer streaming from disk.
+    // Models fitting within host RAM capacity (e.g. 0.5B, 3B, 7B, 9B <= 13GB on a 16GB host)
+    // route to Tier 1 Fast (llama.cpp / Ollama mmap with GPU offload).
+    let max_tier1_bytes = (total_bytes as f64 * 0.85) as u64;
     let tier = if is_safetensors {
         EngineTier::Tier3LargeSafetensor
-    } else if model_gb > 20.0 && needed_bytes > ram_bytes {
+    } else if (model_gb > 16.0 && needed_bytes > max_tier1_bytes) || model_bytes > max_tier1_bytes {
         EngineTier::Tier2LargeGguf
-    } else if needed_bytes <= ram_bytes || (prefer_gpu && model_gb <= 12.0) {
-        EngineTier::Tier1Fast
     } else {
-        EngineTier::Tier2LargeGguf
+        EngineTier::Tier1Fast
     };
 
     RouteDecision {
@@ -319,6 +414,50 @@ pub fn route_model(model_path: &Path, prefer_gpu: bool) -> RouteDecision {
         ram_available_mb: ram_mb,
         ram_needed_mb,
         is_safetensors,
+    }
+}
+
+/// Unified streaming query router: automatically dispatches to Tier 1 (fast llama.cpp/Ollama)
+/// or Tier 2 (Leafcutter pure Rust layer streaming) based on the model's routed tier.
+pub async fn query_model_stream(
+    tier: EngineTier,
+    endpoint: &str,
+    model_name: &str,
+    prompt: &str,
+    system_prompt: &str,
+    mut on_token: impl FnMut(TokenType, &str),
+) -> Result<ExecutionStats> {
+    match tier {
+        EngineTier::Tier1Fast => {
+            query_tier1_stream(endpoint, model_name, prompt, system_prompt, on_token).await
+        }
+        EngineTier::Tier2LargeGguf | EngineTier::Tier3LargeSafetensor => {
+            if let Some(local_path) = find_model_file_path(model_name) {
+                let p = local_path.clone();
+                let pr = prompt.to_string();
+                let sys = system_prompt.to_string();
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(TokenType, String)>();
+                let handle = tokio::task::spawn_blocking(move || {
+                    query_native_leafcutter_stream(&p, &pr, &sys, |ttype, text| {
+                        let _ = tx.send((ttype, text.to_string()));
+                    })
+                });
+
+                while let Some((ttype, text)) = rx.recv().await {
+                    on_token(ttype, &text);
+                }
+
+                match handle.await {
+                    Ok(Ok(stats)) => Ok(stats),
+                    Ok(Err(e)) => anyhow::bail!("Native Leafcutter Tier 2 streaming error for '{}': {}", model_name, e),
+                    Err(join_err) => anyhow::bail!("Native Leafcutter task panicked: {}", join_err),
+                }
+            } else {
+                // Fallback to Tier 1 endpoint if local GGUF file is missing
+                query_tier1_stream(endpoint, model_name, prompt, system_prompt, on_token).await
+            }
+        }
     }
 }
 
@@ -495,6 +634,12 @@ fn get_or_load_native_engine(path_str: &str) -> Result<Arc<leafcutter::api::Nati
     Ok(arc_engine)
 }
 
+/// Checks if a model belongs to a reasoning family that generates thinking tokens
+pub fn is_reasoning_model(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("ornith") || lower.contains("qwq") || lower.contains("deepseek") || lower.contains("r1")
+}
+
 /// Direct in-process native Leafcutter Rust GGUF stream runner
 pub fn query_native_leafcutter_stream(
     model_path: &Path,
@@ -512,10 +657,11 @@ pub fn query_native_leafcutter_stream(
     };
 
     let start = Instant::now();
-    let mut is_thinking = false;
+    let is_reasoning = is_reasoning_model(&path_str);
+    let mut is_thinking = is_reasoning;
 
     let (_text, tokens) = engine
-        .generate_stream(&full_prompt, 2048, 0.7, 0.9, |token| {
+        .generate_stream(&full_prompt, 4096, 0.2, 0.95, |token| {
             if token.contains("<think>") {
                 is_thinking = true;
                 let clean = token.replace("<think>", "");
@@ -557,24 +703,74 @@ pub async fn query_tier1_stream(
     system_prompt: &str,
     mut on_token: impl FnMut(TokenType, &str),
 ) -> Result<ExecutionStats> {
-    // 1. Try HTTP endpoint (llama-server / Ollama) first
+    // 1. Try HTTP endpoint (managed llama-server on 38265 first, then Ollama)
     let client = reqwest::Client::new();
     let start = Instant::now();
-    let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
 
-    let available_tags = fetch_ollama_models(endpoint).await;
-    let resolved_model = resolve_model_tag(model_name, &available_tags);
+    let daemon_port = daemon::DEFAULT_DAEMON_PORT;
+    // Check if external endpoint (e.g. Ollama on 11434) is actively responding
+    let endpoint_healthy = client.get(format!("{}/api/tags", endpoint.trim_end_matches('/')))
+        .timeout(Duration::from_millis(300))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
 
-    let payload = serde_json::json!({
-        "model": resolved_model,
-        "prompt": prompt,
-        "system": system_prompt,
-        "stream": true,
-        "options": {
-            "num_ctx": 4096,
-            "temperature": 0.7
-        }
-    });
+    let daemon_ready = if endpoint_healthy {
+        false // Active external endpoint (e.g. Ollama) takes top priority
+    } else if daemon::LlamaServerDaemon::is_healthy(daemon_port) {
+        true
+    } else if let Some(local_path) = find_model_file_path(model_name) {
+        daemon::LlamaServerDaemon::get_or_spawn_daemon(&local_path, daemon_port)
+    } else {
+        false
+    };
+
+    let (url, payload, resolved_model) = if daemon_ready {
+        let llama_url = format!("http://127.0.0.1:{}/completion", daemon_port);
+        let full_p = if system_prompt.is_empty() {
+            format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+        } else {
+            format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", system_prompt, prompt)
+        };
+        let p = serde_json::json!({
+            "prompt": full_p,
+            "stream": true,
+            "cache_prompt": true,
+            "keep_alive": -1,
+            "slot_id": 0,
+            "id_slot": 0,
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "top_k": 40,
+            "repeat_penalty": 1.1,
+            "repeat_last_n": 256
+        });
+        (llama_url, p, model_name.to_string())
+    } else {
+        let available_tags = fetch_ollama_models(endpoint).await;
+        let resolved = resolve_model_tag(model_name, &available_tags);
+        let ollama_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
+        let p = serde_json::json!({
+            "model": resolved,
+            "prompt": prompt,
+            "system": system_prompt,
+            "stream": true,
+            "cache_prompt": true,
+            "keep_alive": -1,
+            "slot_id": 0,
+            "id_slot": 0,
+            "options": {
+                "num_ctx": 4096,
+                "temperature": 0.2,
+                "top_p": 0.95,
+                "top_k": 40,
+                "repeat_penalty": 1.1,
+                "repeat_last_n": 256
+            }
+        });
+        (ollama_url, p, resolved)
+    };
 
     let mut http_err: Option<String> = None;
     let mut resp_opt: Option<reqwest::Response> = None;
@@ -601,9 +797,16 @@ pub async fn query_tier1_stream(
                     "prompt": prompt,
                     "system": system_prompt,
                     "stream": true,
+                    "cache_prompt": true,
+                    "slot_id": 0,
+                    "id_slot": 0,
                     "options": {
                         "num_ctx": 4096,
-                        "temperature": 0.7
+                        "temperature": 0.2,
+                        "top_p": 0.95,
+                        "top_k": 40,
+                        "repeat_penalty": 1.1,
+                        "repeat_last_n": 256
                     }
                 });
                 if let Ok(retry_res) = client
@@ -626,7 +829,12 @@ pub async fn query_tier1_stream(
                 break;
             }
             Err(e) => {
+                let is_conn_err = e.is_connect();
                 http_err = Some(e.to_string());
+                if is_conn_err {
+                    // Endpoint is offline; break immediately to native Leafcutter fallback
+                    break;
+                }
                 if attempt < max_attempts {
                     let jitter = (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -642,7 +850,8 @@ pub async fn query_tier1_stream(
     if let Some(res) = resp_opt {
         let mut stream = res.bytes_stream();
         let mut tokens_generated = 0usize;
-        let mut is_thinking = false;
+        let is_reasoning = is_reasoning_model(model_name);
+        let mut is_thinking = is_reasoning;
         let mut buffer = String::with_capacity(65536);
 
         while let Some(item) = stream.next().await {
@@ -723,10 +932,10 @@ pub async fn query_tier1_stream(
             on_token(ttype, &text);
         }
 
-        if let Ok(res) = handle.await {
-            if let Ok(stats) = res {
-                return Ok(stats);
-            }
+        match handle.await {
+            Ok(Ok(stats)) => return Ok(stats),
+            Ok(Err(e)) => anyhow::bail!("Native Leafcutter engine error for '{}' ({}): {}", model_name, local_path.display(), e),
+            Err(join_err) => anyhow::bail!("Native Leafcutter task panicked: {}", join_err),
         }
     }
 
@@ -747,6 +956,41 @@ pub async fn unload_model(endpoint: &str, model_name: &str) {
         "keep_alive": 0
     });
     let _ = client.post(&url).json(&payload).send().await;
+}
+
+/// Preload and pin model into memory (keep_alive: -1 for Ollama, or spawn daemon for local GGUF).
+pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let endpoint_clean = endpoint.trim_end_matches('/');
+
+    // 1. Check if Ollama is running and pin with keep_alive: -1
+    let tags_url = format!("{}/api/tags", endpoint_clean);
+    if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_millis(500)).send().await {
+        if resp.status().is_success() {
+            let available_tags = fetch_ollama_models(endpoint).await;
+            let resolved = resolve_model_tag(model_name, &available_tags);
+            let gen_url = format!("{}/api/generate", endpoint_clean);
+            let payload = serde_json::json!({
+                "model": resolved,
+                "keep_alive": -1
+            });
+            let _ = client.post(&gen_url)
+                .json(&payload)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await;
+            return Ok(());
+        }
+    }
+
+    // 2. If daemon can be spawned for local path
+    let daemon_port = daemon::DEFAULT_DAEMON_PORT;
+    if !daemon::LlamaServerDaemon::is_healthy(daemon_port) {
+        if let Some(local_path) = find_model_file_path(model_name) {
+            let _ = daemon::LlamaServerDaemon::get_or_spawn_daemon(&local_path, daemon_port);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -786,5 +1030,51 @@ mod tests {
             resolve_model_tag("unknown-custom-model.gguf", &available),
             "unknown-custom-model.gguf"
         );
+    }
+
+    #[test]
+    fn test_compute_reserve_bytes_scaling() {
+        // Small models (<=3B) -> 512 MiB reserve
+        assert_eq!(compute_reserve_bytes(500 * 1024 * 1024), 512 * 1024 * 1024);
+        // Medium models (3B - 12B) -> 1.5 GiB reserve (e.g. 9B needs ~1.5 GB KV cache)
+        assert_eq!(compute_reserve_bytes(5 * 1024 * 1024 * 1024), 1536 * 1024 * 1024);
+        // Large 35B+ models -> 8.0 GiB reserve
+        assert_eq!(compute_reserve_bytes(21 * 1024 * 1024 * 1024), 8192 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_routing_boundaries() {
+        // Ornith-9B (5.38 GB) with 16 GB total RAM should comfortably route to Tier 1 Fast
+        let model_bytes_9b = (5.38 * 1024.0 * 1024.0 * 1024.0) as u64;
+        let total_bytes_16gb = (16.0 * 1024.0 * 1024.0 * 1024.0) as u64;
+        let max_tier1_bytes = (total_bytes_16gb as f64 * 0.85) as u64;
+        let model_gb_9b = 5.38;
+        let needed_bytes_9b = model_bytes_9b + compute_reserve_bytes(model_bytes_9b);
+
+        let tier_9b = if (model_gb_9b > 16.0 && needed_bytes_9b > max_tier1_bytes) || model_bytes_9b > max_tier1_bytes {
+            EngineTier::Tier2LargeGguf
+        } else {
+            EngineTier::Tier1Fast
+        };
+        assert_eq!(tier_9b, EngineTier::Tier1Fast);
+
+        // Ornith-35B (20.7 GB) with 16 GB total RAM must route to Tier 2 Leafcutter layer streaming
+        let model_bytes_35b = (20.7 * 1024.0 * 1024.0 * 1024.0) as u64;
+        let model_gb_35b = 20.7;
+        let needed_bytes_35b = model_bytes_35b + compute_reserve_bytes(model_bytes_35b);
+
+        let tier_35b = if (model_gb_35b > 16.0 && needed_bytes_35b > max_tier1_bytes) || model_bytes_35b > max_tier1_bytes {
+            EngineTier::Tier2LargeGguf
+        } else {
+            EngineTier::Tier1Fast
+        };
+        assert_eq!(tier_35b, EngineTier::Tier2LargeGguf);
+    }
+
+    #[test]
+    fn test_engine_tier_labels() {
+        assert_eq!(EngineTier::Tier1Fast.label(), "Tier 1 Fast (llama.cpp)");
+        assert_eq!(EngineTier::Tier2LargeGguf.label(), "Tier 2 Stream (Leafcutter)");
+        assert_eq!(EngineTier::Tier3LargeSafetensor.label(), "Tier 3 Stream (Safetensors)");
     }
 }

@@ -78,6 +78,8 @@ pub struct Engine {
     /// Current sequence position offset for RoPE. Tracks total tokens processed
     /// across forward calls within a generation session.
     pub seq_offset: usize,
+    /// Cached tokens matching the current sequence in kv_cache for common-prefix prompt caching.
+    pub cached_prompt_tokens: Vec<usize>,
     // Embedding lookup is on-demand via mmap — see embed_lookup_mmap()
     #[cfg(feature = "llama-ffi")]
     ffi_model: Option<LlamaModel>,
@@ -211,6 +213,7 @@ impl Engine {
             cached_lm_head_size: std::sync::atomic::AtomicUsize::new(0),
             pages_dropped: true,
             seq_offset: 0,
+            cached_prompt_tokens: Vec::new(),
             #[cfg(feature = "llama-ffi")]
             ffi_model: Some(model),
             #[cfg(feature = "llama-ffi")]
@@ -419,6 +422,7 @@ impl Engine {
             cached_tokenizer: std::sync::Mutex::new(None),
             pages_dropped: false,
             seq_offset: 0,
+            cached_prompt_tokens: Vec::new(),
             #[cfg(feature = "llama-ffi")]
             ffi_model: None,
             #[cfg(feature = "llama-ffi")]
@@ -626,23 +630,60 @@ impl Engine {
         self.generate_native(tokens, max_tokens, temperature, top_p)
     }
 
-    pub fn generate_native(&mut self, tokens: &[usize], max_tokens: usize, temperature: f32, top_p: f32) -> Vec<usize> {
-        self.kv_cache.clear();
-        self.ssm_cache.clear();
-        self.deltanet_cache.clear();
-        self.seq_offset = 0;
+    /// Evaluates prompt tokens with common-prefix caching across turns (inspired by llama.cpp).
+    /// Reuses matching prefix from `self.cached_prompt_tokens` and evaluates only uncached tokens.
+    fn prefill_with_prefix_cache(&mut self, tokens: &[usize]) -> Result<Vec<f32>, String> {
+        let common_prefix = if self.kv_cache.is_empty() {
+            0
+        } else {
+            tokens
+                .iter()
+                .zip(&self.cached_prompt_tokens)
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
 
-        // Prefill
-        let logits = match self.forward_native(tokens) {
+        // Determine how many tokens can be retained from cache.
+        // We must evaluate at least 1 token to compute the new logits.
+        let (keep_len, tokens_to_eval) = if common_prefix > 0 && common_prefix == tokens.len() {
+            // All tokens cached: re-evaluate last token to obtain fresh logits
+            let keep = common_prefix.saturating_sub(1);
+            (keep, &tokens[keep..])
+        } else if common_prefix > 0 {
+            (common_prefix, &tokens[common_prefix..])
+        } else {
+            self.kv_cache.clear();
+            self.ssm_cache.clear();
+            self.deltanet_cache.clear();
+            (0, tokens)
+        };
+
+        if keep_len > 0 {
+            self.kv_cache.truncate(keep_len);
+            self.cached_prompt_tokens.truncate(keep_len);
+        } else {
+            self.cached_prompt_tokens.clear();
+        }
+        self.seq_offset = keep_len;
+
+        let logits = self.forward_native(tokens_to_eval)?;
+        self.seq_offset = tokens.len();
+        self.cached_prompt_tokens = tokens.to_vec();
+        Ok(logits)
+    }
+
+    pub fn generate_native(&mut self, tokens: &[usize], max_tokens: usize, temperature: f32, top_p: f32) -> Vec<usize> {
+        // Prefill with cross-turn prefix caching
+        let logits = match self.prefill_with_prefix_cache(tokens) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("Forward pass failed: {}", e);
                 return vec![];
             }
         };
-        self.seq_offset = tokens.len();
         let mut next_token = sample_top_p(&logits, temperature, top_p);
         let mut generated = vec![next_token];
+        self.cached_prompt_tokens.push(next_token);
 
         if next_token == self.config.eos_token {
             return generated;
@@ -650,7 +691,7 @@ impl Engine {
 
         // Decode loop
         for _ in 0..max_tokens - 1 {
-            let mut logits = match self.forward_native(&[next_token]) {
+            let logits = match self.forward_native(&[next_token]) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("Forward pass failed: {}", e);
@@ -661,6 +702,7 @@ impl Engine {
 
             next_token = sample_top_p(&logits, temperature, top_p);
             generated.push(next_token);
+            self.cached_prompt_tokens.push(next_token);
 
             if next_token == self.config.eos_token {
                 break;
@@ -723,25 +765,20 @@ impl Engine {
     where
         F: FnMut(usize, &str) -> bool,
     {
-        self.kv_cache.clear();
-        self.ssm_cache.clear();
-        self.deltanet_cache.clear();
-        self.seq_offset = 0;
-
-        // Prefill
-        let logits = match self.forward_native(tokens) {
+        // Prefill with cross-turn prefix caching
+        let logits = match self.prefill_with_prefix_cache(tokens) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("Forward pass failed: {}", e);
                 return vec![];
             }
         };
-        self.seq_offset = tokens.len();
         let mut next_token = sample_top_p(&logits, temperature, top_p);
         let mut generated = vec![next_token];
+        self.cached_prompt_tokens.push(next_token);
 
         // Streaming UTF-8 byte buffer: joins multi-byte chars split across
-        // byte-level tokens so emoji etc. aren't emitted as lossy `�`.
+        // byte-level tokens so emoji etc. aren't emitted as lossy ``.
         let mut pending_bytes: Vec<u8> = Vec::new();
 
         // First token — call the callback before recording into anti-doom
@@ -761,7 +798,7 @@ impl Engine {
         }
 
         for _ in 0..max_tokens - 1 {
-            let mut logits = match self.forward_native(&[next_token]) {
+            let logits = match self.forward_native(&[next_token]) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("Forward pass failed: {}", e);
@@ -772,6 +809,7 @@ impl Engine {
 
             next_token = sample_top_p(&logits, temperature, top_p);
             generated.push(next_token);
+            self.cached_prompt_tokens.push(next_token);
 
             if !self.emit_stream_token(next_token, &mut pending_bytes, &mut on_token) {
                 break;
@@ -785,6 +823,13 @@ impl Engine {
             };
             if is_stop {
                 break;
+            }
+        }
+
+        // Flush any remaining partial bytes if valid UTF-8
+        if !pending_bytes.is_empty() {
+            if let Ok(s) = std::str::from_utf8(&pending_bytes) {
+                let _ = on_token(next_token, s);
             }
         }
 
@@ -962,8 +1007,7 @@ impl Engine {
                 Some("1") | Some("true") => true,
                 _ => {
                     let total_ram = crate::detect::probe_hardware().ram_total_mb;
-                    let model_mb = (self.model.file.file_size_bytes() / (1024 * 1024)) as u64;
-                    total_ram >= model_mb
+                    total_ram >= 4096
                 }
             };
             let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<std::sync::Arc<HashMap<String, Tensor>>, String>>> =

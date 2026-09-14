@@ -85,6 +85,29 @@ impl KVCache {
             .map(|e| e.shape.get(0).copied().unwrap_or(0))
             .unwrap_or(0)
     }
+
+    /// True if cache is empty or has zero sequence length.
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty() || self.total_seq_len() == 0
+    }
+
+    /// Truncate cached sequence length across all layers to `max_seq_len`.
+    /// Preserves existing keys and values up to `max_seq_len` without reallocation.
+    pub fn truncate(&mut self, max_seq_len: usize) {
+        for entry in self.layers.values_mut() {
+            if entry.shape.is_empty() {
+                continue;
+            }
+            let cur_seq_len = entry.shape[0];
+            if cur_seq_len > max_seq_len {
+                let stride = entry.shape[1..].iter().product::<usize>();
+                let new_len = max_seq_len * stride;
+                entry.k.truncate(new_len);
+                entry.v.truncate(new_len);
+                entry.shape[0] = max_seq_len;
+            }
+        }
+    }
 }
 
 impl Tensor {
@@ -176,5 +199,34 @@ mod tests {
         assert_eq!(k_out.shape, vec![2, 1, 2]);
         assert_eq!(k_out.data, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(v_out.data, vec![0.5, 1.5, 2.5, 3.5]);
+    }
+
+    #[test]
+    fn test_kv_cache_truncate_prefix() {
+        let mut cache = KVCache::new(2);
+        let k1 = Tensor::from_vec(vec![1.0f32, 2.0], vec![1, 1, 2]);
+        let v1 = Tensor::from_vec(vec![0.1f32, 0.2], vec![1, 1, 2]);
+        let k2 = Tensor::from_vec(vec![3.0f32, 4.0], vec![1, 1, 2]);
+        let v2 = Tensor::from_vec(vec![0.3f32, 0.4], vec![1, 1, 2]);
+        let k3 = Tensor::from_vec(vec![5.0f32, 6.0], vec![1, 1, 2]);
+        let v3 = Tensor::from_vec(vec![0.5f32, 0.6], vec![1, 1, 2]);
+
+        cache.append(0, k1, v1);
+        cache.append(0, k2, v2);
+        cache.append(0, k3, v3);
+        assert_eq!(cache.total_seq_len(), 3);
+
+        // Truncate to 2 tokens (retaining tokens 1 and 2)
+        cache.truncate(2);
+        assert_eq!(cache.total_seq_len(), 2);
+        let (k_out, v_out) = cache.get(0).unwrap();
+        assert_eq!(k_out.shape, vec![2, 1, 2]);
+        assert_eq!(k_out.data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(v_out.data, vec![0.1, 0.2, 0.3, 0.4]);
+
+        // Truncate to 0
+        cache.truncate(0);
+        assert_eq!(cache.total_seq_len(), 0);
+        assert!(cache.is_empty());
     }
 }

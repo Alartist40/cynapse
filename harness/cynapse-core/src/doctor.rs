@@ -71,7 +71,10 @@ impl CynapseDoctor {
         // Check 1: Host Hardware & Memory Safety Headroom
         items.push(self.check_hardware_ram());
 
-        // Check 2: SIMD Acceleration Capabilities
+        // Check 2: GPU & Hardware Acceleration
+        items.push(self.check_gpu_acceleration());
+
+        // Check 3: SIMD Acceleration Capabilities
         items.push(self.check_simd_capabilities());
 
         // Check 3: Model Storage Directory & GGUF Header Integrity
@@ -123,20 +126,12 @@ impl CynapseDoctor {
         let avail_ram_mb = hw.ram_avail_mb;
         let total_ram_mb = hw.ram_total_mb;
 
-        if avail_ram_mb >= 8000 {
+        if avail_ram_mb >= 3000 || total_ram_mb >= 12000 {
             DoctorItem {
                 subsystem: "Hardware".into(),
                 check_name: "Host RAM & Safety Headroom".into(),
                 status: DoctorStatus::Pass,
-                detail: format!("Total RAM: {} MB | Available: {} MB (Sufficient for medium/large models with up to 8GB reserve)", total_ram_mb, avail_ram_mb),
-                fix_recommendation: None,
-            }
-        } else if avail_ram_mb >= 3000 {
-            DoctorItem {
-                subsystem: "Hardware".into(),
-                check_name: "Host RAM & Safety Headroom".into(),
-                status: DoctorStatus::Pass,
-                detail: format!("Total RAM: {} MB | Available: {} MB (Sufficient for 0.5B-7B models; 35B+ uses Tier 2 layer streaming)", total_ram_mb, avail_ram_mb),
+                detail: format!("Total RAM: {} MB | Available: {} MB (Sufficient for 0.5B-9B Tier 1 models; 35B+ uses Tier 2 layer streaming)", total_ram_mb, avail_ram_mb),
                 fix_recommendation: None,
             }
         } else if avail_ram_mb >= 1000 {
@@ -154,6 +149,27 @@ impl CynapseDoctor {
                 status: DoctorStatus::Failed,
                 detail: format!("Critical low RAM! Available: {} MB (Minimum 1.0GB needed).", avail_ram_mb),
                 fix_recommendation: Some("Free memory or enable swap space before running LLM models.".into()),
+            }
+        }
+    }
+
+    fn check_gpu_acceleration(&self) -> DoctorItem {
+        let gpu = cynapse_engine::detect_gpu_info();
+        if gpu != "CPU Tier (Host RAM)" {
+            DoctorItem {
+                subsystem: "GPU / Hardware".into(),
+                check_name: "Hardware Acceleration & GPU".into(),
+                status: DoctorStatus::Pass,
+                detail: format!("Detected GPU device: {}", gpu),
+                fix_recommendation: None,
+            }
+        } else {
+            DoctorItem {
+                subsystem: "GPU / Hardware".into(),
+                check_name: "Hardware Acceleration & GPU".into(),
+                status: DoctorStatus::Pass,
+                detail: "CPU host execution active (AVX2 SIMD fallback).".into(),
+                fix_recommendation: None,
             }
         }
     }

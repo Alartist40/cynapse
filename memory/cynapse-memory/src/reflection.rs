@@ -118,10 +118,19 @@ impl ReflectionWorker {
         let node_id = deterministic_reflection_id(&full_transcript);
         let title = format!("Reflected Memory {}", &node_id[..16.min(node_id.len())]);
 
-        let node_type = if full_transcript.contains("how to") || full_transcript.contains("procedure") {
-            NodeType::Procedure
+        let lower = full_transcript.to_lowercase();
+        let error_signals = ["error", "failed", "bug:", "fix ", "exception", "panic!", "resolved", "issue"];
+        let proc_signals = ["how to", "procedure", "step 1", "step 2", "steps:", "workflow:", "recipe", "commands:"];
+
+        let error_score: usize = error_signals.iter().filter(|&&sig| lower.contains(sig)).count();
+        let proc_score: usize = proc_signals.iter().filter(|&&sig| lower.contains(sig)).count();
+
+        let (node_type, tag) = if error_score > 0 && error_score >= proc_score {
+            (NodeType::Lesson, "#lesson")
+        } else if proc_score > 0 {
+            (NodeType::Procedure, "#procedure")
         } else {
-            NodeType::AtomicFact
+            (NodeType::AtomicFact, "#fact")
         };
 
         let node = graph.upsert(
@@ -129,7 +138,7 @@ impl ReflectionWorker {
             &title,
             &full_transcript,
             node_type,
-            Some(vec!["#reflection".into()]),
+            Some(vec!["#reflection".into(), tag.into()]),
         );
 
         if let Some(s) = &store {
@@ -150,5 +159,44 @@ impl ReflectionWorker {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_reflection_distills_lesson_on_error() {
+        let graph = Arc::new(Dendrite::new());
+        let messages = vec![
+            Message::text(Role::User, "Cargo build failed with borrow checker error"),
+            Message::text(Role::Assistant, "The fix is to clone the Arc before the spawn."),
+        ];
+
+        let res = ReflectionWorker::do_reflection(graph.clone(), None, &messages).await;
+        assert!(res.is_ok());
+
+        let all = graph.all();
+        let lesson_node = all.iter().find(|n| n.node_type == NodeType::Lesson);
+        assert!(lesson_node.is_some(), "Expected a Lesson node to be distilled from error resolution");
+        let lesson = lesson_node.unwrap();
+        assert!(lesson.tags.contains(&"#lesson".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_distills_procedure_on_steps() {
+        let graph = Arc::new(Dendrite::new());
+        let messages = vec![
+            Message::text(Role::User, "how to deploy cynapse mini to production?"),
+            Message::text(Role::Assistant, "Follow this procedure: step 1 run tests, step 2 build release."),
+        ];
+
+        let res = ReflectionWorker::do_reflection(graph.clone(), None, &messages).await;
+        assert!(res.is_ok());
+
+        let all = graph.all();
+        let proc_node = all.iter().find(|n| n.node_type == NodeType::Procedure);
+        assert!(proc_node.is_some(), "Expected a Procedure node to be distilled from procedural steps");
     }
 }

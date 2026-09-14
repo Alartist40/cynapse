@@ -60,15 +60,15 @@ pub const CURATED_MODELS_CATALOG: &[CuratedModelDef] = &[
         family: "qwen",
     },
     CuratedModelDef {
-        id: "ministral-8b",
-        name: "Ministral 8B Instruct",
-        repo_url: "mistralai/Ministral-8B-Instruct-2410",
-        filename: "ministral-8b-instruct-q4_k_m.gguf",
-        size_str: "4.9 GB",
-        min_ram_gb: 10,
-        recommended_ram_gb: 16,
-        description: "High performance dense model with long context window",
-        family: "mistral",
+        id: "llama-3.2-1b",
+        name: "Llama 3.2 1B Instruct",
+        repo_url: "bartowski/Llama-3.2-1B-Instruct-GGUF",
+        filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        size_str: "800 MB",
+        min_ram_gb: 4,
+        recommended_ram_gb: 6,
+        description: "Meta lightweight mobile-optimized instruction model",
+        family: "llama",
     },
     CuratedModelDef {
         id: "qwen2.5-7b",
@@ -82,15 +82,15 @@ pub const CURATED_MODELS_CATALOG: &[CuratedModelDef] = &[
         family: "qwen",
     },
     CuratedModelDef {
-        id: "gemma-4-12b",
-        name: "Gemma 4 12B Instruct QAT",
-        repo_url: "unsloth/gemma-4-12B-it-qat-GGUF",
-        filename: "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
-        size_str: "6.7 GB",
-        min_ram_gb: 16,
-        recommended_ram_gb: 24,
-        description: "Deep reasoning model with quantization-aware training",
-        family: "gemma",
+        id: "llama-3.2-3b",
+        name: "Llama 3.2 3B Instruct",
+        repo_url: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+        filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        size_str: "2.2 GB",
+        min_ram_gb: 8,
+        recommended_ram_gb: 12,
+        description: "Meta compact 3B instruction following model",
+        family: "llama",
     },
 ];
 
@@ -300,6 +300,7 @@ where
         }
     }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GgufHeaderInfo {
     pub magic: String,
@@ -310,6 +311,7 @@ pub struct GgufHeaderInfo {
 }
 
 /// Quick GGUF header inspector reading magic bytes and metadata counts.
+#[allow(dead_code)]
 pub fn inspect_gguf_header(path: &Path) -> Result<GgufHeaderInfo> {
     let mut file = File::open(path)?;
     let mut magic_bytes = [0u8; 4];

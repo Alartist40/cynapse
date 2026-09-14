@@ -228,7 +228,8 @@ impl DendriteStore {
             let node = node.context("reading node row")?;
             graph.insert_hydrated(node);
         }
-        graph.simulate_forces(20);
+        // Single light relaxation pass on DB load to pin core without startup lag
+        graph.simulate_forces(1);
         Ok(())
     }
 
@@ -278,17 +279,17 @@ impl DendriteStore {
             }
         }
 
-        // Fallback: LIKE-based search across title/content/tags.
-        // Escape SQL LIKE special characters so user input doesn't break
-        // the pattern or allow injection.
+        // Fallback: LIKE-based search across core dendrite_nodes (title, content, tags).
+        // Escape SQL LIKE special characters so user input doesn't break pattern.
         let pattern = format!(
             "%{}%",
             query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
         );
         let mut stmt = conn.prepare(
             r#"
-            SELECT id FROM dendrite_fts_fallback
+            SELECT id FROM dendrite_nodes
             WHERE title LIKE ? OR content LIKE ? OR tags LIKE ?
+            ORDER BY updated_at DESC
             LIMIT ?
             "#,
         )?;

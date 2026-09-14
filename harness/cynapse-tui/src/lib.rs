@@ -150,7 +150,14 @@ impl TuiSession {
         }
         if !found_files.is_empty() {
             if self.active_model_name == "ministral-3:3b" || !found_files.contains(&self.active_model_name) {
-                self.active_model_name = found_files[0].clone();
+                let preferred = found_files.iter().find(|f| {
+                    let fl = f.to_lowercase();
+                    fl.contains("9b") || fl.contains("8b") || fl.contains("7b") || fl.contains("3b")
+                });
+                self.active_model_name = preferred.unwrap_or(&found_files[0]).clone();
+            }
+            if let Some((_, resolved_path)) = self.resolve_model_by_name_or_index(&self.active_model_name) {
+                self.active_model_path = resolved_path;
             }
         }
     }
@@ -166,6 +173,51 @@ impl TuiSession {
         } else {
             "GGUF".to_string()
         }
+    }
+
+    pub fn resolve_model_by_name_or_index(&self, target: &str) -> Option<(String, PathBuf)> {
+        let trimmed = target.trim();
+        let mut models = Vec::new();
+        let search_dirs = [self.models_dir.clone(), PathBuf::from("./models")];
+
+        for dir in &search_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                            if (ext == "gguf" || ext == "safetensors" || ext == "bin") && path.file_name().unwrap() != "README.md" {
+                                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                                if !models.iter().any(|(n, _)| n == &name) {
+                                    models.push((name, path));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(num) = trimmed.parse::<usize>() {
+            if num >= 1 && num <= models.len() {
+                return Some(models[num - 1].clone());
+            }
+        }
+
+        let lower = trimmed.to_lowercase();
+        for (name, path) in &models {
+            if name.to_lowercase() == lower || name.to_lowercase().contains(&lower) {
+                return Some((name.clone(), path.clone()));
+            }
+        }
+
+        let direct = PathBuf::from(trimmed);
+        if direct.exists() && direct.is_file() {
+            let fname = direct.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| trimmed.to_string());
+            return Some((fname, direct));
+        }
+
+        None
     }
 
     pub fn list_models(&self) {
@@ -360,7 +412,19 @@ impl TuiSession {
             println!("\n{}", "⚙️ Generating stream...".dimmed());
             let mut current_type: Option<TokenType> = None;
 
-            let system_prompt = self.dendrite_ctx.build_prompt(trimmed, 4000);
+            let is_conversational = cynapse_memory::context::is_conversational_query(trimmed);
+            let persona_dir = cynapse_core::persona::PersonaManager::default_dir();
+            let persona_mgr = cynapse_core::persona::PersonaManager::new(&persona_dir)
+                .unwrap_or_else(|_| cynapse_core::persona::PersonaManager::new("./persona").unwrap());
+            let persona_prompt = persona_mgr.build_system_prompt();
+            let system_prompt = if is_conversational {
+                cynapse_core::offline_agent::compile_conversational_prefix(&persona_prompt)
+            } else {
+                cynapse_core::offline_agent::compile_zone_a_prefix(&persona_prompt)
+            };
+
+            let mut full_response = String::new();
+            let mut full_thinking = String::new();
 
             let stats_res = query_tier1_stream(
                 &self.tier1_endpoint,
@@ -381,9 +445,11 @@ impl TuiSession {
                     }
                     match ttype {
                         TokenType::Thinking => {
+                            full_thinking.push_str(token);
                             print!("{}", token.dimmed().purple());
                         }
                         TokenType::Response => {
+                            full_response.push_str(token);
                             print!("{}", token);
                         }
                     }
@@ -391,6 +457,84 @@ impl TuiSession {
                 },
             )
             .await;
+
+            // Offline Agent: GBNF tool call check & execution in CLI mode
+            if let Ok(tool_call) = cynapse_core::offline_agent::validate_gbnf_tool_call(&full_response)
+                .or_else(|_| cynapse_core::offline_agent::validate_gbnf_tool_call(&full_thinking))
+            {
+                println!("\n{}", format!("🔧 Detected Tool Call: `{}`", tool_call.name).yellow().bold());
+                let (arg1, arg2): (String, Option<String>) = match tool_call.name.as_str() {
+                    "write_file" => {
+                        let path = tool_call.arguments.get("path")
+                            .or_else(|| tool_call.arguments.get("file"))
+                            .or_else(|| tool_call.arguments.get("filename"))
+                            .or_else(|| tool_call.arguments.get("filepath"))
+                            .or_else(|| tool_call.arguments.get("arg1"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let content = tool_call.arguments.get("content")
+                            .or_else(|| tool_call.arguments.get("text"))
+                            .or_else(|| tool_call.arguments.get("body"))
+                            .or_else(|| tool_call.arguments.get("data"))
+                            .or_else(|| tool_call.arguments.get("arg2"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        (path.to_string(), content)
+                    }
+                    "read_file" => {
+                        let path = tool_call.arguments.get("path")
+                            .or_else(|| tool_call.arguments.get("file"))
+                            .or_else(|| tool_call.arguments.get("filename"))
+                            .or_else(|| tool_call.arguments.get("filepath"))
+                            .or_else(|| tool_call.arguments.get("arg1"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        (path.to_string(), None)
+                    }
+                    "grep" => {
+                        let pattern = tool_call.arguments.get("pattern")
+                            .or_else(|| tool_call.arguments.get("query"))
+                            .or_else(|| tool_call.arguments.get("regex"))
+                            .or_else(|| tool_call.arguments.get("arg1"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let dir = tool_call.arguments.get("dir")
+                            .or_else(|| tool_call.arguments.get("path"))
+                            .or_else(|| tool_call.arguments.get("directory"))
+                            .or_else(|| tool_call.arguments.get("arg2"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        (pattern.to_string(), dir)
+                    }
+                    "execute_command" => {
+                        let cmd = tool_call.arguments.get("command")
+                            .or_else(|| tool_call.arguments.get("cmd"))
+                            .or_else(|| tool_call.arguments.get("script"))
+                            .or_else(|| tool_call.arguments.get("arg1"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        (cmd.to_string(), None)
+                    }
+                    _ => {
+                        let a1 = tool_call.arguments.get("path")
+                            .or_else(|| tool_call.arguments.get("query"))
+                            .or_else(|| tool_call.arguments.get("command"))
+                            .or_else(|| tool_call.arguments.get("arg1"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let a2 = tool_call.arguments.get("content")
+                            .or_else(|| tool_call.arguments.get("dir"))
+                            .or_else(|| tool_call.arguments.get("arg2"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        (a1.to_string(), a2)
+                    }
+                };
+                match cynapse_core::execute_tool(&tool_call.name, &arg1, arg2.as_deref()) {
+                    Ok(out) => println!("{}", format!("✓ Tool executed successfully:\n{}", out).green()),
+                    Err(e) => println!("{}", format!("❌ Tool error: {}", e).red()),
+                }
+            }
 
             match stats_res {
                 Ok(stats) => {

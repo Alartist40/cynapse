@@ -2,7 +2,7 @@
 
 **Cynapse** is a high-performance, offline-first AI agent platform engineered entirely in 100% pure Rust. Designed for total privacy, zero external runtime dependencies, and instant local execution, it bridges host hardware telemetry with an intelligent multi-engine router and a dynamic, synaptic knowledge graph.
 
-At the heart of Cynapse lies a unified architecture where three powerful engines work in concert: **Dendrite**, a 4-tier graph memory system powered by SQLite FTS5 full-text indexing and BM25 relevance ranking that organically grows and adapts like biological synapses; **Leafcutter**, a custom pure-Rust GGUF and Safetensors execution core providing local tensor streaming; and **llama.cpp / Ollama integration**, acting as a high-speed Tier-1 inference runner. Together, these subsystems provide a complete local agent harness capable of autonomous tool execution, strict GBNF grammar constrained outputs, real-time memory synthesis, 3D orbital galaxy memory visualization, and self-healing diagnostics—all running locally on your hardware without a single byte leaving your machine.
+At the heart of Cynapse lies a unified architecture where three powerful engines work in concert: **Dendrite**, a force-directed 3D graph memory system with Coulomb/Hooke physics, SQLite FTS5 full-text indexing, and BM25 relevance ranking; **Leafcutter**, a custom pure-Rust GGUF and Safetensors execution core providing local tensor streaming with KV cache trunk reservation; and **llama.cpp / Ollama integration**, acting as a high-speed Tier-1 HTTP inference runner with NDJSON streaming. Together, these subsystems provide a complete local agent harness capable of autonomous tool execution, strict GBNF grammar constrained outputs, real-time memory synthesis, 3D orbital galaxy memory visualization, and self-healing diagnostics—all running locally on your hardware without a single byte leaving your machine.
 
 ---
 
@@ -104,8 +104,8 @@ cynapse-mini/
       ▼                                                        ▼
 [ Hardware Tier Router ] ◄───────────────────────── [ Injected System Prompt ]
       │
-      ├─────► Tier 1 (Fast): llama.cpp / Ollama HTTP Stream
-      ├─────► Tier 2 (GGUF): Leafcutter Rust Tensor Core
+      ├─────► Tier 1 (Fast): llama.cpp / Ollama NDJSON Stream (HTTP-first)
+      ├─────► Tier 2 (GGUF): Leafcutter Rust Tensor Core (KV trunk reservation)
       └─────► Tier 3 (Safetensor): Leafcutter Rust Core
       │
       ▼
@@ -122,8 +122,9 @@ cynapse-mini/
 ## 🌟 Capabilities, Specs & Features
 
 ### 🧠 Synaptic Memory & 3D Galaxy Memory Atlas
-Memory in Cynapse is modeled after biological neural networks. Ideas, facts, and conversation turn logs form nodes connected by weighted synaptic links that strengthen with use and decay with disuse over time.
-- **3D Orbital Galaxy Visualizer (`/memory`)**: Visualizes memory nodes as stars organized into galactic clusters revolving around a supermassive central core of knowledge. Categories (Personal, Engineering, Preferences, Meta, Episodic) orbit in colorful stellar belts. Node size dynamically scales with entropy-based specialization metrics.
+Memory in Cynapse is modeled after biological neural networks with a force-directed 3D physics engine. Ideas, facts, and conversation turn logs form nodes connected by weighted synaptic links that strengthen with use and decay with disuse over time.
+- **Force-Directed 3D Galaxy Physics**: Real Coulomb repulsion, Hooke spring attraction, central gravity toward the supermassive core, velocity damping (0.88), collision avoidance, and force clamping. Nodes have spatial coordinates (x, y, z) and velocity vectors (vx, vy, vz) with mass computed from tier, spec_index, and connectivity.
+- **3D Orbital Galaxy Visualizer (`/memory`)**: Visualizes memory nodes as stars organized into galactic clusters revolving around a supermassive central core. Nodes are mass-scaled glyphs (★/✦/●) with full filament edge lines drawn in 3D space. Categories (Personal, Engineering, Preferences, Meta, Episodic) orbit in colorful stellar belts.
 - **Two-Tier Hybrid Memory Recall**: Merges SQLite FTS5 keyword matching with BM25 scoring, specialization index weighting, and exponential temporal decay ($\gamma^{\Delta t}$).
 - **Interactive Memory Drawer (`Tab`)**: Inspect, search, and purge individual memory nodes directly from a pop-up overlay.
 
@@ -133,8 +134,9 @@ Memory in Cynapse is modeled after biological neural networks. Ideas, facts, and
 - **Background Async Progress**: Non-blocking Tokio downloader streams models directly to storage with real-time speed (`MB/s`), progress bars, and automatic activation upon completion.
 
 ### 🛡️ Offline Agent Capabilities & GBNF Grammar Engine
+- **NDJSON Streaming**: Polymorphic streaming parser supporting multiple API formats (Ollama `.response`, vLLM `.choices[0].delta.content`, generic `.content`, `.message.content`, `.choices[0].text`). Handles SSE `data:` prefix stripping, `[DONE]` termination, and 64KB read buffers.
 - **GBNF Grammar Constraints**: Enforces valid JSON tool-call schema syntax, preventing output formatting panics offline.
-- **KV-Cache Slot Preservation**: Reuses prompt prefix KV-caches across conversation turns for near-zero prefix evaluation latency.
+- **KV-Cache Trunk Reservation**: KV cache + activations + LM head reserved before layer cache in trunk-first budgeting, preventing KV spill on large models.
 - **Loop Guard Protection**: Active circular buffer detects and halts non-progressing repeated tool execution loops.
 - **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 5`) to prevent runaway recursive tool execution cycles.
 
@@ -143,7 +145,7 @@ Memory in Cynapse is modeled after biological neural networks. Ideas, facts, and
 - **Dynamic Prompt Compiler**: Injects direct, high-character system instructions into every model prompt without generic LLM headers or preambles.
 
 ### 🩺 Cynapse Doctor Self-Healing Engine (`/doctor`)
-- **9-Subsystem Auditing**: Audits host RAM headroom, SIMD instruction availability (AVX2 + FMA), GGUF magic headers (`0x46554747`), SQLite database health (`PRAGMA quick_check;`), GBNF grammar parser, local host tools (`bash`, `git`), async Tokio runtimes, and the Markdown Persona Subsystem.
+- **11-Subsystem Auditing**: Audits host RAM headroom, SIMD instruction availability (AVX2 + FMA), GGUF magic headers (`0x46554747`), SQLite database health (`PRAGMA quick_check;`), GBNF grammar parser, local host tools (`bash`, `git`), async Tokio runtimes, Markdown Persona Subsystem, HuggingFace API connectivity, endpoint health, and model availability.
 - **Auto-Fix Mode (`--fix`)**: Automatically recreates missing directories (`~/.cynapse/persona`), repairs database indexes, clears stale scratch files, and updates configuration paths.
 
 ### 🎨 Visual Themes & UI Experience

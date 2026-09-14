@@ -52,6 +52,8 @@ pub enum NodeType {
     Project,
     /// Procedural skill or workflow (L2)
     Procedure,
+    /// Rule or operational lesson learned from errors or corrections (L2)
+    Lesson,
     /// Something that happened / event (L1)
     Event,
     /// Atomic fact or preference (L1)
@@ -72,6 +74,7 @@ impl NodeType {
             NodeType::Concept => "concept",
             NodeType::Project => "project",
             NodeType::Procedure => "procedure",
+            NodeType::Lesson => "lesson",
             NodeType::Event => "event",
             NodeType::AtomicFact => "atomic_fact",
             NodeType::TurnLog => "turn_log",
@@ -87,7 +90,7 @@ impl NodeType {
     pub fn tier(&self) -> u8 {
         match self {
             NodeType::TurnLog => 0,
-            NodeType::AtomicFact | NodeType::Memory | NodeType::Event | NodeType::Person => 1,
+            NodeType::AtomicFact | NodeType::Lesson | NodeType::Memory | NodeType::Event | NodeType::Person => 1,
             NodeType::Procedure | NodeType::Project | NodeType::Concept => 2,
             NodeType::Identity => 3,
             NodeType::Custom => 1,
@@ -101,6 +104,7 @@ impl NodeType {
             "concept" => NodeType::Concept,
             "project" => NodeType::Project,
             "procedure" => NodeType::Procedure,
+            "lesson" => NodeType::Lesson,
             "event" => NodeType::Event,
             "atomic_fact" => NodeType::AtomicFact,
             "turn_log" => NodeType::TurnLog,
@@ -180,7 +184,7 @@ impl Node {
             if t.contains("pref") || t.contains("like") || t.contains("favorite") || t.contains("food") || t.contains("book") || t.contains("color") {
                 return NodeCategory::Preferences;
             }
-            if t.contains("code") || t.contains("rust") || t.contains("arch") || t.contains("procedure") || t.contains("project") || t.contains("concept") {
+            if t.contains("code") || t.contains("rust") || t.contains("arch") || t.contains("procedure") || t.contains("lesson") || t.contains("project") || t.contains("concept") {
                 return NodeCategory::Engineering;
             }
             if t.contains("fact") || t.contains("person") || t.contains("user") {
@@ -189,7 +193,7 @@ impl Node {
         }
         match self.node_type {
             NodeType::Person | NodeType::AtomicFact => NodeCategory::Personal,
-            NodeType::Procedure | NodeType::Project | NodeType::Concept => NodeCategory::Engineering,
+            NodeType::Procedure | NodeType::Lesson | NodeType::Project | NodeType::Concept => NodeCategory::Engineering,
             NodeType::Event | NodeType::Memory => NodeCategory::Episodic,
             NodeType::Identity => NodeCategory::Meta,
             NodeType::TurnLog => NodeCategory::Transient,
@@ -317,6 +321,13 @@ impl Dendrite {
     /// backlink recalculation because backlinks are already stored.
     pub fn insert_hydrated(&self, mut node: Node) {
         node.mass = node.compute_mass();
+        if node.x == 0.0 && node.y == 0.0 && node.z == 0.0 && node.node_type != NodeType::Identity {
+            let arm = Self::category_cluster_arm(&node.category());
+            let hash = node.id.len() as f32;
+            node.x = arm.0 + (hash % 3.0 - 1.0) * 0.4;
+            node.y = arm.1 + (hash % 2.0 - 0.5) * 0.3;
+            node.z = arm.2 + (hash % 4.0 - 2.0) * 0.4;
+        }
         lock_inner(&self.inner).nodes.insert(node.id.clone(), node);
     }
 
@@ -344,7 +355,7 @@ impl Dendrite {
             if let Some(nb) = inner.nodes.get_mut(node_b) {
                 nb.vx -= (dx / dist) * force;
                 nb.vy -= (dy / dist) * force;
-                nb.vz += (dz / dist) * force;
+                nb.vz -= (dz / dist) * force;
             }
         }
     }
@@ -396,9 +407,32 @@ impl Dendrite {
                 n.clone()
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let count = e.key().len() + total_nodes;
-                let initial_radius = 8.0 + (count % 5) as f32 * 2.0;
-                let initial_angle = count as f32 * 1.6;
+                let count = total_nodes;
+                let cat = {
+                    let temp = Node {
+                        id: String::new(),
+                        title: String::new(),
+                        content: String::new(),
+                        node_type,
+                        tags: tags.clone(),
+                        links: Vec::new(),
+                        backlinks: Vec::new(),
+                        created_at: 0,
+                        updated_at: 0,
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                        vx: 0.0,
+                        vy: 0.0,
+                        vz: 0.0,
+                        mass: 1.0,
+                    };
+                    temp.category()
+                };
+                let arm = Self::category_cluster_arm(&cat);
+                let jitter_angle = (count as f32 * 2.39996) % (2.0 * std::f32::consts::PI);
+                let jitter_r = ((count % 5) as f32 - 2.0) * 0.35;
+                let jitter_y = ((count % 3) as f32 - 1.0) * 0.25;
                 let mut n = Node {
                     id: id.to_string(),
                     title: title.to_string(),
@@ -409,9 +443,9 @@ impl Dendrite {
                     backlinks: Vec::new(),
                     created_at: now,
                     updated_at: now,
-                    x: initial_radius * initial_angle.cos(),
-                    y: ((count % 3) as f32 - 1.0) * 2.5,
-                    z: initial_radius * initial_angle.sin(),
+                    x: arm.0 + jitter_r * jitter_angle.cos(),
+                    y: arm.1 + jitter_y,
+                    z: arm.2 + jitter_r * jitter_angle.sin(),
                     vx: 0.0,
                     vy: 0.0,
                     vz: 0.0,
@@ -433,9 +467,8 @@ impl Dendrite {
             }
         }
 
-        // Run force simulation relaxation pass so the galaxy reorganizes organically
-        Self::simulate_forces_inner(&mut inner, 15);
-
+        // Single light relaxation pass to anchor supermassive core at (0,0,0) and adjust positions
+        Self::simulate_forces_inner(&mut inner, 1);
         drop(inner);
         self.notify();
         node
@@ -455,126 +488,292 @@ impl Dendrite {
         }
 
         inner.nodes.remove(id);
-        Self::simulate_forces_inner(&mut inner, 10);
+        Self::simulate_forces_inner(&mut inner, 15);
         drop(inner);
         self.notify();
         true
     }
 
+/// Canonical orbital arm position for a memory category cluster in 3D space.
+pub fn category_cluster_arm(cat: &NodeCategory) -> (f32, f32, f32) {
+    let (angle_idx, r, y) = match cat {
+        NodeCategory::Meta => (0.0f32, 9.0f32, 0.4f32),
+        NodeCategory::Engineering => (1.0f32, 16.0f32, -0.4f32),
+        NodeCategory::Personal => (2.0f32, 23.0f32, 0.6f32),
+        NodeCategory::Preferences => (3.0f32, 30.0f32, -0.6f32),
+        NodeCategory::Episodic => (4.0f32, 37.0f32, 0.3f32),
+        NodeCategory::Transient => (5.0f32, 42.0f32, -0.3f32),
+    };
+    let angle = angle_idx * (std::f32::consts::PI / 3.0);
+    (r * angle.cos(), y, r * angle.sin())
+}
+
 /// Internal force simulation engine.
-/// Simulates Coulomb repulsion, Hooke spring attraction, central gravity, and damping.
+/// Anchors the supermassive central node (highest mass) at (0, 0, 0),
+/// while memories group into Colibri-style category clusters that orbit around the core.
 fn simulate_forces_inner(inner: &mut DendriteInner, iterations: usize) {
     if inner.nodes.is_empty() {
         return;
     }
 
-    const REPULSION_K: f32 = 60.0;
-    const SPRING_K: f32 = 0.06;
-    const SPRING_REST: f32 = 5.0;
-    const CENTRAL_G: f32 = 0.04;
-    const DAMPING: f32 = 0.88;
-    const DT: f32 = 0.3;
-    const MAX_FORCE: f32 = 12.0;
+    // 1. Identify the supermassive central node (highest mass)
+    let supermassive_id = inner
+        .nodes
+        .values()
+        .max_by(|a, b| a.mass.partial_cmp(&b.mass).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|n| n.id.clone());
 
-    let node_ids: Vec<String> = inner.nodes.keys().cloned().collect();
-    let n = node_ids.len();
+    // Lock central core at origin (0, 0, 0)
+    if let Some(ref core_id) = supermassive_id {
+        if let Some(core) = inner.nodes.get_mut(core_id) {
+            core.x = 0.0;
+            core.y = 0.0;
+            core.z = 0.0;
+            core.vx = 0.0;
+            core.vy = 0.0;
+            core.vz = 0.0;
+        }
+    }
+
+    if inner.nodes.len() == 1 {
+        return;
+    }
 
     for _ in 0..iterations {
+        // 2. Compute dynamic cluster centroids for each category among non-core nodes
+        let mut cat_sums: HashMap<NodeCategory, (f32, f32, f32, f32)> = HashMap::new();
+        for (id, node) in &inner.nodes {
+            if Some(id) == supermassive_id.as_ref() {
+                continue;
+            }
+            let cat = node.category();
+            let entry = cat_sums.entry(cat).or_insert((0.0, 0.0, 0.0, 0.0));
+            entry.0 += node.x;
+            entry.1 += node.y;
+            entry.2 += node.z;
+            entry.3 += 1.0;
+        }
+
+        // Blend category averages with designated orbital arm centroids
+        let mut cluster_centers: HashMap<NodeCategory, (f32, f32, f32)> = HashMap::new();
+        for (cat, (sx, sy, sz, count)) in &cat_sums {
+            let arm = Self::category_cluster_arm(cat);
+            let avg_x = sx / count;
+            let avg_y = sy / count;
+            let avg_z = sz / count;
+            cluster_centers.insert(
+                *cat,
+                (
+                    avg_x * 0.4 + arm.0 * 0.6,
+                    avg_y * 0.4 + arm.1 * 0.6,
+                    avg_z * 0.4 + arm.2 * 0.6,
+                ),
+            );
+        }
+
+        // 3. Compute forces for each non-core node
+        let node_ids: Vec<String> = inner.nodes.keys().cloned().collect();
         let mut forces: HashMap<String, (f32, f32, f32)> = HashMap::new();
         for id in &node_ids {
             forces.insert(id.clone(), (0.0, 0.0, 0.0));
         }
 
-        // 1. Repulsion between all pairs
-        for i in 0..n {
+        // a) Colibri-style Cluster Cohesion & Core Orbit
+        for (id, node) in &inner.nodes {
+            if Some(id) == supermassive_id.as_ref() {
+                continue;
+            }
+            let cat = node.category();
+            let (target_cx, target_cy, target_cz) = cluster_centers
+                .get(&cat)
+                .cloned()
+                .unwrap_or_else(|| Self::category_cluster_arm(&cat));
+
+            // Spring pull towards cluster centroid (Colibri group formation)
+            let cdx = target_cx - node.x;
+            let cdy = target_cy - node.y;
+            let cdz = target_cz - node.z;
+            let c_dist = (cdx * cdx + cdy * cdy + cdz * cdz).sqrt().max(0.1);
+            let cluster_f = 0.12 * c_dist.min(4.0);
+
+            // Core gravity & orbital velocity around (0,0,0)
+            let r_sq = node.x * node.x + node.z * node.z;
+            let r = r_sq.sqrt().max(0.5);
+
+            // Minimum clearance from central core (keep center clear for biggest memory)
+            let core_repulsion = if r < 3.0 { (3.0 - r) * 0.4 } else { 0.0 };
+
+            // Tangential orbital velocity (clockwise rotation around Y-axis)
+            let tangent_x = -node.z / r;
+            let tangent_z = node.x / r;
+            let orbital_drift = 0.08;
+
+            if let Some(f) = forces.get_mut(id) {
+                f.0 += (cdx / c_dist) * cluster_f + (node.x / r) * core_repulsion + tangent_x * orbital_drift;
+                f.1 += (cdy / c_dist) * cluster_f * 0.6;
+                f.2 += (cdz / c_dist) * cluster_f + (node.z / r) * core_repulsion + tangent_z * orbital_drift;
+            }
+        }
+
+        // b) Colibri Concept Similarity Attraction (Nodes sharing tags or categories pull together)
+        let count = node_ids.len();
+        for i in 0..count {
             let id1 = &node_ids[i];
-            let n1 = match inner.nodes.get(id1) {
-                Some(node) => node,
+            if Some(id1) == supermassive_id.as_ref() {
+                continue;
+            }
+            let (n1_tags, n1_cat, n1_pos) = match inner.nodes.get(id1) {
+                Some(n) => (&n.tags, n.category(), (n.x, n.y, n.z)),
                 None => continue,
             };
-            let (p1x, p1y, p1z, m1) = (n1.x, n1.y, n1.z, n1.mass);
 
-            for j in (i + 1)..n {
+            for j in (i + 1)..count {
                 let id2 = &node_ids[j];
-                let n2 = match inner.nodes.get(id2) {
-                    Some(node) => node,
+                if Some(id2) == supermassive_id.as_ref() {
+                    continue;
+                }
+                let (n2_tags, n2_cat, n2_pos) = match inner.nodes.get(id2) {
+                    Some(n) => (&n.tags, n.category(), (n.x, n.y, n.z)),
                     None => continue,
                 };
-                let (p2x, p2y, p2z, m2) = (n2.x, n2.y, n2.z, n2.mass);
 
-                let mut dx = p1x - p2x;
-                let mut dy = p1y - p2y;
-                let mut dz = p1z - p2z;
-                let mut dist_sq = dx * dx + dy * dy + dz * dz;
-                if dist_sq < 0.04 {
-                    dx = ((i as f32 * 1.3).sin() * 0.2) + 0.1;
-                    dy = ((j as f32 * 1.7).cos() * 0.2) + 0.1;
-                    dz = 0.1;
-                    dist_sq = dx * dx + dy * dy + dz * dz;
-                }
+                let shared_tags = n1_tags.iter().filter(|t| n2_tags.contains(t)).count();
+                if shared_tags > 0 || n1_cat == n2_cat {
+                    let sdx = n2_pos.0 - n1_pos.0;
+                    let sdy = n2_pos.1 - n1_pos.1;
+                    let sdz = n2_pos.2 - n1_pos.2;
+                    let sdist = (sdx * sdx + sdy * sdy + sdz * sdz).sqrt().max(0.1);
 
-                let dist = dist_sq.sqrt();
-                let rep_force = (REPULSION_K * m1 * m2 / dist_sq).min(MAX_FORCE);
-                let (fx, fy, fz) = (dx / dist * rep_force, dy / dist * rep_force, dz / dist * rep_force);
+                    if sdist > 1.5 {
+                        let pull_factor = if shared_tags > 0 { 0.05 * (shared_tags as f32) } else { 0.02 };
+                        let pull_f = ((sdist - 1.5) * pull_factor).min(0.25);
+                        let px = (sdx / sdist) * pull_f;
+                        let py = (sdy / sdist) * pull_f * 0.5;
+                        let pz = (sdz / sdist) * pull_f;
 
-                if let Some(f1) = forces.get_mut(id1) {
-                    f1.0 += fx; f1.1 += fy; f1.2 += fz;
-                }
-                if let Some(f2) = forces.get_mut(id2) {
-                    f2.0 -= fx; f2.1 -= fy; f2.2 -= fz;
-                }
-            }
-        }
-
-        // 2. Spring attraction along links & backlinks
-        for (id, node) in inner.nodes.iter() {
-            let p1 = (node.x, node.y, node.z);
-            for target_id in &node.links {
-                if let Some(target) = inner.nodes.get(target_id) {
-                    let dx = target.x - p1.0;
-                    let dy = target.y - p1.1;
-                    let dz = target.z - p1.2;
-                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.1);
-                    let displacement = dist - SPRING_REST;
-                    let spring_f = (SPRING_K * displacement).clamp(-MAX_FORCE, MAX_FORCE);
-                    let (fx, fy, fz) = (dx / dist * spring_f, dy / dist * spring_f, dz / dist * spring_f);
-
-                    if let Some(f1) = forces.get_mut(id) {
-                        f1.0 += fx; f1.1 += fy; f1.2 += fz;
-                    }
-                    if let Some(f2) = forces.get_mut(target_id) {
-                        f2.0 -= fx; f2.1 -= fy; f2.2 -= fz;
+                        if let Some(f1) = forces.get_mut(id1) {
+                            f1.0 += px;
+                            f1.1 += py;
+                            f1.2 += pz;
+                        }
+                        if let Some(f2) = forces.get_mut(id2) {
+                            f2.0 -= px;
+                            f2.1 -= py;
+                            f2.2 -= pz;
+                        }
                     }
                 }
             }
         }
 
-        // 3. Central Core Gravity (pull toward center of mass)
-        for (id, node) in inner.nodes.iter() {
-            let dist_sq = node.x * node.x + node.y * node.y + node.z * node.z;
-            let dist = dist_sq.sqrt().max(0.1);
-            let core_f = CENTRAL_G * node.mass * dist;
-            if let Some(f) = forces.get_mut(id) {
-                f.0 -= (node.x / dist) * core_f;
-                f.1 -= (node.y / dist) * core_f;
-                f.2 -= (node.z / dist) * core_f;
+        // c) Synaptic Links & Backlinks Attraction (Hooke's Law between connected memories)
+        for (id, node) in &inner.nodes {
+            if Some(id) == supermassive_id.as_ref() {
+                continue;
+            }
+            for link_id in &node.links {
+                if let Some(target) = inner.nodes.get(link_id) {
+                    let ldx = target.x - node.x;
+                    let ldy = target.y - node.y;
+                    let ldz = target.z - node.z;
+                    let ldist = (ldx * ldx + ldy * ldy + ldz * ldz).sqrt().max(0.1);
+                    let rest_len = if Some(link_id) == supermassive_id.as_ref() { 3.5 } else { 1.8 };
+                    let spring_f = (ldist - rest_len) * 0.06;
+
+                    if let Some(f) = forces.get_mut(id) {
+                        f.0 += (ldx / ldist) * spring_f;
+                        f.1 += (ldy / ldist) * spring_f * 0.5;
+                        f.2 += (ldz / ldist) * spring_f;
+                    }
+                }
             }
         }
 
-        // 4. Velocity integration & position update
+        // c) Pairwise Coulomb Repulsion between nearby nodes (prevents overlaps within cluster)
+        let count = node_ids.len();
+        for i in 0..count {
+            let id1 = &node_ids[i];
+            if Some(id1) == supermassive_id.as_ref() {
+                continue;
+            }
+            let n1 = match inner.nodes.get(id1) {
+                Some(n) => (n.x, n.y, n.z),
+                None => continue,
+            };
+
+            for j in (i + 1)..count {
+                let id2 = &node_ids[j];
+                if Some(id2) == supermassive_id.as_ref() {
+                    continue;
+                }
+                let n2 = match inner.nodes.get(id2) {
+                    Some(n) => (n.x, n.y, n.z),
+                    None => continue,
+                };
+
+                let pdx = n2.0 - n1.0;
+                let pdy = n2.1 - n1.1;
+                let pdz = n2.2 - n1.2;
+                let pdist_sq = pdx * pdx + pdy * pdy + pdz * pdz;
+                if pdist_sq < 4.0 && pdist_sq > 0.0001 {
+                    let pdist = pdist_sq.sqrt();
+                    let rep_f = 0.35 / pdist;
+                    let rx = (pdx / pdist) * rep_f;
+                    let ry = (pdy / pdist) * rep_f * 0.5;
+                    let rz = (pdz / pdist) * rep_f;
+
+                    if let Some(f1) = forces.get_mut(id1) {
+                        f1.0 -= rx;
+                        f1.1 -= ry;
+                        f1.2 -= rz;
+                    }
+                    if let Some(f2) = forces.get_mut(id2) {
+                        f2.0 += rx;
+                        f2.1 += ry;
+                        f2.2 += rz;
+                    }
+                }
+            }
+        }
+
+        // 4. Integrate Velocities and Positions
         for (id, (fx, fy, fz)) in forces {
+            if Some(&id) == supermassive_id.as_ref() {
+                continue;
+            }
             if let Some(node) = inner.nodes.get_mut(&id) {
-                let ax = fx / node.mass.max(0.1);
-                let ay = fy / node.mass.max(0.1);
-                let az = fz / node.mass.max(0.1);
+                node.vx = (node.vx + fx) * 0.82;
+                node.vy = (node.vy + fy) * 0.82;
+                node.vz = (node.vz + fz) * 0.82;
 
-                node.vx = (node.vx + ax * DT) * DAMPING;
-                node.vy = (node.vy + ay * DT) * DAMPING;
-                node.vz = (node.vz + az * DT) * DAMPING;
+                node.x += node.vx;
+                node.y += node.vy;
+                node.z += node.vz;
 
-                node.x += node.vx * DT;
-                node.y += node.vy * DT;
-                node.z += node.vz * DT;
+                // Galaxy outer boundary clamp (XZ orbital radius and Y vertical bounds)
+                let cur_r = (node.x * node.x + node.z * node.z).sqrt();
+                if cur_r > 50.0 {
+                    node.x = (node.x / cur_r) * 48.0;
+                    node.z = (node.z / cur_r) * 48.0;
+                    node.vx *= 0.2;
+                    node.vz *= 0.2;
+                }
+                if node.y.abs() > 4.0 {
+                    node.y = node.y.signum() * 3.8;
+                    node.vy *= 0.2;
+                }
+            }
+        }
+
+        // 5. Ensure core remains pinned at (0, 0, 0)
+        if let Some(ref core_id) = supermassive_id {
+            if let Some(core) = inner.nodes.get_mut(core_id) {
+                core.x = 0.0;
+                core.y = 0.0;
+                core.z = 0.0;
+                core.vx = 0.0;
+                core.vy = 0.0;
+                core.vz = 0.0;
             }
         }
     }
@@ -901,5 +1100,94 @@ mod tests {
             None,
         );
         assert!(g.get("id").is_none(), "code-span example must not create a real node");
+    }
+
+    #[test]
+    fn test_supermassive_core_anchored_at_origin() {
+        let g = Dendrite::new();
+        // Insert identity node (highest tier/mass)
+        let _core = g.upsert(
+            "core_identity",
+            "System Identity",
+            "I am Cynapse Core, central knowledge anchor.",
+            NodeType::Identity,
+            Some(vec!["core".into(), "identity".into()]),
+        );
+
+        // Insert peripheral concepts
+        g.upsert(
+            "rust_engine",
+            "Rust Engine",
+            "High performance kernels linked to [[core_identity]].",
+            NodeType::Concept,
+            Some(vec!["code".into(), "rust".into()]),
+        );
+        g.upsert(
+            "user_pref",
+            "User Preferences",
+            "User favorite theme linked to [[core_identity]].",
+            NodeType::Concept,
+            Some(vec!["pref".into(), "theme".into()]),
+        );
+
+        let supermassive = g.supermassive_node().expect("supermassive node exists");
+        assert_eq!(supermassive.id, "core_identity");
+
+        let core_node = g.get("core_identity").expect("core node exists");
+        assert_eq!((core_node.x, core_node.y, core_node.z), (0.0, 0.0, 0.0));
+
+        let eng_node = g.get("rust_engine").expect("rust_engine exists");
+        let pref_node = g.get("user_pref").expect("user_pref exists");
+
+        // Peripheral nodes must not be at (0,0,0)
+        let eng_dist = (eng_node.x * eng_node.x + eng_node.z * eng_node.z).sqrt();
+        let pref_dist = (pref_node.x * pref_node.x + pref_node.z * pref_node.z).sqrt();
+        assert!(eng_dist > 2.0, "Engineering cluster must orbit away from origin");
+        assert!(pref_dist > 2.0, "Preferences cluster must orbit away from origin");
+    }
+
+    #[test]
+    fn test_attract_z_axis_signs() {
+        let g = Dendrite::new();
+        let mut na = Node::placeholder("node_a".to_string(), 0);
+        na.x = 1.0;
+        na.y = 1.0;
+        na.z = 1.0;
+        let mut nb = Node::placeholder("node_b".to_string(), 0);
+        nb.x = 1.0;
+        nb.y = 1.0;
+        nb.z = 10.0;
+
+        g.insert_hydrated(na);
+        g.insert_hydrated(nb);
+
+        g.attract("node_a", "node_b", 1.0);
+
+        let res_a = g.get("node_a").unwrap();
+        let res_b = g.get("node_b").unwrap();
+
+        // Node A should be pulled forward (+Z towards Node B)
+        assert!(res_a.vz > 0.0, "Node A vz must be positive towards B");
+        // Node B should be pulled backward (-Z towards Node A)
+        assert!(res_b.vz < 0.0, "Node B vz must be negative towards A");
+        // Magnitudes must be equal and opposite
+        assert!((res_a.vz + res_b.vz).abs() < 1e-5, "Attraction must be equal and opposite");
+    }
+
+    #[test]
+    fn test_boundary_clamping_xz_and_y() {
+        let g = Dendrite::new();
+        let mut runaway = Node::placeholder("runaway".to_string(), 0);
+        runaway.x = 100.0;
+        runaway.y = 50.0;
+        runaway.z = 100.0;
+        g.insert_hydrated(runaway);
+
+        g.simulate_forces(1);
+
+        let clamped = g.get("runaway").unwrap();
+        let r_xz = (clamped.x * clamped.x + clamped.z * clamped.z).sqrt();
+        assert!(r_xz <= 50.0, "Outer XZ radius must be clamped <= 50.0, got {}", r_xz);
+        assert!(clamped.y.abs() <= 4.0, "Y-axis must be clamped <= 4.0, got {}", clamped.y);
     }
 }
