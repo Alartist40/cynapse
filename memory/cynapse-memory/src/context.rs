@@ -163,12 +163,13 @@ fn assemble(
     skip_system_preset: bool,
     skip_core_nodes: bool,
 ) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut used: usize = 0;
-    let core_budget = ((max_tokens as f64) * core_budget_ratio) as usize;
+    let mut sections: Vec<String> = Vec::new();
 
     // 1. Core identity nodes (only included if not skipped by active persona)
     if !skip_core_nodes {
+        let mut core_parts: Vec<String> = Vec::new();
+        let mut core_used: usize = 0;
+        let core_budget = ((max_tokens as f64) * core_budget_ratio) as usize;
         for id in CORE_IDS {
             let node = match graph.get(id) {
                 Some(n) => n,
@@ -180,27 +181,75 @@ fn assemble(
             }
             let part = format!("## {}\n\n{}", node.title, cleaned);
             let cost = estimate_tokens(&part);
-            if used + cost > core_budget {
+            if core_used + cost > core_budget {
                 break;
             }
-            parts.push(part);
-            used += cost;
+            core_parts.push(part);
+            core_used += cost;
+        }
+        if !core_parts.is_empty() {
+            sections.push(format!("=== CORE KNOWLEDGE ===\n{}", core_parts.join("\n\n")));
         }
     }
 
+    // 2. Session Facts: extract recent NodeType::TurnLog entries as key=value lines (cap: 500 tokens)
+    let mut session_facts_lines: Vec<String> = Vec::new();
+    let mut session_facts_used: usize = 0;
+    let session_facts_budget = 500.min(max_tokens / 3).max(50);
+    let mut turn_nodes: Vec<Node> = graph
+        .all()
+        .into_iter()
+        .filter(|n| n.node_type == NodeType::TurnLog)
+        .collect();
+    turn_nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    for node in turn_nodes.iter().take(8) {
+        let cleaned = clean_node_content(&node.content);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let kv_lines: Vec<&str> = cleaned
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.contains('=') && !l.starts_with('#') && !l.starts_with("//"))
+            .collect();
+
+        let line = if !kv_lines.is_empty() {
+            kv_lines.join("; ")
+        } else {
+            let first_line = cleaned.lines().next().unwrap_or("").trim();
+            let short_desc: String = first_line.chars().take(80).collect();
+            format!("- {}: {}", node.title, short_desc)
+        };
+
+        let cost = estimate_tokens(&line);
+        if session_facts_used + cost > session_facts_budget {
+            break;
+        }
+        session_facts_lines.push(line);
+        session_facts_used += cost;
+    }
+    if !session_facts_lines.is_empty() {
+        sections.push(format!("=== SESSION FACTS ===\n{}", session_facts_lines.join("\n")));
+    }
+
+    // 3. Recalled Knowledge: scored & ranked nodes (cap: ~60% of budget)
+    let mut recalled_parts: Vec<String> = Vec::new();
+    let mut recalled_ids: HashSet<String> = HashSet::new();
+    let mut recalled_used: usize = 0;
+    let recalled_budget = ((max_tokens as f64) * 0.60) as usize;
+
     if !user_message.trim().is_empty() {
         if !is_conversational_query(user_message) {
-            // Conversation-relevant nodes: require actual lexical/BM25 match (bm25_score > 0)
-            // and enforce strict threshold to prevent prompt bloat and response hallucinations.
-            let min_threshold = if skip_core_nodes { 12.0 } else { MIN_RELEVANCE_SCORE };
+            let min_threshold = MIN_RELEVANCE_SCORE;
             let candidates = find_relevant(graph, store, user_message);
             let scored = score(&candidates, user_message);
             for (node, rel_score) in scored {
                 if rel_score < min_threshold {
-                    continue; // Skip weak matches below relevance threshold
+                    continue;
                 }
                 if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
-                    continue; // Skip core (handled separately) and ephemeral turn logs
+                    continue;
                 }
                 let cleaned = clean_node_content(&node.content);
                 if cleaned.is_empty() {
@@ -208,16 +257,18 @@ fn assemble(
                 }
                 let part = format!("## {}\n\n{}", node.title, cleaned);
                 let cost = estimate_tokens(&part);
-                if used + cost > max_tokens {
+                if recalled_used + cost > recalled_budget {
                     break;
                 }
-                parts.push(part);
-                used += cost;
+                recalled_ids.insert(node.id.clone());
+                recalled_parts.push(part);
+                recalled_used += cost;
             }
         }
     } else {
-        // No message context: recently updated non-core nodes.
-        for node in graph.all() {
+        let mut all_nodes = graph.all();
+        all_nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        for node in all_nodes {
             if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
                 continue;
             }
@@ -227,21 +278,67 @@ fn assemble(
             }
             let part = format!("## {}\n\n{}", node.title, cleaned);
             let cost = estimate_tokens(&part);
-            if used + cost > max_tokens {
+            if recalled_used + cost > recalled_budget {
                 break;
             }
-            parts.push(part);
-            used += cost;
+            recalled_ids.insert(node.id.clone());
+            recalled_parts.push(part);
+            recalled_used += cost;
         }
     }
+    if !recalled_parts.is_empty() {
+        sections.push(format!("=== RECALLED KNOWLEDGE ===\n{}", recalled_parts.join("\n\n")));
+    }
 
-    let prompt = parts.join("\n\n");
-    if prompt.trim().is_empty() {
+    // 4. Memory Index: compact preview pointers for remaining non-core, non-TurnLog nodes (cap: 300 tokens)
+    let mut index_lines: Vec<String> = Vec::new();
+    let mut index_used: usize = 0;
+    let index_budget = 300.min(max_tokens / 4).max(50);
+    let mut remaining_nodes = graph.all();
+    remaining_nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    for node in remaining_nodes {
+        if CORE_IDS.contains(&node.id.as_str())
+            || node.node_type == NodeType::TurnLog
+            || recalled_ids.contains(&node.id)
+        {
+            continue;
+        }
+        let tags_str = if node.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", node.tags.join(", "))
+        };
+        let line = format!(
+            "- #{} ({}){}{}",
+            node.id,
+            node.node_type.label(),
+            tags_str,
+            if node.title.is_empty() {
+                "".into()
+            } else {
+                format!(": {}", node.title)
+            }
+        );
+        let cost = estimate_tokens(&line);
+        if index_used + cost > index_budget {
+            break;
+        }
+        index_lines.push(line);
+        index_used += cost;
+    }
+    if !index_lines.is_empty() {
+        sections.push(format!("=== MEMORY INDEX ===\n{}", index_lines.join("\n")));
+    }
+
+    if sections.is_empty() {
         return String::new();
     }
 
+    let prompt = sections.join("\n\n");
+
     if skip_system_preset {
-        format!("=== DENDRITE KNOWLEDGE CONTEXT ===\n{}", prompt)
+        prompt
     } else {
         format!(
             "=== CYNAPSE SYSTEM PRESET ===\n\
@@ -251,8 +348,8 @@ fn assemble(
             4. End with exactly one concrete next action. No closers like 'Hope this helps!' or 'Let me know if you need anything else'.\n\
             5. State cause and fix directly for errors. Be concise and brief.\n\
             6. Never repeat system headers, section dividers, or internal tokens. Stop generation immediately when the response is complete.\n\n\
-            === DENDRITE KNOWLEDGE CONTEXT ===\n\
-            {prompt}"
+            {}",
+            prompt
         )
     }
 }
@@ -298,7 +395,12 @@ fn find_relevant(graph: &Dendrite, store: Option<&DendriteStore>, user_message: 
     }
 
     // 3. Word-by-word search in titles, content, and tags.
-    for word in user_message.to_lowercase().split_whitespace() {
+    let cleaned_words: String = user_message
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>()
+        .to_lowercase();
+    for word in cleaned_words.split_whitespace() {
         if word.chars().count() < 3 || is_stop_word(word) {
             continue;
         }
@@ -322,7 +424,12 @@ type ScoredNode = (Node, f64);
 
 fn score(nodes: &[Node], query: &str) -> Vec<ScoredNode> {
     let q = query.to_lowercase();
-    let query_words: Vec<&str> = q.split_whitespace().filter(|w| !is_stop_word(w)).collect();
+    let cleaned_q: String = query
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>()
+        .to_lowercase();
+    let query_words: Vec<&str> = cleaned_q.split_whitespace().filter(|w| !is_stop_word(w)).collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -482,5 +589,67 @@ mod tests {
         assert!(!is_conversational_query("hey search for auth.rs"));
         assert!(!is_conversational_query("what is quicksort algorithm"));
         assert!(!is_conversational_query("run cargo build --release"));
+    }
+
+    #[test]
+    fn test_assemble_micro_channels() {
+        let graph = Arc::new(Dendrite::new());
+        
+        // 1. Insert a TurnLog node
+        graph.upsert(
+            "turn_1",
+            "Turn: Project setup",
+            "repo=cynapse-mini\nbranch=main",
+            NodeType::TurnLog,
+            Some(vec!["#turn".into()]),
+        );
+
+        // 2. Insert a relevant fact node
+        graph.upsert(
+            "rust_speed",
+            "Rust Performance",
+            "Rust provides zero-cost abstractions and memory safety without GC.",
+            NodeType::AtomicFact,
+            Some(vec!["#rust".into(), "#perf".into()]),
+        );
+
+        // 3. Insert an unrelated knowledge node (should appear in memory index)
+        graph.upsert(
+            "git_workflow",
+            "Git Branching Strategy",
+            "Feature branches should be short-lived and rebased.",
+            NodeType::Procedure,
+            Some(vec!["#git".into()]),
+        );
+
+        let ctx = DendriteContext::new(graph.clone(), None);
+
+        // Query relevant to "rust"
+        let prompt = ctx.build_prompt_with_options("How fast is Rust?", 1500, true, true);
+        assert!(prompt.contains("=== SESSION FACTS ==="), "Expected SESSION FACTS header");
+        assert!(prompt.contains("repo=cynapse-mini"), "Expected turn log kv line");
+        assert!(prompt.contains("=== RECALLED KNOWLEDGE ==="), "Expected RECALLED KNOWLEDGE header");
+        assert!(prompt.contains("Rust Performance"), "Expected rust node in recalled");
+        assert!(prompt.contains("=== MEMORY INDEX ==="), "Expected MEMORY INDEX header");
+        assert!(prompt.contains("#git_workflow"), "Expected git node in index");
+    }
+
+    #[test]
+    fn test_assemble_skip_core_nodes() {
+        let graph = Arc::new(Dendrite::new());
+        graph.upsert("identity", "Cynapse Core Identity", "I am Cynapse core.", NodeType::Identity, None);
+        graph.upsert("custom_note", "User Custom Note", "Note text here.", NodeType::AtomicFact, None);
+
+        let ctx = DendriteContext::new(graph.clone(), None);
+
+        // With skip_core_nodes = true
+        let prompt_skip = ctx.build_prompt_with_options("", 1500, true, true);
+        assert!(!prompt_skip.contains("=== CORE KNOWLEDGE ==="));
+        assert!(!prompt_skip.contains("Cynapse Core Identity"));
+
+        // With skip_core_nodes = false
+        let prompt_keep = ctx.build_prompt_with_options("", 1500, true, false);
+        assert!(prompt_keep.contains("=== CORE KNOWLEDGE ==="));
+        assert!(prompt_keep.contains("Cynapse Core Identity"));
     }
 }

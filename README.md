@@ -1,12 +1,12 @@
-# 🧠 CYNAPSE — Offline-First Agent System & Synaptic Knowledge Memory
+# CYNAPSE — Offline-First Agent System & Synaptic Knowledge Memory
 
-**Cynapse** is a high-performance, offline-first AI agent platform engineered entirely in 100% pure Rust. Designed for total privacy, zero external runtime dependencies, and instant local execution, it bridges host hardware telemetry with an intelligent multi-engine router and a dynamic, synaptic knowledge graph.
+**Cynapse** is a high-performance, offline-first AI agent platform engineered entirely in 100% pure Rust. Designed for total privacy, zero external runtime dependencies, and instant local execution, it bridges host hardware telemetry with an intelligent multi-engine router, a dynamic synaptic knowledge graph, and an Atomic-Agent-inspired architecture elevation.
 
-At the heart of Cynapse lies a unified architecture where three powerful engines work in concert: **Dendrite**, a force-directed 3D graph memory system with Coulomb/Hooke physics, SQLite FTS5 full-text indexing, and BM25 relevance ranking; **Leafcutter**, a custom pure-Rust GGUF and Safetensors execution core providing local tensor streaming with KV cache trunk reservation; and **llama.cpp / Ollama integration**, acting as a high-speed Tier-1 HTTP inference runner with NDJSON streaming. Together, these subsystems provide a complete local agent harness capable of autonomous tool execution, strict GBNF grammar constrained outputs, real-time memory synthesis, 3D orbital galaxy memory visualization, and self-healing diagnostics—all running locally on your hardware without a single byte leaving your machine.
+At the heart of Cynapse lies a unified architecture where three powerful engines work in concert: **Dendrite**, a force-directed 3D graph memory system with Coulomb/Hooke physics, SQLite FTS5 full-text indexing, and BM25 relevance ranking; **Leafcutter**, a custom pure-Rust GGUF and Safetensors execution core providing local tensor streaming with KV cache trunk reservation; and **llama.cpp / Ollama integration**, acting as a high-speed Tier-1 HTTP inference runner with NDJSON streaming and multi-provider fallback. Together, these subsystems provide a complete local agent harness capable of autonomous tool execution, strict GBNF grammar constrained outputs, real-time memory synthesis, 3D orbital galaxy memory visualization, and self-healing diagnostics—all running locally on your hardware without a single byte leaving your machine.
 
 ---
 
-## 📥 Installation & Setup
+## Installation & Setup
 
 ### Single-Line Automated Install (Linux & macOS)
 ```bash
@@ -29,9 +29,8 @@ cynapse doctor --fix
 
 ---
 
-## 🕹️ Menu & Usage Guide
+## Launch Modes
 
-### Launch Modes
 - **Visual TUI Dashboard (Default)**: Launch the full visual Ratatui interactive interface:
   ```bash
   cynapse
@@ -49,36 +48,45 @@ cynapse doctor --fix
   cynapse run <model_name_or_number>
   ```
 
-### Interactive Slash Commands (`/`)
+---
+
+## Interactive Slash Commands
+
 Type `/` in the prompt bar to trigger the floating command menu:
-- `/help` — Display interactive keyboard shortcuts & help menu
-- `/model` — Open interactive model selector & scanner
-- `/pull` — Download GGUF models from HuggingFace (Curated catalog & custom URLs)
-- `/persona` — Manage agent personality markdown files (`IDENTITY`, `SOUL`, `USER`, custom `.md`)
-- `/doctor` — Launch Cynapse Doctor self-healing diagnostic dashboard
-- `/memory` — Launch 3D Orbital Galaxy Memory Atlas visualizer
-- `/drawer` — Open interactive Dendrite Memory drawer inspector
-- `/thinking` — Toggle collapsible model reasoning/thinking stream blocks
-- `/theme` — Cycle color themes (Dark Slate, Neon Cyber, Amber CRT, Emerald Matrix)
-- `/session` — Manage and resume saved conversation sessions
-- `/clear` — Reset conversation view and restore brand banner
-- `/exit` — Quit Cynapse TUI
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Display interactive keyboard shortcuts & help menu |
+| `/model` | Open interactive model selector & scanner |
+| `/pull` | Download GGUF models from HuggingFace (curated catalog & custom URLs) |
+| `/persona` | Manage agent personality markdown files (`IDENTITY`, `SOUL`, `USER`, custom `.md`) |
+| `/doctor` | Launch Cynapse Doctor self-healing diagnostic dashboard |
+| `/memory` | Launch 3D Orbital Galaxy Memory Atlas visualizer |
+| `/drawer` | Open interactive Dendrite Memory drawer inspector |
+| `/thinking` | Toggle collapsible model reasoning/thinking stream blocks |
+| `/theme` | Cycle color themes (Dark Slate, Neon Cyber, Amber CRT, Emerald Matrix) |
+| `/session` | Manage and resume saved conversation sessions |
+| `/clear` | Reset conversation view and restore brand banner |
+| `/exit` | Quit Cynapse TUI |
 
 ### Terminal Shortcuts
-- `Tab`: Open Dendrite Memory Drawer inspector from anywhere
-- `Up` / `Down`: Scroll conversation viewport line-by-line
-- `Ctrl + Backspace` / `Ctrl + W`: Delete word backward in prompt input
-- `Ctrl + T`: Toggle model thinking/reasoning blocks
-- `Ctrl + A` / `Ctrl + E`: Move input cursor to start / end of line
-- `Ctrl + U`: Clear input line
-- `Spacebar` / `s` (in `/memory`): Toggle 3D Galaxy auto-rotation
-- `r` / `F5` (in `/doctor`): Re-run self-healing diagnostics with auto-repair
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Open Dendrite Memory Drawer inspector from anywhere |
+| `Up` / `Down` | Scroll conversation viewport line-by-line |
+| `Ctrl+Backspace` / `Ctrl+W` | Delete word backward in prompt input |
+| `Ctrl+T` | Toggle model thinking/reasoning blocks |
+| `Ctrl+A` / `Ctrl+E` | Move input cursor to start / end of line |
+| `Ctrl+U` | Clear input line |
+| `Spacebar` / `s` (in `/memory`) | Toggle 3D Galaxy auto-rotation |
+| `r` / `F5` (in `/doctor`) | Re-run self-healing diagnostics with auto-repair |
 
 ---
 
-## 🏗️ Architecture Structure
+## Architecture
 
-Cynapse is structured as a decoupled multi-crate Rust workspace:
+Cynapse is structured as a decoupled multi-crate Rust workspace. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical breakdown.
 
 ```
 cynapse-mini/
@@ -89,72 +97,71 @@ cynapse-mini/
 ├── memory/
 │   └── cynapse-memory/         # Dendrite graph engine, SQLite FTS5 store, BM25 ranker
 ├── engine/
-│   ├── cynapse-engine/         # Semantic hardware router & Tier-1 LLM client
+│   ├── cynapse-engine/         # Semantic hardware router, Tier-1 LLM client, provider fallback
 │   └── leafcutter_core/        # Pure Rust GGUF & Safetensors tensor kernels
 └── install.sh                  # Dual remote/local automated installer & setup script
 ```
 
-### Data & Memory Flow
-```
-[ User Input ]
-      │
-      ▼
-[ Dendrite Memory Core ] ──( SQLite FTS5 + BM25 )──► [ Relevant Context Facts ]
-      │                                                        │
-      ▼                                                        ▼
-[ Hardware Tier Router ] ◄───────────────────────── [ Injected System Prompt ]
-      │
-      ├─────► Tier 1 (Fast): llama.cpp / Ollama NDJSON Stream (HTTP-first)
-      ├─────► Tier 2 (GGUF): Leafcutter Rust Tensor Core (KV trunk reservation)
-      └─────► Tier 3 (Safetensor): Leafcutter Rust Core
-      │
-      ▼
-[ GBNF Tool Grammar Parser ] ──( Tool Executed )──► [ Tool Output Result ]
-      │                                                     │
-      └─────────────────────◄ ( Reprompt Loop ) ────────────┘
-      │
-      ▼
-[ Turn Log & Fact Extraction ] ──► [ Dendrite Knowledge Graph ]
-```
-
 ---
 
-## 🌟 Capabilities, Specs & Features
+## Capabilities
 
-### 🧠 Synaptic Memory & 3D Galaxy Memory Atlas
+### Synaptic Memory & 3D Galaxy Memory Atlas
 Memory in Cynapse is modeled after biological neural networks with a force-directed 3D physics engine. Ideas, facts, and conversation turn logs form nodes connected by weighted synaptic links that strengthen with use and decay with disuse over time.
-- **Force-Directed 3D Galaxy Physics**: Real Coulomb repulsion, Hooke spring attraction, central gravity toward the supermassive core, velocity damping (0.88), collision avoidance, and force clamping. Nodes have spatial coordinates (x, y, z) and velocity vectors (vx, vy, vz) with mass computed from tier, spec_index, and connectivity.
-- **3D Orbital Galaxy Visualizer (`/memory`)**: Visualizes memory nodes as stars organized into galactic clusters revolving around a supermassive central core. Nodes are mass-scaled glyphs (★/✦/●) with full filament edge lines drawn in 3D space. Categories (Personal, Engineering, Preferences, Meta, Episodic) orbit in colorful stellar belts.
-- **Two-Tier Hybrid Memory Recall**: Merges SQLite FTS5 keyword matching with BM25 scoring, specialization index weighting, and exponential temporal decay ($\gamma^{\Delta t}$).
-- **Interactive Memory Drawer (`Tab`)**: Inspect, search, and purge individual memory nodes directly from a pop-up overlay.
+- **Force-Directed 3D Galaxy Physics**: Real Coulomb repulsion, Hooke spring attraction, central gravity toward the supermassive core, velocity damping (0.88), collision avoidance, and force clamping.
+- **3D Orbital Galaxy Visualizer (`/memory`)**: Visualizes memory nodes as stars organized into galactic clusters revolving around a supermassive central core.
+- **Two-Tier Hybrid Memory Recall**: Merges SQLite FTS5 keyword matching with BM25 scoring, specialization index weighting, and exponential temporal decay.
+- **Structured Memory Micro-Channels**: Session facts, recalled knowledge, and memory index injected as structured prompt sections.
 
-### 📥 Offline Model Downloader & Model Management (`/pull`)
-- **Curated Recommendations**: Probes system RAM and GPU VRAM to tag optimal model sizes (`[★ Recommended]`).
-- **Custom HuggingFace Downloads**: Download any model from HuggingFace by entering a repository ID (e.g., `Qwen/Qwen2.5-7B-Instruct-GGUF` or `TheBloke/Llama-2-7B-GGUF`) or pasting a direct GGUF file URL. Select quantization levels ranging from `Q2_K` to `F16`.
-- **Background Async Progress**: Non-blocking Tokio downloader streams models directly to storage with real-time speed (`MB/s`), progress bars, and automatic activation upon completion.
+### Atomic-Agent Architecture Elevation
+Six architecture phases inspired by the Atomic-Agent reference implementation:
+- **Stable Zone A Prefix**: Byte-stable system prompt cached across multi-turn tool loops for KV-cache reuse.
+- **Two-Phase LoopGuard**: Prospective loop detection with no-progress streak tracking, wandering detection, and circuit breaker.
+- **Batch Tool Dispatch**: Array tool call parsing `[{"tool": ...}, ...]` with sequential per-call guard evaluation.
+- **Notice Injection**: `=== NOTICE ===` prompt tail for loop detector and steering redirections.
+- **Provider Fallback Chain**: Sticky multi-provider fallback (llama-server -> Ollama -> NativeLeafcutter) with escalating cooldowns (30s -> 60s -> 300s) and lazy probe recovery.
 
-### 🛡️ Offline Agent Capabilities & GBNF Grammar Engine
-- **NDJSON Streaming**: Polymorphic streaming parser supporting multiple API formats (Ollama `.response`, vLLM `.choices[0].delta.content`, generic `.content`, `.message.content`, `.choices[0].text`). Handles SSE `data:` prefix stripping, `[DONE]` termination, and 64KB read buffers.
+### Offline Agent Capabilities & GBNF Grammar Engine
+- **NDJSON Streaming**: Polymorphic streaming parser supporting multiple API formats (Ollama, vLLM, generic).
 - **GBNF Grammar Constraints**: Enforces valid JSON tool-call schema syntax, preventing output formatting panics offline.
-- **KV-Cache Trunk Reservation**: KV cache + activations + LM head reserved before layer cache in trunk-first budgeting, preventing KV spill on large models.
-- **Loop Guard Protection**: Active circular buffer detects and halts non-progressing repeated tool execution loops.
-- **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 5`) to prevent runaway recursive tool execution cycles.
+- **KV-Cache Slot Affinity**: Slot 0 pinned for chat, slot 1 for reflection, with `cache_prompt: true` for warm cache reuse.
+- **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 5`) to prevent runaway recursive tool execution.
 
-### 🎭 System Persona Manager (`/persona`)
-- **Interactive TUI Modal & Live Editor**: Inspect available `.md` persona files in `~/.cynapse/persona/`, press `e` to edit live with cursor navigation, `Ctrl+S` to save to disk, switch active personas (`Enter`), or reset to default identity (`r`).
-- **Dynamic Prompt Compiler**: Injects direct, high-character system instructions into every model prompt without generic LLM headers or preambles.
+### Async Background Reflection
+Fire-and-forget reflection worker distills conversation turns into atomic facts, procedures, and lessons without blocking the UI. Runs on a dedicated background thread after each turn completion.
 
-### 🩺 Cynapse Doctor Self-Healing Engine (`/doctor`)
-- **11-Subsystem Auditing**: Audits host RAM headroom, SIMD instruction availability (AVX2 + FMA), GGUF magic headers (`0x46554747`), SQLite database health (`PRAGMA quick_check;`), GBNF grammar parser, local host tools (`bash`, `git`), async Tokio runtimes, Markdown Persona Subsystem, HuggingFace API connectivity, endpoint health, and model availability.
-- **Auto-Fix Mode (`--fix`)**: Automatically recreates missing directories (`~/.cynapse/persona`), repairs database indexes, clears stale scratch files, and updates configuration paths.
+### Offline Model Downloader & Model Management (`/pull`)
+- **Curated Recommendations**: Probes system RAM and GPU VRAM to tag optimal model sizes.
+- **Custom HuggingFace Downloads**: Download any GGUF model from HuggingFace with real-time progress.
+- **Background Async Progress**: Non-blocking Tokio downloader with real-time speed and progress bars.
 
-### 🎨 Visual Themes & UI Experience
-- **4 Visual Color Presets**: Switch instantly between Dark Slate, Neon Cyber, Amber CRT, and Emerald Matrix themes.
-- **Dynamic Input Box**: Expands downward from 3 to 8 lines as text grows, keeping long prompts completely visible.
-- **Collapsible Reasoning Blocks (`Ctrl + T`)**: Expand or collapse internal model thinking streams.
+### System Persona Manager (`/persona`)
+- **Interactive TUI Modal & Live Editor**: Inspect, edit, and switch persona `.md` files in `~/.cynapse/persona/`.
+- **Dynamic Prompt Compiler**: Injects direct system instructions into every model prompt without generic LLM headers.
+
+### Cynapse Doctor Self-Healing Engine (`/doctor`)
+- **11-Subsystem Auditing**: RAM headroom, SIMD availability, GGUF magic headers, SQLite health, GBNF grammar parser, local tools, Tokio runtimes, persona subsystem, API connectivity, endpoint health, model availability.
+- **Auto-Fix Mode (`--fix`)**: Automatically recreates missing directories, repairs database indexes, clears stale files.
+
+### Visual Themes & UI Experience
+- **4 Visual Color Presets**: Dark Slate, Neon Cyber, Amber CRT, Emerald Matrix.
+- **Dynamic Input Box**: Expands from 3 to 8 lines as text grows.
+- **Collapsible Reasoning Blocks (`Ctrl+T`)**: Expand or collapse internal model thinking streams.
 - **Rich Markdown Formatting**: In-terminal syntax-highlighted code blocks, blockquotes, headers, and bullet lists.
 
 ---
 
-## 📄 License
+## Verification
+
+| Metric | Value |
+|--------|-------|
+| Tests passed | 242 |
+| Tests failed | 0 |
+| Build | `cargo build --release` succeeds |
+| System doctor | 92% health (11 Pass, 1 Warn, 0 Failed) |
+| Acceptance gates | G1-G13 all PASSED |
+
+---
+
+## License
 MIT License. Free and open-source.

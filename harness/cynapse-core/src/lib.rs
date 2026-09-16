@@ -41,7 +41,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-/// Validate path safety: prevents path traversal to sensitive system files.
+/// Validate path safety: prevents path traversal and symlink bypass to sensitive system files.
 fn validate_safe_path(p_str: &str, for_write: bool) -> Result<PathBuf> {
     let raw_path = if p_str.starts_with('~') {
         if let Some(home) = dirs::home_dir() {
@@ -58,25 +58,39 @@ fn validate_safe_path(p_str: &str, for_write: bool) -> Result<PathBuf> {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(raw_path)
     };
 
+    let resolved = if normalized.exists() {
+        normalized.canonicalize().unwrap_or_else(|_| normalized.clone())
+    } else if let Some(parent) = normalized.parent() {
+        if parent.exists() {
+            parent.canonicalize().map(|p| p.join(normalized.file_name().unwrap_or_default())).unwrap_or_else(|_| normalized.clone())
+        } else {
+            normalized.clone()
+        }
+    } else {
+        normalized.clone()
+    };
+
     let p_str_clean = normalized.to_string_lossy();
-    let sensitive_prefixes = [
-        "/etc/shadow", "/etc/passwd", "/etc/sudoers",
-        "/.ssh", "/root", "/proc/kcore", "/dev/mem",
+    let resolved_str = resolved.to_string_lossy();
+
+    let sensitive_patterns = [
+        "/etc/shadow", "/etc/passwd", "/etc/sudoers", "/etc/master.passwd",
+        "/.ssh", "/root", "/proc/kcore", "/dev/mem", "/dev/kmem",
     ];
 
-    for sensitive in &sensitive_prefixes {
-        if p_str_clean.contains(sensitive) {
+    for sensitive in &sensitive_patterns {
+        if p_str_clean.contains(sensitive) || resolved_str.contains(sensitive) {
             bail!("Access denied: path '{}' accesses sensitive system resources.", p_str);
         }
     }
 
     if for_write {
-        if p_str_clean == "/" || p_str_clean == "/etc" || p_str_clean == "/usr" || p_str_clean == "/bin" {
+        if resolved_str == "/" || resolved_str == "/etc" || resolved_str == "/usr" || resolved_str == "/bin" || resolved_str == "/sbin" {
             bail!("Access denied: cannot write to system directory '{}'.", p_str);
         }
     }
 
-    Ok(normalized)
+    Ok(resolved)
 }
 
 /// Native implementation of atomic-agent tools with sandboxing and execution timeout.
@@ -251,6 +265,22 @@ mod tests {
         assert!(validate_safe_path("/etc/shadow", false).is_err());
         assert!(validate_safe_path("/root/.ssh/id_rsa", false).is_err());
         assert!(validate_safe_path("src/lib.rs", false).is_ok());
+    }
+
+    #[test]
+    fn test_symlink_safety() {
+        let temp_dir = std::env::temp_dir();
+        let symlink_path = temp_dir.join("cynapse_test_symlink_passwd");
+        let _ = fs::remove_file(&symlink_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            if symlink("/etc/passwd", &symlink_path).is_ok() {
+                let res = validate_safe_path(&symlink_path.to_string_lossy(), false);
+                let _ = fs::remove_file(&symlink_path);
+                assert!(res.is_err());
+            }
+        }
     }
 
     #[test]

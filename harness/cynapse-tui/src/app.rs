@@ -27,7 +27,7 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use cynapse_core::offline_agent::{validate_gbnf_tool_call, LoopGuard};
+use cynapse_core::offline_agent::{validate_gbnf_tool_calls, LoopGuard};
 use cynapse_core::session::{SessionData, SessionManager, SessionMessage};
 use cynapse_engine::{
     fetch_native_models, probe_hardware_info, query_model_stream, route_model,
@@ -35,7 +35,9 @@ use cynapse_engine::{
 };
 use cynapse_memory::context::DendriteContext;
 use cynapse_memory::graph::Dendrite;
+use cynapse_memory::reflection::{Message as ReflMessage, Role as ReflRole};
 use cynapse_memory::store::DendriteStore;
+use cynapse_memory::ReflectionWorker;
 use crate::terminal::TuiRuntimeGuard;
 use crate::theme::AppTheme;
 
@@ -247,6 +249,8 @@ pub struct TuiApp {
     pub persona_editing: bool,
     pub persona_edit_buffer: String,
     pub persona_edit_cursor: usize,
+    pub cached_zone_a_prefix: Option<String>,
+    pub reflection_worker: ReflectionWorker,
 }
 
 impl TuiApp {
@@ -266,6 +270,7 @@ impl TuiApp {
             .unwrap_or(0);
         let hw_info = probe_hardware_info();
         let initial_tier = route_model(&models_dir.join(&active_model_name), false).tier;
+        let reflection_worker = ReflectionWorker::new(graph.clone(), store.clone());
         Self {
             models_dir,
             active_model_name,
@@ -277,6 +282,7 @@ impl TuiApp {
             graph,
             store,
             dendrite_ctx,
+            reflection_worker,
             input: String::new(),
             input_cursor: 0,
             messages: vec![ChatMessage {
@@ -325,7 +331,24 @@ impl TuiApp {
             persona_editing: false,
             persona_edit_buffer: String::new(),
             persona_edit_cursor: 0,
+            cached_zone_a_prefix: None,
         }
+    }
+
+    /// Retrieves or compiles the byte-stable Zone A system prompt prefix for KV-cache preservation.
+    pub fn get_or_compile_zone_a_prefix(&mut self) -> String {
+        if let Some(ref p) = self.cached_zone_a_prefix {
+            return p.clone();
+        }
+        let persona_prompt = self.persona_mgr.build_system_prompt();
+        let prefix = cynapse_core::offline_agent::compile_zone_a_prefix(&persona_prompt);
+        self.cached_zone_a_prefix = Some(prefix.clone());
+        prefix
+    }
+
+    /// Invalidates the compiled Zone A prefix when persona or system settings change.
+    pub fn invalidate_zone_a_prefix(&mut self) {
+        self.cached_zone_a_prefix = None;
     }
 
     /// Re-evaluates active engine tier based on current model size and host RAM.
@@ -852,6 +875,7 @@ impl TuiApp {
                                         let idx = self.selected_persona_idx.min(personas.len() - 1);
                                         let name = &personas[idx];
                                         if let Ok(_) = self.persona_mgr.write_file(name, &self.persona_edit_buffer) {
+                                            self.invalidate_zone_a_prefix();
                                             self.messages.push(ChatMessage {
                                                 role: "system".into(),
                                                 content: format!("✓ Persona file '{}.md' updated and saved.", name),
@@ -992,6 +1016,7 @@ impl TuiApp {
                                     }
                                     ActiveModal::PersonaManager => {
                                         self.persona_mgr.set_active_persona(None);
+                                        self.invalidate_zone_a_prefix();
                                         self.messages.push(ChatMessage {
                                             role: "system".into(),
                                             content: "Persona reset to default Cynapse identity (IDENTITY.md + SOUL.md + USER.md).".into(),
@@ -1034,6 +1059,7 @@ impl TuiApp {
                                             let idx = self.selected_persona_idx.min(personas.len() - 1);
                                             let selected_name = personas[idx].clone();
                                             self.persona_mgr.set_active_persona(Some(selected_name.clone()));
+                                            self.invalidate_zone_a_prefix();
                                             self.messages.push(ChatMessage {
                                                 role: "system".into(),
                                                 content: format!("Active persona loaded: {}.md", selected_name),
@@ -1320,6 +1346,7 @@ impl TuiApp {
                                     let target = parts.get(2).cloned().unwrap_or(parts.get(1).cloned().unwrap_or(""));
                                     if target.is_empty() || target == "default" || target == "reset" {
                                         self.persona_mgr.set_active_persona(None);
+                                        self.invalidate_zone_a_prefix();
                                         self.messages.push(ChatMessage {
                                             role: "system".into(),
                                             content: "Persona reset to default Cynapse identity (IDENTITY.md + SOUL.md + USER.md).".into(),
@@ -1327,6 +1354,7 @@ impl TuiApp {
                                         });
                                     } else {
                                         self.persona_mgr.set_active_persona(Some(target.to_string()));
+                                        self.invalidate_zone_a_prefix();
                                         self.messages.push(ChatMessage {
                                             role: "system".into(),
                                             content: format!("Active persona loaded: {}.md", target),
@@ -1348,6 +1376,7 @@ impl TuiApp {
 
                                 if trimmed == "/persona default" || trimmed == "/persona reset" {
                                     self.persona_mgr.set_active_persona(None);
+                                    self.invalidate_zone_a_prefix();
                                     self.messages.push(ChatMessage {
                                         role: "system".into(),
                                         content: "Persona reset to default Cynapse identity.".into(),
@@ -1370,22 +1399,22 @@ impl TuiApp {
                                 self.auto_scroll = true; // Lock scroll to bottom for incoming response
 
                                 // Build Two-Zone Prompt: Zone A (Invariant Prefix) & Zone B (Variable Tail)
-                                let is_conversational = cynapse_memory::context::is_conversational_query(&trimmed);
-                                let persona_prompt = self.persona_mgr.build_system_prompt();
-                                // Dendrite is disconnected for testing: pure harness/engine isolation
-                                let memory_prompt = String::new();
-                                let system_prompt = if is_conversational {
-                                    cynapse_core::offline_agent::compile_conversational_prefix(&persona_prompt)
-                                } else {
-                                    cynapse_core::offline_agent::compile_zone_a_prefix(&persona_prompt)
-                                };
+                                let system_prompt = self.get_or_compile_zone_a_prefix();
+                                let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&trimmed, 1500, true, false);
 
-                                let history_context: String = self.messages.iter().rev().skip(1).take(6).collect::<Vec<_>>().into_iter().rev()
+                                let history_context: String = self.messages
+                                    .iter()
+                                    .take(self.messages.len().saturating_sub(1))
+                                    .rev()
+                                    .take(6)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
                                     .map(|m| format!("{}: {}", m.role.to_uppercase(), m.content))
                                     .collect::<Vec<_>>()
                                     .join("\n\n");
 
-                                let prompt = cynapse_core::offline_agent::compile_zone_b_tail(&memory_prompt, &history_context, &trimmed);
+                                let prompt = cynapse_core::offline_agent::compile_zone_b_tail(&memory_prompt, &history_context, &trimmed, None);
 
                                 // Spawn Non-blocking Async LLM Task
                                 let (tx, rx) = mpsc::unbounded_channel();
@@ -1465,6 +1494,7 @@ impl TuiApp {
         }
 
         let mut finished = false;
+        let mut reprompting = false;
         for event in events {
             match event {
                 StreamEvent::Token { ttype, text } => match ttype {
@@ -1475,112 +1505,145 @@ impl TuiApp {
                     self.last_tok_per_sec = tok_per_sec;
                     self.last_latency_sec = elapsed_sec;
 
-                    let mut triggered_reprompt = false;
                     const MAX_AGENT_STEPS: usize = 5;
 
                     // Offline Agent: GBNF tool call check (response buffer fallback to thinking buffer) & circular LoopGuard intervention
-                    let detected_tool = validate_gbnf_tool_call(&self.current_response_buf)
-                        .or_else(|_| validate_gbnf_tool_call(&self.current_thinking_buf));
+                    let detected_tools = validate_gbnf_tool_calls(&self.current_response_buf)
+                        .or_else(|_| validate_gbnf_tool_calls(&self.current_thinking_buf));
 
-                    if let Ok(tool_call) = detected_tool {
-                        if self.agent_step_count >= MAX_AGENT_STEPS {
-                            self.messages.push(ChatMessage {
-                                role: "system".into(),
-                                content: format!("⚠️ MAX AGENT STEPS REACHED ({} steps): Automated tool execution loop paused to prevent runaway execution.", MAX_AGENT_STEPS),
-                                thinking: None,
-                            });
-                            self.save_current_session();
-                        } else {
-                            match self.loop_guard.record_and_check(&tool_call) {
-                                Ok(()) => {
-                                    self.agent_step_count += 1;
-                                    let (tool_output, ok) = self.execute_tool_and_format(&tool_call);
-                                    let assistant_content = if self.current_response_buf.trim().is_empty() {
-                                        format!("Executing tool `{}`", tool_call.name)
+                    if let Ok(tool_calls) = detected_tools {
+                        if !tool_calls.is_empty() {
+                            if self.agent_step_count >= MAX_AGENT_STEPS {
+                                self.messages.push(ChatMessage {
+                                    role: "system".into(),
+                                    content: format!("⚠️ MAX AGENT STEPS REACHED ({} steps): Automated tool execution loop paused to prevent runaway execution.", MAX_AGENT_STEPS),
+                                    thinking: None,
+                                });
+                                self.save_current_session();
+                            } else {
+                                self.agent_step_count += 1;
+                                let mut tool_results: Vec<String> = Vec::new();
+                                let mut tool_names: Vec<String> = Vec::new();
+                                let mut veto_notices: Vec<String> = Vec::new();
+                                let mut all_vetoed = true;
+
+                                let assistant_content = if self.current_response_buf.trim().is_empty() {
+                                    let names: Vec<String> = tool_calls.iter().map(|t| format!("`{}`", t.name)).collect();
+                                    format!("Executing tools: {}", names.join(", "))
+                                } else {
+                                    self.current_response_buf.clone()
+                                };
+                                self.messages.push(ChatMessage {
+                                    role: "assistant".into(),
+                                    content: assistant_content,
+                                    thinking: if self.current_thinking_buf.is_empty() {
+                                        None
                                     } else {
-                                        self.current_response_buf.clone()
-                                    };
-                                    self.messages.push(ChatMessage {
-                                        role: "assistant".into(),
-                                        content: assistant_content,
-                                        thinking: if self.current_thinking_buf.is_empty() {
-                                            None
-                                        } else {
-                                            Some(self.current_thinking_buf.clone())
-                                        },
-                                    });
-                                    self.messages.push(ChatMessage {
-                                        role: "system".into(),
-                                        content: format!("🔧 Tool Call [{}] Executed (Step {}/{}):\n{}", tool_call.name, self.agent_step_count, MAX_AGENT_STEPS, tool_output),
-                                        thinking: None,
-                                    });
-                                    self.save_current_session();
+                                        Some(self.current_thinking_buf.clone())
+                                    },
+                                });
 
-                                    if ok {
-                                        triggered_reprompt = true;
-                                        let (tx, rx) = mpsc::unbounded_channel();
-                                        self.stream_rx = Some(rx);
-                                        self.is_generating = true;
-                                        self.current_thinking_buf.clear();
-                                        self.current_response_buf.clear();
-
-                                        let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
-                                        let persona_prompt = self.persona_mgr.build_system_prompt();
-                                        // Dendrite disconnected for testing
-                                        let memory_prompt = String::new();
-                                        let system_prompt = cynapse_core::offline_agent::compile_zone_a_prefix(&persona_prompt);
-                                        let endpoint = self.tier1_endpoint.clone();
-                                        let model_name = self.active_model_name.clone();
-
-                                        let history_context: String = self.messages.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev()
-                                            .map(|m| format!("{}: {}", m.role.to_uppercase(), m.content))
-                                            .collect::<Vec<_>>()
-                                            .join("\n\n");
-
-                                        let tool_instruction = format!("Tool Result for `{}`:\n{}\n\nContinue resolution of user request: {}", tool_call.name, tool_output, user_msg);
-                                        let prompt = cynapse_core::offline_agent::compile_zone_b_tail(&memory_prompt, &history_context, &tool_instruction);
-
-                                        let tier = self.active_tier;
-                                        tokio::spawn(async move {
-                                            let res = query_model_stream(
-                                                tier,
-                                                &endpoint,
-                                                &model_name,
-                                                &prompt,
-                                                &system_prompt,
-                                                |ttype, token| {
-                                                    let _ = tx.send(StreamEvent::Token { ttype, text: token.to_string() });
-                                                },
-                                            )
-                                            .await;
-
-                                            match res {
-                                                Ok(stats) => {
-                                                    let _ = tx.send(StreamEvent::Done {
-                                                        tok_per_sec: stats.tok_per_sec,
-                                                        elapsed_sec: stats.elapsed_sec,
-                                                    });
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx.send(StreamEvent::Error(e.to_string()));
-                                                }
-                                            }
-                                        });
+                                for tool_call in &tool_calls {
+                                    tool_names.push(tool_call.name.clone());
+                                    match self.loop_guard.check(tool_call) {
+                                        Ok(()) => {
+                                            all_vetoed = false;
+                                            self.loop_guard.record_call(tool_call);
+                                            let (tool_output, _ok) = self.execute_tool_and_format(tool_call);
+                                            self.loop_guard.record_outcome(tool_call, &tool_output);
+                                            tool_results.push(format!("[{}]\n{}", tool_call.name, tool_output));
+                                        }
+                                        Err(loop_warn) => {
+                                            self.loop_guard.record_veto(tool_call);
+                                            veto_notices.push(format!("Loop intervention for `{}`: {}", tool_call.name, loop_warn));
+                                            tool_results.push(format!("[{}] Vetoed: {}", tool_call.name, loop_warn));
+                                        }
                                     }
                                 }
-                                Err(loop_warn) => {
-                                    self.messages.push(ChatMessage {
-                                        role: "system".into(),
-                                        content: loop_warn,
-                                        thinking: None,
+
+                                let combined_output = tool_results.join("\n\n");
+                                self.messages.push(ChatMessage {
+                                    role: "system".into(),
+                                    content: format!(
+                                        "🔧 Tool Batch [{}] Executed (Step {}/{}):\n{}",
+                                        tool_names.join(", "),
+                                        self.agent_step_count,
+                                        MAX_AGENT_STEPS,
+                                        combined_output
+                                    ),
+                                    thinking: None,
+                                });
+                                self.save_current_session();
+
+                                if !all_vetoed {
+                                    reprompting = true;
+                                    let (tx, rx) = mpsc::unbounded_channel();
+                                    self.stream_rx = Some(rx);
+                                    self.is_generating = true;
+                                    self.current_thinking_buf.clear();
+                                    self.current_response_buf.clear();
+
+                                    let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
+                                    let system_prompt = self.get_or_compile_zone_a_prefix();
+                                    let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&user_msg, 1500, true, false);
+                                    let endpoint = self.tier1_endpoint.clone();
+                                    let model_name = self.active_model_name.clone();
+
+                                    let history_context: String = self.messages.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev()
+                                        .map(|m| format!("{}: {}", m.role.to_uppercase(), m.content))
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n");
+
+                                    let tool_instruction = format!(
+                                        "Tool Results for `{}`:\n{}\n\nContinue resolution of user request: {}",
+                                        tool_names.join(", "),
+                                        combined_output,
+                                        user_msg
+                                    );
+                                    let notice_str = if !veto_notices.is_empty() {
+                                        Some(veto_notices.join("\n"))
+                                    } else {
+                                        None
+                                    };
+                                    let prompt = cynapse_core::offline_agent::compile_zone_b_tail(
+                                        &memory_prompt,
+                                        &history_context,
+                                        &tool_instruction,
+                                        notice_str.as_deref(),
+                                    );
+
+                                    let tier = self.active_tier;
+                                    tokio::spawn(async move {
+                                        let res = query_model_stream(
+                                            tier,
+                                            &endpoint,
+                                            &model_name,
+                                            &prompt,
+                                            &system_prompt,
+                                            |ttype, token| {
+                                                let _ = tx.send(StreamEvent::Token { ttype, text: token.to_string() });
+                                            },
+                                        )
+                                        .await;
+
+                                        match res {
+                                            Ok(stats) => {
+                                                let _ = tx.send(StreamEvent::Done {
+                                                    tok_per_sec: stats.tok_per_sec,
+                                                    elapsed_sec: stats.elapsed_sec,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(StreamEvent::Error(e.to_string()));
+                                            }
+                                        }
                                     });
-                                    self.save_current_session();
                                 }
                             }
                         }
                     }
 
-                    if !triggered_reprompt {
+                    if !reprompting {
                         self.messages.push(ChatMessage {
                             role: "assistant".into(),
                             content: self.current_response_buf.clone(),
@@ -1601,8 +1664,36 @@ impl TuiApp {
                             let title = format!("Turn: {}", excerpt);
                             let content = format!("User: {}\n\nAssistant: {}", user_msg, self.current_response_buf);
 
-                            // Dendrite is disconnected for testing: skip graph upserts and store writes
-                            let _ = (turn_id, excerpt, title, content);
+                            let turn_node = self.graph.upsert(
+                                &turn_id,
+                                &title,
+                                &content,
+                                cynapse_memory::graph::NodeType::TurnLog,
+                                Some(vec!["#turn".into(), "#chat".into()]),
+                            );
+                            if let Some(s) = &self.store {
+                                let _ = s.save(&turn_node);
+                            }
+
+                            // Trigger Async Background Reflection (fire-and-forget out-of-band distillation)
+                            let recent_refl_msgs: Vec<ReflMessage> = self.messages
+                                .iter()
+                                .rev()
+                                .take(6)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .map(|m| {
+                                    let role = match m.role.as_str() {
+                                        "user" => ReflRole::User,
+                                        "assistant" => ReflRole::Assistant,
+                                        "system" => ReflRole::System,
+                                        _ => ReflRole::Tool,
+                                    };
+                                    ReflMessage::text(role, m.content.clone())
+                                })
+                                .collect();
+                            self.reflection_worker.spawn_reflection(recent_refl_msgs);
                         }
 
                         self.is_generating = false;
@@ -1620,7 +1711,7 @@ impl TuiApp {
                 }
             }
         }
-        if finished {
+        if finished && !reprompting {
             self.stream_rx = None;
         }
     }
@@ -2989,4 +3080,34 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zone_a_prefix_caching_and_invalidation() {
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:11434".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        assert!(app.cached_zone_a_prefix.is_none());
+        let p1 = app.get_or_compile_zone_a_prefix();
+        assert!(app.cached_zone_a_prefix.is_some());
+        let p2 = app.get_or_compile_zone_a_prefix();
+        assert_eq!(p1, p2);
+
+        app.invalidate_zone_a_prefix();
+        assert!(app.cached_zone_a_prefix.is_none());
+        let p3 = app.get_or_compile_zone_a_prefix();
+        assert_eq!(p1, p3);
+    }
 }

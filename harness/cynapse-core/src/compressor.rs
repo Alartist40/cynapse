@@ -23,14 +23,15 @@ pub struct CompressorOptions {
 impl Default for CompressorOptions {
     fn default() -> Self {
         Self {
-            max_summary_length: 400,
-            max_tail_lines: 12,
+            max_summary_length: 1200,
+            max_tail_lines: 20,
         }
     }
 }
 
 const ERROR_MARKERS: &[&str] = &[
     "error:",
+    "error[",
     "failed:",
     "panic:",
     "fatal:",
@@ -42,26 +43,37 @@ const ERROR_MARKERS: &[&str] = &[
     "syntax error",
 ];
 
-/// Extracts key diagnostic signature line if output indicates error or failure.
+/// Extracts key diagnostic signature lines if output indicates error or failure.
 fn extract_signature(text: &str, is_error: bool) -> Option<String> {
     if !is_error {
         return None;
     }
+    let mut sigs = Vec::new();
     for line in text.lines() {
         let lower = line.to_lowercase();
         for marker in ERROR_MARKERS {
             if lower.contains(marker) {
                 let trimmed = line.trim();
-                let sig = if trimmed.chars().count() > 180 {
-                    trimmed.chars().take(180).collect::<String>() + "…"
+                let sig = if trimmed.chars().count() > 250 {
+                    trimmed.chars().take(250).collect::<String>() + "…"
                 } else {
                     trimmed.to_string()
                 };
-                return Some(format!("key: {}", sig));
+                if !sigs.contains(&sig) {
+                    sigs.push(sig);
+                }
+                break;
             }
         }
+        if sigs.len() >= 3 {
+            break;
+        }
     }
-    None
+    if sigs.is_empty() {
+        None
+    } else {
+        Some(sigs.iter().map(|s| format!("key: {}", s)).collect::<Vec<_>>().join("\n"))
+    }
 }
 
 /// Extracts trailing lines while skipping massive intermediate logs.
@@ -134,6 +146,16 @@ mod tests {
         let res = compress_tool_result(text, true, None);
         assert!(res.signature.is_some());
         assert!(res.signature.as_ref().unwrap().contains("key: error: unresolved import"));
+    }
+
+    #[test]
+    fn test_compress_multi_error_signatures() {
+        let text = "Compiling...\nerror[E0425]: cannot find value `foo`\nerror[E0425]: cannot find value `bar`\nfatal: aborting";
+        let res = compress_tool_result(text, true, None);
+        assert!(res.signature.is_some());
+        let sig = res.signature.unwrap();
+        assert!(sig.contains("key: error[E0425]: cannot find value `foo`"));
+        assert!(sig.contains("key: error[E0425]: cannot find value `bar`"));
     }
 
     #[test]

@@ -49,6 +49,109 @@ impl EngineTier {
     }
 }
 
+/// Provider backend kind for multi-provider resilience and fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ProviderKind {
+    LlamaServer,
+    Ollama,
+    NativeLeafcutter,
+}
+
+impl ProviderKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProviderKind::LlamaServer => "llama-server",
+            ProviderKind::Ollama => "Ollama",
+            ProviderKind::NativeLeafcutter => "Native Leafcutter",
+        }
+    }
+}
+
+/// Dynamic Provider Fallback Chain with escalating cooldown and lazy probe recovery.
+#[derive(Debug, Clone)]
+pub struct ProviderFallbackChain {
+    pub primary: ProviderKind,
+    pub fallbacks: Vec<ProviderKind>,
+    pub consecutive_failures: usize,
+    pub active_override: Option<ProviderKind>,
+    pub override_until: Option<Instant>,
+    pub last_failure_reason: Option<String>,
+}
+
+impl Default for ProviderFallbackChain {
+    fn default() -> Self {
+        Self::new(
+            ProviderKind::LlamaServer,
+            vec![ProviderKind::Ollama, ProviderKind::NativeLeafcutter],
+        )
+    }
+}
+
+impl ProviderFallbackChain {
+    pub fn new(primary: ProviderKind, fallbacks: Vec<ProviderKind>) -> Self {
+        Self {
+            primary,
+            fallbacks,
+            consecutive_failures: 0,
+            active_override: None,
+            override_until: None,
+            last_failure_reason: None,
+        }
+    }
+
+    /// Resolves the provider to use for the active turn.
+    /// Returns (ProviderKind, is_probe).
+    pub fn resolve_provider(&self) -> (ProviderKind, bool) {
+        if let Some(override_provider) = self.active_override {
+            if let Some(until) = self.override_until {
+                if Instant::now() < until {
+                    return (override_provider, false);
+                } else {
+                    // Cooldown elapsed -> lazy probe of primary provider
+                    return (self.primary, true);
+                }
+            }
+            return (override_provider, false);
+        }
+        (self.primary, false)
+    }
+
+    /// Records a successful turn, resetting failure counters and clearing active overrides.
+    pub fn record_success(&mut self, _provider: ProviderKind) {
+        self.consecutive_failures = 0;
+        self.active_override = None;
+        self.override_until = None;
+        self.last_failure_reason = None;
+    }
+
+    /// Records a provider failure, escalating cooldown (30s -> 60s -> 300s) and setting sticky fallback.
+    pub fn record_failure(&mut self, failed_provider: ProviderKind, reason: &str) {
+        self.consecutive_failures += 1;
+        self.last_failure_reason = Some(reason.to_string());
+
+        let cooldown_secs = match self.consecutive_failures {
+            1 => 30,
+            2 => 60,
+            _ => 300,
+        };
+
+        // Pick next fallback provider
+        let next_fallback = self.fallbacks
+            .iter()
+            .find(|&&p| p != failed_provider)
+            .copied()
+            .unwrap_or(self.primary);
+
+        self.active_override = Some(next_fallback);
+        self.override_until = Some(Instant::now() + Duration::from_secs(cooldown_secs));
+    }
+}
+
+pub fn shared_fallback_chain() -> &'static std::sync::Mutex<ProviderFallbackChain> {
+    static CHAIN: std::sync::OnceLock<std::sync::Mutex<ProviderFallbackChain>> = std::sync::OnceLock::new();
+    CHAIN.get_or_init(|| std::sync::Mutex::new(ProviderFallbackChain::default()))
+}
+
 pub struct RouteDecision {
     pub tier: EngineTier,
     pub model_size_mb: f64,
@@ -461,6 +564,7 @@ pub async fn query_model_stream(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStats {
     pub model_name: String,
     pub tokens_generated: usize,
@@ -695,30 +799,98 @@ pub fn query_native_leafcutter_stream(
     })
 }
 
-/// Real token-by-token streaming query runner (HTTP endpoint first, native Leafcutter fallback).
-pub async fn query_tier1_stream(
-    endpoint: &str,
+pub fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+async fn parse_http_stream(
+    res: reqwest::Response,
+    model_name: &str,
+    start: Instant,
+    mut on_token: impl FnMut(TokenType, &str),
+) -> Result<ExecutionStats> {
+    let mut stream = res.bytes_stream();
+    let mut tokens_generated = 0usize;
+    let is_reasoning = is_reasoning_model(model_name);
+    let mut is_thinking = is_reasoning;
+    let mut buffer = String::with_capacity(65536);
+
+    while let Some(item) = stream.next().await {
+        let chunk_bytes = item.context("Error reading stream chunk from LLM engine")?;
+        let text = String::from_utf8_lossy(&chunk_bytes);
+        buffer.push_str(&text);
+
+        while let Some(pos) = buffer.find('\n') {
+            let mut line = buffer[..pos].trim().to_string();
+            buffer.drain(..=pos);
+
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with("data:") {
+                line = line.trim_start_matches("data:").trim().to_string();
+            }
+
+            if line == "[DONE]" {
+                break;
+            }
+
+            if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
+                if let Some(token) = parsed.extract_token() {
+                    if !token.is_empty() {
+                        tokens_generated += 1;
+
+                        if token.contains("<think>") {
+                            is_thinking = true;
+                            let clean = token.replace("<think>", "");
+                            if !clean.is_empty() {
+                                on_token(TokenType::Thinking, &clean);
+                            }
+                        } else if token.contains("</think>") {
+                            let clean = token.replace("</think>", "");
+                            if !clean.is_empty() {
+                                on_token(TokenType::Thinking, &clean);
+                            }
+                            is_thinking = false;
+                        } else {
+                            let ttype = if is_thinking { TokenType::Thinking } else { TokenType::Response };
+                            on_token(ttype, &token);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
+    let tok_per_sec = tokens_generated as f64 / elapsed_sec;
+    let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
+
+    Ok(ExecutionStats {
+        model_name: model_name.to_string(),
+        tokens_generated: tokens_generated.max(1),
+        elapsed_sec,
+        tok_per_sec,
+        avail_ram_gb,
+    })
+}
+
+pub async fn try_llama_server_stream(
     model_name: &str,
     prompt: &str,
     system_prompt: &str,
-    mut on_token: impl FnMut(TokenType, &str),
+    on_token: impl FnMut(TokenType, &str),
 ) -> Result<ExecutionStats> {
-    // 1. Try HTTP endpoint (managed llama-server on 38265 first, then Ollama)
-    let client = reqwest::Client::new();
-    let start = Instant::now();
-
     let daemon_port = daemon::DEFAULT_DAEMON_PORT;
-    // Check if external endpoint (e.g. Ollama on 11434) is actively responding
-    let endpoint_healthy = client.get(format!("{}/api/tags", endpoint.trim_end_matches('/')))
-        .timeout(Duration::from_millis(300))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-
-    let daemon_ready = if endpoint_healthy {
-        false // Active external endpoint (e.g. Ollama) takes top priority
-    } else if daemon::LlamaServerDaemon::is_healthy(daemon_port) {
+    let daemon_ready = if daemon::LlamaServerDaemon::is_healthy(daemon_port) {
         true
     } else if let Some(local_path) = find_model_file_path(model_name) {
         daemon::LlamaServerDaemon::get_or_spawn_daemon(&local_path, daemon_port)
@@ -726,196 +898,129 @@ pub async fn query_tier1_stream(
         false
     };
 
-    let (url, payload, resolved_model) = if daemon_ready {
-        let llama_url = format!("http://127.0.0.1:{}/completion", daemon_port);
-        let full_p = if system_prompt.is_empty() {
-            format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
-        } else {
-            format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", system_prompt, prompt)
-        };
-        let p = serde_json::json!({
-            "prompt": full_p,
-            "stream": true,
-            "cache_prompt": true,
-            "keep_alive": -1,
-            "slot_id": 0,
-            "id_slot": 0,
+    if !daemon_ready {
+        anyhow::bail!("llama-server daemon not running and cannot be spawned for {}", model_name);
+    }
+
+    let client = shared_http_client();
+    let llama_url = format!("http://127.0.0.1:{}/completion", daemon_port);
+    let full_p = if system_prompt.is_empty() {
+        format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+    } else {
+        format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", system_prompt, prompt)
+    };
+    let payload = serde_json::json!({
+        "prompt": full_p,
+        "stream": true,
+        "cache_prompt": true,
+        "keep_alive": -1,
+        "slot_id": 0,
+        "id_slot": 0,
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "top_k": 40,
+        "repeat_penalty": 1.1,
+        "repeat_last_n": 256
+    });
+
+    let start = Instant::now();
+    let resp = client
+        .post(&llama_url)
+        .header("Accept", "application/x-ndjson, text/event-stream, application/json")
+        .json(&payload)
+        .send()
+        .await
+        .context("Failed to connect to llama-server daemon")?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("llama-server returned HTTP error: {}", resp.status());
+    }
+
+    parse_http_stream(resp, model_name, start, on_token).await
+}
+
+pub async fn try_ollama_stream(
+    endpoint: &str,
+    model_name: &str,
+    prompt: &str,
+    system_prompt: &str,
+    on_token: impl FnMut(TokenType, &str),
+) -> Result<ExecutionStats> {
+    let client = shared_http_client();
+    let available_tags = fetch_ollama_models(endpoint).await;
+    let resolved = resolve_model_tag(model_name, &available_tags);
+    let ollama_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
+    let payload = serde_json::json!({
+        "model": resolved,
+        "prompt": prompt,
+        "system": system_prompt,
+        "stream": true,
+        "cache_prompt": true,
+        "keep_alive": -1,
+        "slot_id": 0,
+        "id_slot": 0,
+        "options": {
+            "num_ctx": 4096,
             "temperature": 0.2,
             "top_p": 0.95,
             "top_k": 40,
             "repeat_penalty": 1.1,
             "repeat_last_n": 256
-        });
-        (llama_url, p, model_name.to_string())
-    } else {
-        let available_tags = fetch_ollama_models(endpoint).await;
-        let resolved = resolve_model_tag(model_name, &available_tags);
-        let ollama_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
-        let p = serde_json::json!({
-            "model": resolved,
-            "prompt": prompt,
-            "system": system_prompt,
-            "stream": true,
-            "cache_prompt": true,
-            "keep_alive": -1,
-            "slot_id": 0,
-            "id_slot": 0,
-            "options": {
-                "num_ctx": 4096,
-                "temperature": 0.2,
-                "top_p": 0.95,
-                "top_k": 40,
-                "repeat_penalty": 1.1,
-                "repeat_last_n": 256
-            }
-        });
-        (ollama_url, p, resolved)
-    };
+        }
+    });
 
-    let mut http_err: Option<String> = None;
-    let mut resp_opt: Option<reqwest::Response> = None;
+    let start = Instant::now();
+    let resp = client
+        .post(&ollama_url)
+        .header("Accept", "application/x-ndjson, text/event-stream, application/json")
+        .json(&payload)
+        .send()
+        .await
+        .context("Failed to connect to Ollama endpoint")?;
 
-    let mut attempt = 0;
-    let max_attempts = 3;
-    let mut delay_ms = 150u64;
-
-    while attempt < max_attempts {
-        attempt += 1;
-        let req_builder = client
-            .post(&url)
-            .header("Accept", "application/x-ndjson, text/event-stream, application/json")
-            .json(&payload);
-
-        match req_builder.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                resp_opt = Some(resp);
-                break;
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND && resolved_model != model_name => {
-                let retry_payload = serde_json::json!({
-                    "model": model_name,
-                    "prompt": prompt,
-                    "system": system_prompt,
-                    "stream": true,
-                    "cache_prompt": true,
-                    "slot_id": 0,
-                    "id_slot": 0,
-                    "options": {
-                        "num_ctx": 4096,
-                        "temperature": 0.2,
-                        "top_p": 0.95,
-                        "top_k": 40,
-                        "repeat_penalty": 1.1,
-                        "repeat_last_n": 256
-                    }
-                });
-                if let Ok(retry_res) = client
-                    .post(&url)
-                    .header("Accept", "application/x-ndjson, text/event-stream, application/json")
-                    .json(&retry_payload)
-                    .send()
-                    .await
-                {
-                    if retry_res.status().is_success() {
-                        resp_opt = Some(retry_res);
-                        break;
-                    }
+    if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && resolved != model_name {
+            let retry_payload = serde_json::json!({
+                "model": model_name,
+                "prompt": prompt,
+                "system": system_prompt,
+                "stream": true,
+                "cache_prompt": true,
+                "slot_id": 0,
+                "id_slot": 0,
+                "options": {
+                    "num_ctx": 4096,
+                    "temperature": 0.2,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "repeat_penalty": 1.1,
+                    "repeat_last_n": 256
                 }
-                http_err = Some(format!("HTTP {}", resp.status()));
-                break;
-            }
-            Ok(resp) => {
-                http_err = Some(format!("HTTP {}", resp.status()));
-                break;
-            }
-            Err(e) => {
-                let is_conn_err = e.is_connect();
-                http_err = Some(e.to_string());
-                if is_conn_err {
-                    // Endpoint is offline; break immediately to native Leafcutter fallback
-                    break;
-                }
-                if attempt < max_attempts {
-                    let jitter = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos())
-                        .unwrap_or(0) % 100) as u64;
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms + jitter)).await;
-                    delay_ms *= 2;
+            });
+            if let Ok(retry_resp) = client
+                .post(&ollama_url)
+                .header("Accept", "application/x-ndjson, text/event-stream, application/json")
+                .json(&retry_payload)
+                .send()
+                .await
+            {
+                if retry_resp.status().is_success() {
+                    return parse_http_stream(retry_resp, model_name, start, on_token).await;
                 }
             }
         }
+        anyhow::bail!("Ollama returned HTTP error: {}", resp.status());
     }
 
-    if let Some(res) = resp_opt {
-        let mut stream = res.bytes_stream();
-        let mut tokens_generated = 0usize;
-        let is_reasoning = is_reasoning_model(model_name);
-        let mut is_thinking = is_reasoning;
-        let mut buffer = String::with_capacity(65536);
+    parse_http_stream(resp, model_name, start, on_token).await
+}
 
-        while let Some(item) = stream.next().await {
-            let chunk_bytes = item.context("Error reading stream chunk from LLM engine")?;
-            let text = String::from_utf8_lossy(&chunk_bytes);
-            buffer.push_str(&text);
-
-            while let Some(pos) = buffer.find('\n') {
-                let mut line = buffer[..pos].trim().to_string();
-                buffer.drain(..=pos);
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if line.starts_with("data:") {
-                    line = line.trim_start_matches("data:").trim().to_string();
-                }
-
-                if line == "[DONE]" {
-                    break;
-                }
-
-                if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
-                    if let Some(token) = parsed.extract_token() {
-                        if !token.is_empty() {
-                            tokens_generated += 1;
-
-                            if token.contains("<think>") {
-                                is_thinking = true;
-                                let clean = token.replace("<think>", "");
-                                if !clean.is_empty() {
-                                    on_token(TokenType::Thinking, &clean);
-                                }
-                            } else if token.contains("</think>") {
-                                let clean = token.replace("</think>", "");
-                                if !clean.is_empty() {
-                                    on_token(TokenType::Thinking, &clean);
-                                }
-                                is_thinking = false;
-                            } else {
-                                let ttype = if is_thinking { TokenType::Thinking } else { TokenType::Response };
-                                on_token(ttype, &token);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
-        let tok_per_sec = tokens_generated as f64 / elapsed_sec;
-        let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
-
-        return Ok(ExecutionStats {
-            model_name: model_name.to_string(),
-            tokens_generated: tokens_generated.max(1),
-            elapsed_sec,
-            tok_per_sec,
-            avail_ram_gb,
-        });
-    }
-
-    // 2. Fallback to direct native Leafcutter execution if GGUF file exists on disk
+pub async fn try_native_leafcutter_stream(
+    model_name: &str,
+    prompt: &str,
+    system_prompt: &str,
+    mut on_token: impl FnMut(TokenType, &str),
+) -> Result<ExecutionStats> {
     if let Some(local_path) = find_model_file_path(model_name) {
         let p = local_path.clone();
         let pr = prompt.to_string();
@@ -933,23 +1038,77 @@ pub async fn query_tier1_stream(
         }
 
         match handle.await {
-            Ok(Ok(stats)) => return Ok(stats),
+            Ok(Ok(stats)) => Ok(stats),
             Ok(Err(e)) => anyhow::bail!("Native Leafcutter engine error for '{}' ({}): {}", model_name, local_path.display(), e),
             Err(join_err) => anyhow::bail!("Native Leafcutter task panicked: {}", join_err),
+        }
+    } else {
+        anyhow::bail!("No local GGUF file found for '{}'", model_name)
+    }
+}
+
+/// Real token-by-token streaming query runner with dynamic multi-provider fallback.
+pub async fn query_tier1_stream(
+    endpoint: &str,
+    model_name: &str,
+    prompt: &str,
+    system_prompt: &str,
+    mut on_token: impl FnMut(TokenType, &str),
+) -> Result<ExecutionStats> {
+    let (resolved_provider, _is_probe) = {
+        let chain = shared_fallback_chain().lock().map_err(|_| anyhow::anyhow!("Fallback chain lock poisoned"))?;
+        chain.resolve_provider()
+    };
+
+    let mut candidate_providers = vec![resolved_provider];
+    for p in [ProviderKind::LlamaServer, ProviderKind::Ollama, ProviderKind::NativeLeafcutter] {
+        if !candidate_providers.contains(&p) {
+            candidate_providers.push(p);
+        }
+    }
+
+    let mut last_error = String::new();
+
+    for provider in candidate_providers {
+        let result = match provider {
+            ProviderKind::LlamaServer => {
+                try_llama_server_stream(model_name, prompt, system_prompt, &mut on_token).await
+            }
+            ProviderKind::Ollama => {
+                try_ollama_stream(endpoint, model_name, prompt, system_prompt, &mut on_token).await
+            }
+            ProviderKind::NativeLeafcutter => {
+                try_native_leafcutter_stream(model_name, prompt, system_prompt, &mut on_token).await
+            }
+        };
+
+        match result {
+            Ok(stats) => {
+                if let Ok(mut chain) = shared_fallback_chain().lock() {
+                    chain.record_success(provider);
+                }
+                return Ok(stats);
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                if let Ok(mut chain) = shared_fallback_chain().lock() {
+                    chain.record_failure(provider, &err_msg);
+                }
+                last_error = err_msg;
+            }
         }
     }
 
     anyhow::bail!(
-        "Local LLM engine at {} is unreachable ({}) and no local GGUF file found for '{}'.",
-        endpoint,
-        http_err.unwrap_or_else(|| "Connection refused".into()),
-        model_name
+        "All providers in fallback chain failed for '{}'. Last error: {}",
+        model_name,
+        last_error
     )
 }
 
 /// Send keep_alive: 0 payload to local LLM engine to immediately free memory.
 pub async fn unload_model(endpoint: &str, model_name: &str) {
-    let client = reqwest::Client::new();
+    let client = shared_http_client();
     let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
     let payload = serde_json::json!({
         "model": model_name,
@@ -960,7 +1119,7 @@ pub async fn unload_model(endpoint: &str, model_name: &str) {
 
 /// Preload and pin model into memory (keep_alive: -1 for Ollama, or spawn daemon for local GGUF).
 pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = shared_http_client();
     let endpoint_clean = endpoint.trim_end_matches('/');
 
     // 1. Check if Ollama is running and pin with keep_alive: -1
@@ -1076,5 +1235,53 @@ mod tests {
         assert_eq!(EngineTier::Tier1Fast.label(), "Tier 1 Fast (llama.cpp)");
         assert_eq!(EngineTier::Tier2LargeGguf.label(), "Tier 2 Stream (Leafcutter)");
         assert_eq!(EngineTier::Tier3LargeSafetensor.label(), "Tier 3 Stream (Safetensors)");
+    }
+
+    #[test]
+    fn test_provider_fallback_chain() {
+        let mut chain = ProviderFallbackChain::new(
+            ProviderKind::LlamaServer,
+            vec![ProviderKind::Ollama, ProviderKind::NativeLeafcutter],
+        );
+
+        // 1. Initially resolves to primary (llama-server)
+        let (p, is_probe) = chain.resolve_provider();
+        assert_eq!(p, ProviderKind::LlamaServer);
+        assert!(!is_probe);
+
+        // 2. On failure, escalates to Ollama with sticky override
+        chain.record_failure(ProviderKind::LlamaServer, "Connection refused");
+        let (p, is_probe) = chain.resolve_provider();
+        assert_eq!(p, ProviderKind::Ollama);
+        assert!(!is_probe);
+        assert_eq!(chain.consecutive_failures, 1);
+
+        // 3. On success on fallback, resets back to primary
+        chain.record_success(ProviderKind::Ollama);
+        let (p, is_probe) = chain.resolve_provider();
+        assert_eq!(p, ProviderKind::LlamaServer);
+        assert!(!is_probe);
+        assert_eq!(chain.consecutive_failures, 0);
+
+        // 4. Consecutive failure cooldown escalation
+        chain.record_failure(ProviderKind::LlamaServer, "Err 1");
+        chain.record_failure(ProviderKind::Ollama, "Err 2");
+        assert_eq!(chain.consecutive_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn test_query_tier1_stream_all_fail() {
+        // Querying non-existent model on unreachable port should try chain and return clean Err
+        let res = query_tier1_stream(
+            "http://127.0.0.1:59999",
+            "non-existent-model-12345.gguf",
+            "hello",
+            "",
+            |_ttype, _token| {},
+        ).await;
+
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("All providers in fallback chain failed"));
     }
 }
