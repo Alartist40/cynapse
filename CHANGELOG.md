@@ -110,6 +110,46 @@ Stages 13-17, inspired by nanobot and gawkbot reference implementations. Gates G
 
 ---
 
+## [Unreleased] — Task 2: Agency Capabilities (2026-09-26)
+
+Stages 18-21. Patterns clean-room adapted from nanobot (spawn/status/announce), gawkbot (mention routing, approval gates — ideas only, Sustainable Use License), and cua (capability manifests). Gates G19-G22. 281 tests passing, doctor 13/13.
+
+### Added
+
+#### Stage 18: Bot Profiles & Registry
+- `harness/cynapse-core/src/bots.rs`: `BotProfile` (slug, persona_file, tools_allow/deny/ask, workspace_restrict, max_concurrent) and `BotRegistry` (TOML files in `~/.cynapse/bots/`, slug validation); deny beats allow, unknown tools fail closed, seeds `coder`/`researcher`/`auditor`.
+- `/bots` TUI modal with profile list, manifest preview (allow/deny/ask), unknown-tool and duplicate-slug warnings.
+- `spawn_subagent` ToolDefinition registered with `concurrency_safe: false`.
+
+#### Stage 19: Subagent Spawn Runtime
+- `harness/cynapse-core/src/subagent.rs`: `SubagentManager` (task lifecycle, `CancellationToken`, semaphore cap 2, announcement channel) and `run_subagent_loop` — injected `query_fn`, 5-step budget with forced finalization turn, GBNF tool parsing, LoopGuard check/record/outcome/veto, `execute_tool_with_profile` dispatch, 6-message history window.
+- Spawn handler: inline (`wait=true`) runs a fresh current-thread runtime on a joined thread; background runs under the semaphore with results announced into conversation history; persona sourced from the bot's `persona_file`.
+- Unit tests for multi-step execution, mid-flight cancellation, and inline/background workflow.
+
+#### Stage 20: Per-Bot Permissions & Approval Gates
+- `execute_tool_with_profile`: allow−deny precedence, workspace path confinement, `requires_approval` fail-closed rejection; `execute_tool_with_profile_approved` for post-approval execution (bypasses only the ask check).
+- Interactive approvals: `approval_fn` injected into `run_subagent_loop` (symmetric with `query_fn`); background ask-tools send `ToolApprovalRequest` over mpsc, drained every event-loop tick into `ActiveModal::ToolApproval`, resolved via oneshot in `handle_approval_decision`; deny returns `[tool denied by user]`; inline subagents fail closed with an explanatory notice.
+- `spawn_subagent` validates slugs against the registry (unknown slug rejected with the available list).
+- `MAX_AGENT_STEPS` exported as a const and used at both spawn call sites.
+- Engine fix: `shared_http_client` gained `connect_timeout(500ms)`; a 4s total body timeout introduced during Stage 19 was removed after audit — reqwest applies it to response streams and would have killed any generation longer than 4s.
+
+#### Stage 21: Agency Orchestration UX & Diagnostics
+- `@slug <task>` input routing into `spawn_subagent` (background default, same fail-closed registry check).
+- `/bots spawn <slug> <task>`, `/bots status [id]`, `/bots cancel <id|all>` slash commands.
+- Stall detection: `check_and_cancel_stalled_tasks(120s)` on `SubagentManager` with `=== NOTICE ===` auto-cancel alerts drained in `poll_stream_events`.
+- Sidebar `AGENCY & BOTS` telemetry (active count, concurrency cap).
+- Doctor 13th subsystem: `[Agency & Bots] Bot Registry & Profile Catalog` (profiles parse, seeded catalog reported); health 13/13.
+- Removed the legacy test-only approval execution branch from `handle_approval_decision`.
+
+### Known Issues
+- DEF-1 (recorded in PLAN.md Stage 21): the stall clock measures total runtime, not inactivity — healthy tasks >120s are cancelled, approval-waiting tasks burn the same clock, and an approval granted after auto-cancel still executes the tool. Fix required before Task 3.
+
+### Fixed (2026-09-26)
+- G20 evidence corrected after audit found the spawn loop was an echo stub — remediated with a real loop and re-verified.
+- G21 evidence corrected after audit found the approval modal was test-only — remediated with channel wiring and re-verified.
+
+---
+
 ## [0.1.0] — Initial Release
 
 - Force-directed 3D graph memory with SQLite FTS5 and BM25 ranking.

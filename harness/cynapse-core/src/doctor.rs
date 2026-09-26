@@ -98,6 +98,9 @@ impl CynapseDoctor {
         // Check 9: Markdown Persona System & System Prompt Directory Integrity
         items.push(self.check_persona_subsystem());
 
+        // Check 10: Bot Registry & Agency Profile Manifest Catalog
+        items.push(self.check_bot_registry_subsystem());
+
         let total_pass = items.iter().filter(|i| i.status == DoctorStatus::Pass).count();
         let total_warn = items.iter().filter(|i| i.status == DoctorStatus::Warning).count();
         let total_repaired = items.iter().filter(|i| i.status == DoctorStatus::Repaired).count();
@@ -483,5 +486,50 @@ impl CynapseDoctor {
                 fix_recommendation: Some(format!("Check permissions or recreate directory at {}", p_dir.display())),
             },
         }
+    }
+
+    fn check_bot_registry_subsystem(&self) -> DoctorItem {
+        let b_dir = crate::bots::BotRegistry::default_dir();
+        match crate::bots::BotRegistry::new(&b_dir) {
+            Ok(reg) => {
+                let bots: Vec<String> = reg.list().into_iter().map(|b| format!("@{}", b.slug)).collect();
+                let status = if self.auto_fix { DoctorStatus::Repaired } else { DoctorStatus::Pass };
+                DoctorItem {
+                    subsystem: "Agency & Bots".into(),
+                    check_name: "Bot Registry & Profile Catalog".into(),
+                    status,
+                    detail: format!("Bot registry at {} verified. Active bot profiles: [{}].", b_dir.display(), bots.join(", ")),
+                    fix_recommendation: None,
+                }
+            }
+            Err(err) => DoctorItem {
+                subsystem: "Agency & Bots".into(),
+                check_name: "Bot Registry & Profile Catalog".into(),
+                status: DoctorStatus::Failed,
+                detail: format!("Failed to initialize bot registry: {}", err),
+                fix_recommendation: Some(format!("Check permissions or recreate directory at {}", b_dir.display())),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_doctor_diagnostics_includes_bot_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let models_dir = temp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let db_path = temp.path().join("dendrite.db");
+        let doctor = CynapseDoctor::new(models_dir, db_path, false);
+        let report = doctor.run_diagnostics();
+
+        // 13 subsystem checks total
+        assert_eq!(report.items.len(), 13);
+        let bot_check = report.items.iter().find(|i| i.subsystem == "Agency & Bots");
+        assert!(bot_check.is_some());
+        assert_eq!(bot_check.unwrap().status, DoctorStatus::Pass);
     }
 }

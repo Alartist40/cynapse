@@ -448,7 +448,8 @@ pub async fn fetch_native_models(endpoint: &str) -> Vec<String> {
 
     // Query endpoint /api/tags if available
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .connect_timeout(std::time::Duration::from_millis(250))
+        .timeout(std::time::Duration::from_millis(500))
         .build()
         .ok();
     if let Some(c) = client {
@@ -803,6 +804,7 @@ pub fn shared_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()

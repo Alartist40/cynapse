@@ -28,7 +28,7 @@ Imagine an AI agent platform that:
 - **Executes tools safely** — with grammar constraints, path sandboxing, timeout enforcement, and loop detection
 - Routes inference across **three engine tiers** — automatically selecting the fastest execution path for your hardware
 - Provides a **gorgeous TUI** — with real-time streaming, theme presets, collapsible reasoning blocks, and interactive memory inspection
-- **Heals itself** — with a self-diagnosing Doctor that audits 11 subsystems and auto-repairs common issues
+- **Heals itself** — with a self-diagnosing Doctor that audits 13 subsystems and auto-repairs common issues
 - Downloads models from **HuggingFace** — with curated recommendations based on your RAM and VRAM
 
 **Cynapse** — from the Greek *κύνωψ* (kýnōps), meaning "intelligence" — is exactly that. A pure Rust AI agent system with 3D galaxy memory and atomic tool execution, designed to run entirely on your hardware without a single byte leaving your machine.
@@ -119,21 +119,23 @@ Cynapse ships with a **Ratatui-powered TUI** that makes local AI feel premium:
 - Amber CRT — retro terminal warmth
 - Emerald Matrix — green-on-black hacker aesthetic
 
-#### 5. The Self-Healing Doctor — 11-Subsystem Diagnostics
+#### 5. The Self-Healing Doctor — 13-Subsystem Diagnostics
 
-Cynapse does not just run — it **verifies its own health** across 11 subsystems:
+Cynapse does not just run — it **verifies its own health** across 13 subsystems:
 
 1. **Host RAM Headroom** — Ensures sufficient memory for model + KV cache
 2. **GPU & Hardware Acceleration** — Detects AMD/NVIDIA/Intel via lspci and sysfs DRM
 3. **SIMD Capabilities** — Verifies AVX2 + FMA instruction availability
-4. **Model Storage & GGUF Integrity** — Validates magic headers (`0x46554747`)
-5. **SQLite Database Health** — Runs `PRAGMA quick_check` on Dendrite DB
-6. **GBNF Grammar Parser** — Verifies grammar constraint engine
-7. **Local Host Tools** — Checks for `bash`, `git` availability
-8. **Async Tokio Runtimes** — Validates async execution infrastructure
-9. **Markdown Persona Subsystem** — Verifies persona files exist and are readable
-10. **HuggingFace API Connectivity** — Tests model download capability
-11. **Endpoint Health & Model Availability** — Confirms inference backend is reachable
+4. **Model Storage Directory** — Confirms the models directory exists and is writable
+5. **GGUF File Integrity** — Validates magic headers (`0x46554747`)
+6. **SQLite Database Connection** — Opens the Dendrite DB with FTS5
+7. **SQLite Table & Index Health** — Runs `PRAGMA quick_check` on Dendrite DB
+8. **GBNF Grammar Parser** — Verifies grammar constraint engine
+9. **Local Host Tools** — Checks for `bash`, `git` availability
+10. **Async Tokio Runtimes** — Validates async execution infrastructure
+11. **Native Engine & Model Catalog** — Confirms the Leafcutter catalog and reachable inference endpoint
+12. **Markdown Persona Subsystem** — Verifies persona files exist and are readable
+13. **Bot Registry & Agency Profiles** — Parses bot profile manifests and reports seeded specialists
 
 **Auto-Fix Mode (`--fix`)** automatically recreates missing directories, repairs database indexes, clears stale scratch files, and updates configuration paths.
 
@@ -184,19 +186,21 @@ cynapse-mini/
 ├── install.sh                          # Dual remote/local automated installer
 ├── harness/
 │   ├── src/main.rs                     # CLI & TUI entrypoint dispatcher (Clap)
-│   ├── cynapse-core/                   # Tool execution, GBNF parser, session manager, doctor
+│   ├── cynapse-core/                   # Tool execution, GBNF parser, bot registry, subagent loop, session manager, doctor
 │   │   └── src/
-│   │       ├── lib.rs                  # 4 tools: read_file, write_file, grep, execute_command
+│   │       ├── lib.rs                  # 5 tools: read_file, write_file, grep, execute_command, spawn_subagent
+│   │       ├── bots.rs                 # BotProfile/BotRegistry, allow-deny-ask permissions
 │   │       ├── compressor.rs           # Tool output compressor (max 400 chars, tail extraction)
-│   │       ├── doctor.rs               # 11-subsystem self-healing diagnostics
+│   │       ├── doctor.rs               # 13-subsystem self-healing diagnostics
 │   │       ├── downloader.rs           # HuggingFace model downloader
 │   │       ├── offline_agent.rs        # GBNF tool call validator, LoopGuard, Two-Zone Prompt
 │   │       ├── persona.rs              # Persona file manager, system prompt compiler
-│   │       └── session.rs              # Conversation session persistence
+│   │       ├── session.rs              # Conversation session persistence
+│   │       └── subagent.rs             # SubagentManager, autonomous loop, approval gate, stall detection
 │   └── cynapse-tui/                    # Ratatui visual interface
 │       └── src/
 │           ├── lib.rs                  # TuiSession, CLI loop, TUI launcher
-│           ├── app.rs                  # Main TUI application (2992 lines)
+│           ├── app.rs                  # Main TUI application (4462 lines)
 │           ├── memory_render.rs        # 3D Galaxy Memory Atlas visualizer
 │           ├── terminal.rs             # RAII terminal protection
 │           └── theme.rs                # 4 color theme presets
@@ -610,22 +614,22 @@ impl LoopGuard {
 
 ### Core Module: Self-Healing Doctor
 
-The doctor (`cynapse-core/src/doctor.rs`) audits **11 subsystems**:
+The doctor (`cynapse-core/src/doctor.rs`) audits **13 subsystems**:
 
 ```rust
 pub fn run_diagnostics(&self) -> DoctorReport {
     let mut items = Vec::new();
-    items.push(self.check_hardware_ram());        // RAM headroom
-    items.push(self.check_gpu_acceleration());    // GPU detection
-    items.push(self.check_simd_capabilities());   // AVX2 + FMA
-    items.push(self.check_model_storage());       // GGUF header validation
-    items.push(self.check_sqlite_health());       // PRAGMA quick_check
-    items.push(self.check_gbnf_parser());         // Grammar engine
-    items.push(self.check_local_tools());         // bash, git
-    items.push(self.check_tokio_runtime());       // Async infrastructure
-    items.push(self.check_persona_subsystem());   // Persona .md files
-    items.push(self.check_huggingface_api());     // HF connectivity
-    items.push(self.check_endpoint_health());     // Inference backend
+    items.push(self.check_hardware_ram());           // RAM headroom
+    items.push(self.check_gpu_acceleration());       // GPU detection
+    items.push(self.check_simd_capabilities());      // AVX2 + FMA
+    items.extend(self.check_models_and_gguf_integrity()); // Model dir + GGUF headers
+    items.extend(self.check_dendrite_db_integrity());     // SQLite connection + quick_check
+    items.push(self.check_gbnf_validator());         // Grammar engine
+    items.push(self.check_local_tools());            // bash, git
+    items.push(self.check_tokio_channels());         // Async infrastructure
+    items.push(self.check_llm_endpoint_and_models()); // Endpoint + model catalog
+    items.push(self.check_persona_subsystem());      // Persona .md files
+    items.push(self.check_bot_registry_subsystem()); // Bot profile manifests
     // Auto-fix mode: recreate dirs, repair indexes, clear stale files
 }
 ```
@@ -836,10 +840,10 @@ core_node_budget = 0.40
 
 ### Test Suite
 
-Cynapse maintains **226 passing tests** across all crates:
+Cynapse maintains **281 passing tests** across all crates:
 
 - **leafcutter_core** — Tensor operations, GGUF loading, tokenizer
-- **cynapse-core** — Tool sandboxing, path validation, GBNF parsing, loop guard, compression
+- **cynapse-core** — Tool sandboxing, path validation, GBNF parsing, loop guard, compression, bot registry, subagent loop & approval gates
 - **cynapse-memory** — Graph operations, FTS5 search, BM25 scoring, context assembly, conversational query detection
 - **cynapse-tui** — Theme rendering, memory visualization, pipeline state
 - **cynapse (root)** — Integration tests
@@ -857,7 +861,10 @@ Cynapse maintains **226 passing tests** across all crates:
 - ✅ Managed llama-server child daemon
 - ✅ Pure Rust SlotManager with cache_prompt
 - ✅ Procedural memory (NodeType::Lesson, NodeType::Procedure)
-- ✅ Self-healing Doctor (11 subsystems)
+- ✅ Async background reflection worker (verified-turn admission)
+- ✅ Self-healing Doctor (13 subsystems)
+- ✅ Bot profiles, scoped subagent loop & interactive approval gates
+- ✅ `@mention` delegation, `/bots` orchestration & stall auto-cancel
 - ✅ Persona system with markdown files
 - ✅ Ratatui TUI with 4 themes
 - ✅ HuggingFace model downloader with curated recommendations
@@ -865,10 +872,9 @@ Cynapse maintains **226 passing tests** across all crates:
 - ✅ Collapsible reasoning blocks
 - ✅ Memory Pipeline visualization
 - ✅ Dynamic input box expansion
-- ✅ 226 passing tests
+- ✅ 281 passing tests
 
 **In Progress:**
-- 🔄 Background memory reflection worker
 - 🔄 Advanced mesh networking integration
 - 🔄 Multi-user collaboration support
 - 🔄 Plugin system for community extensions

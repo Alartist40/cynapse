@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use regex::Regex;
+pub mod bots;
 pub mod compressor;
 pub mod doctor;
 pub mod downloader;
@@ -13,6 +14,7 @@ pub mod offline_agent;
 pub mod persona;
 pub mod receipts;
 pub mod session;
+pub mod subagent;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +44,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "execute_command",
             description: "Execute a safe bash shell command with timeout",
+            concurrency_safe: false,
+        },
+        ToolDefinition {
+            name: "spawn_subagent",
+            description: "Spawn a delegated autonomous subagent task with optional bot profile and wait mode",
             concurrency_safe: false,
         },
     ]
@@ -264,6 +271,91 @@ pub fn execute_tool(name: &str, arg1: &str, arg2: Option<&str>) -> Result<String
     }
 }
 
+/// Executes a tool enforcing a BotProfile's allow/deny rules and workspace confinement.
+pub fn execute_tool_with_profile(
+    name: &str,
+    arg1: &str,
+    arg2: Option<&str>,
+    profile: &bots::BotProfile,
+) -> Result<String> {
+    if !profile.is_tool_allowed(name) {
+        bail!("Permission denied: tool '{}' is not permitted by bot profile '@{}'", name, profile.slug);
+    }
+
+    if profile.requires_approval(name) {
+        bail!("Approval required: tool '{}' requires interactive confirmation (in tools_ask for '@{}')", name, profile.slug);
+    }
+
+    // Path confinement check for file tools
+    match name {
+        "read_file" | "write_file" => {
+            if !profile.is_path_in_workspace(arg1) {
+                bail!(
+                    "Workspace violation: path '{}' is outside the restricted workspace '{:?}' of bot profile '@{}'",
+                    arg1,
+                    profile.workspace_restrict,
+                    profile.slug
+                );
+            }
+        }
+        "grep" => {
+            let dir = arg2.unwrap_or(".");
+            if !profile.is_path_in_workspace(dir) {
+                bail!(
+                    "Workspace violation: directory '{}' is outside the restricted workspace '{:?}' of bot profile '@{}'",
+                    dir,
+                    profile.workspace_restrict,
+                    profile.slug
+                );
+            }
+        }
+        _ => {}
+    }
+
+    execute_tool(name, arg1, arg2)
+}
+
+/// Executes a tool enforcing a BotProfile's allow/deny rules and workspace confinement,
+/// bypassing the `requires_approval` check because explicit user approval was already granted.
+pub fn execute_tool_with_profile_approved(
+    name: &str,
+    arg1: &str,
+    arg2: Option<&str>,
+    profile: &bots::BotProfile,
+) -> Result<String> {
+    if !profile.is_tool_allowed(name) {
+        bail!("Permission denied: tool '{}' is not permitted by bot profile '@{}'", name, profile.slug);
+    }
+
+    // Path confinement check for file tools
+    match name {
+        "read_file" | "write_file" => {
+            if !profile.is_path_in_workspace(arg1) {
+                bail!(
+                    "Workspace violation: path '{}' is outside the restricted workspace '{:?}' of bot profile '@{}'",
+                    arg1,
+                    profile.workspace_restrict,
+                    profile.slug
+                );
+            }
+        }
+        "grep" => {
+            let dir = arg2.unwrap_or(".");
+            if !profile.is_path_in_workspace(dir) {
+                bail!(
+                    "Workspace violation: directory '{}' is outside the restricted workspace '{:?}' of bot profile '@{}'",
+                    dir,
+                    profile.workspace_restrict,
+                    profile.slug
+                );
+            }
+        }
+        _ => {}
+    }
+
+    execute_tool(name, arg1, arg2)
+}
+
 /// Real HuggingFace model downloader streaming target .gguf or .safetensors files into models_dir.
 pub async fn pull_huggingface_model(url_or_repo: &str, models_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(models_dir)?;
@@ -335,6 +427,7 @@ mod tests {
         assert!(is_tool_concurrency_safe("grep"));
         assert!(!is_tool_concurrency_safe("write_file"));
         assert!(!is_tool_concurrency_safe("execute_command"));
+        assert!(!is_tool_concurrency_safe("spawn_subagent"));
         assert!(!is_tool_concurrency_safe("unknown_tool"));
     }
 
@@ -387,5 +480,61 @@ mod tests {
         let res = execute_tool("execute_command", "echo 'hello cynapse'", None);
         assert!(res.is_ok());
         assert!(res.unwrap().contains("hello cynapse"));
+    }
+
+    #[test]
+    fn test_execute_tool_with_profile_permissions_and_confinement() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = temp.path().join("sub_ws");
+        fs::create_dir_all(&ws).unwrap();
+        let safe_file = ws.join("test.txt");
+        fs::write(&safe_file, "hello from safe ws").unwrap();
+
+        let restricted_profile = bots::BotProfile {
+            slug: "isolated".into(),
+            display_name: "Isolated Bot".into(),
+            description: "".into(),
+            persona_file: None,
+            model_preset: None,
+            tools_allow: vec!["read_file".into()],
+            tools_deny: vec!["write_file".into()],
+            tools_ask: vec![],
+            workspace_restrict: Some(ws.to_string_lossy().to_string()),
+            max_concurrent: None,
+        };
+
+        // Allowed inside workspace
+        let res = execute_tool_with_profile("read_file", &safe_file.to_string_lossy(), None, &restricted_profile);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "hello from safe ws");
+
+        // Denied tool (write_file)
+        let res_write = execute_tool_with_profile("write_file", &safe_file.to_string_lossy(), Some("new"), &restricted_profile);
+        assert!(res_write.is_err());
+        assert!(res_write.unwrap_err().to_string().contains("Permission denied"));
+
+        // Tool outside workspace (read outside)
+        let outside_file = temp.path().join("outside.txt");
+        fs::write(&outside_file, "secret").unwrap();
+        let res_outside = execute_tool_with_profile("read_file", &outside_file.to_string_lossy(), None, &restricted_profile);
+        assert!(res_outside.is_err());
+        assert!(res_outside.unwrap_err().to_string().contains("Workspace violation"));
+
+        // Tool requiring interactive approval (tools_ask)
+        let ask_profile = bots::BotProfile {
+            slug: "cautious".into(),
+            display_name: "Cautious Bot".into(),
+            description: "".into(),
+            persona_file: None,
+            model_preset: None,
+            tools_allow: vec!["*".into()],
+            tools_deny: vec![],
+            tools_ask: vec!["execute_command".into()],
+            workspace_restrict: None,
+            max_concurrent: None,
+        };
+        let res_ask = execute_tool_with_profile("execute_command", "ls", None, &ask_profile);
+        assert!(res_ask.is_err());
+        assert!(res_ask.unwrap_err().to_string().contains("Approval required"));
     }
 }

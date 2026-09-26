@@ -41,6 +41,8 @@ use cynapse_memory::ReflectionWorker;
 use crate::terminal::TuiRuntimeGuard;
 use crate::theme::AppTheme;
 
+pub const MAX_AGENT_STEPS: usize = 5;
+
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
@@ -59,6 +61,28 @@ pub enum ActiveModal {
     SessionList,
     Doctor,
     PersonaManager,
+    Bots,
+    ToolApproval,
+}
+
+#[derive(Debug)]
+pub struct ToolApprovalRequest {
+    pub task_id: usize,
+    pub bot_slug: String,
+    pub tool_name: String,
+    pub arg1: String,
+    pub arg2: Option<String>,
+    pub response_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[derive(Debug)]
+pub struct PendingToolApproval {
+    pub task_id: usize,
+    pub bot_slug: String,
+    pub tool_name: String,
+    pub arg1: String,
+    pub arg2: Option<String>,
+    pub response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +142,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/doctor", description: "Run self-healing Cynapse Doctor system diagnostic & recovery" },
     SlashCommand { name: "/pull", description: "Download GGUF model from HuggingFace (hardware curated)" },
     SlashCommand { name: "/persona", description: "Manage agent personality markdown files (IDENTITY, SOUL, USER)" },
+    SlashCommand { name: "/bots", description: "List and inspect configured subagent bot profiles" },
     SlashCommand { name: "/thinking", description: "Toggle collapsible model thinking/reasoning blocks" },
     SlashCommand { name: "/unload", description: "Unload active LLM model from RAM immediately to free memory" },
     SlashCommand { name: "/session", description: "Open saved sessions manager" },
@@ -263,6 +288,14 @@ pub struct TuiApp {
     pub cached_zone_a_prefix: Option<String>,
     pub reflection_worker: ReflectionWorker,
     pub read_receipts: cynapse_core::receipts::ReadReceiptRegistry,
+    pub bot_registry: cynapse_core::bots::BotRegistry,
+    pub selected_bot_idx: usize,
+    pub subagent_mgr: cynapse_core::subagent::SubagentManager,
+    pub subagent_tx: mpsc::UnboundedSender<cynapse_core::subagent::SubagentAnnouncement>,
+    pub subagent_rx: mpsc::UnboundedReceiver<cynapse_core::subagent::SubagentAnnouncement>,
+    pub approval_tx: mpsc::UnboundedSender<ToolApprovalRequest>,
+    pub approval_rx: mpsc::UnboundedReceiver<ToolApprovalRequest>,
+    pub pending_approval: Option<PendingToolApproval>,
 }
 
 impl TuiApp {
@@ -283,6 +316,8 @@ impl TuiApp {
         let hw_info = probe_hardware_info();
         let initial_tier = route_model(&models_dir.join(&active_model_name), false).tier;
         let reflection_worker = ReflectionWorker::new(graph.clone(), store.clone());
+        let (subagent_tx, subagent_rx) = mpsc::unbounded_channel();
+        let (approval_tx, approval_rx) = mpsc::unbounded_channel();
         Self {
             models_dir,
             active_model_name,
@@ -347,6 +382,16 @@ impl TuiApp {
             persona_edit_cursor: 0,
             cached_zone_a_prefix: None,
             read_receipts: cynapse_core::receipts::ReadReceiptRegistry::default(),
+            bot_registry: cynapse_core::bots::BotRegistry::new(cynapse_core::bots::BotRegistry::default_dir())
+                .or_else(|_| cynapse_core::bots::BotRegistry::new("./bots"))
+                .unwrap_or_else(|_| cynapse_core::bots::BotRegistry::empty()),
+            selected_bot_idx: 0,
+            subagent_mgr: cynapse_core::subagent::SubagentManager::default(),
+            subagent_tx,
+            subagent_rx,
+            approval_tx,
+            approval_rx,
+            pending_approval: None,
         }
     }
 
@@ -472,6 +517,24 @@ impl TuiApp {
         });
     }
 
+    pub fn handle_approval_decision(&mut self, approved: bool) {
+        if self.modal == ActiveModal::ToolApproval {
+            if let Some(mut pending) = self.pending_approval.take() {
+                let outcome_str = if approved { "approved" } else { "denied" };
+                if let Some(tx) = pending.response_tx.take() {
+                    let _ = tx.send(approved);
+                }
+                self.messages.push(ChatMessage {
+                    role: "system".into(),
+                    content: format!("Decision recorded for subagent #{}: {} `{}` (@{})", pending.task_id, outcome_str, pending.tool_name, pending.bot_slug),
+                    thinking: None,
+                });
+                self.save_current_session();
+            }
+            self.modal = ActiveModal::None;
+        }
+    }
+
     fn execute_tool_and_format(&mut self, call: &cynapse_core::offline_agent::ToolCall) -> (String, bool) {
         let name = call.name.as_str();
         let args = &call.arguments;
@@ -578,6 +641,242 @@ impl TuiApp {
                     (c.summary, false)
                 }
             };
+        }
+
+        if name == "spawn_subagent" {
+            let task_instruction = args.get("task")
+                .or_else(|| args.get("instruction"))
+                .or_else(|| args.get("prompt"))
+                .or_else(|| args.get("command"))
+                .or_else(|| args.get("arg1"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&arg1);
+
+            if task_instruction.trim().is_empty() {
+                return ("Error: `spawn_subagent` requires a non-empty `task` parameter.".to_string(), false);
+            }
+
+            let bot_slug = args.get("bot")
+                .or_else(|| args.get("slug"))
+                .or_else(|| args.get("profile"))
+                .or_else(|| args.get("arg2"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| arg2.as_deref().unwrap_or("coder"))
+                .to_string();
+
+            let wait = args.get("wait")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let bot_profile = match self.bot_registry.get(&bot_slug) {
+                Some(p) => p.clone(),
+                None => {
+                    let known: Vec<&str> = self.bot_registry.list().into_iter().map(|p| p.slug.as_str()).collect();
+                    return (
+                        format!("Error: Unknown bot profile '@{}'. Available bots: {}", bot_slug, known.join(", ")),
+                        false,
+                    );
+                }
+            };
+            let (task_id, cancel_flag) = self.subagent_mgr.create_task(task_instruction, &bot_slug, wait);
+            let persona_text = if let Some(ref pf) = bot_profile.persona_file {
+                self.persona_mgr.read_file_or_empty(pf)
+            } else {
+                format!("You are @{}, an autonomous specialist bot.", bot_slug)
+            };
+
+            let tier = self.active_tier;
+            let endpoint = self.tier1_endpoint.clone();
+            let model_name = self.active_model_name.clone();
+
+            if wait {
+                self.subagent_mgr.update_status(task_id, cynapse_core::subagent::SubagentStatus::Running, None);
+                let profile_clone = bot_profile.clone();
+                let persona_clone = persona_text.clone();
+                let task_clone = task_instruction.to_string();
+                let cancel_clone = Arc::clone(&cancel_flag);
+
+                let loop_fut = async move {
+                    cynapse_core::subagent::run_subagent_loop(
+                        &task_clone,
+                        &profile_clone,
+                        &persona_clone,
+                        MAX_AGENT_STEPS,
+                        Some(cancel_clone),
+                        |prompt: String, sys: String| {
+                            let ep = endpoint.clone();
+                            let mn = model_name.clone();
+                            async move {
+                                let mut response_buf = String::new();
+                                let _stats = query_model_stream(
+                                    tier,
+                                    &ep,
+                                    &mn,
+                                    &prompt,
+                                    &sys,
+                                    |_ttype, tok| {
+                                        response_buf.push_str(tok);
+                                    },
+                                )
+                                .await?;
+                                Ok(response_buf)
+                            }
+                        },
+                        None::<fn(String, String, Option<String>) -> std::future::Ready<bool>>,
+                    )
+                    .await
+                };
+
+                let loop_res = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string());
+                    match rt {
+                        Ok(rt) => rt.block_on(loop_fut),
+                        Err(err) => cynapse_core::subagent::SubagentLoopResult {
+                            final_text: format!("Failed to initialize runtime for inline subagent: {}", err),
+                            step_count: 0,
+                            tools_executed: 0,
+                            completed: false,
+                            cancelled: false,
+                        },
+                    }
+                })
+                .join()
+                .unwrap_or_else(|_| cynapse_core::subagent::SubagentLoopResult {
+                    final_text: "Subagent thread panicked during inline execution.".to_string(),
+                    step_count: 0,
+                    tools_executed: 0,
+                    completed: false,
+                    cancelled: false,
+                });
+
+                let status = if loop_res.cancelled {
+                    cynapse_core::subagent::SubagentStatus::Cancelled
+                } else if loop_res.completed {
+                    cynapse_core::subagent::SubagentStatus::Done
+                } else {
+                    cynapse_core::subagent::SubagentStatus::Failed(loop_res.final_text.clone())
+                };
+
+                self.subagent_mgr.update_status(task_id, status.clone(), Some(loop_res.final_text.clone()));
+
+                let badge = match status {
+                    cynapse_core::subagent::SubagentStatus::Done => "done",
+                    cynapse_core::subagent::SubagentStatus::Cancelled => "cancelled",
+                    _ => "completed",
+                };
+
+                return (
+                    format!(
+                        "[subagent #{} · @{} · {} (steps: {}, tools: {})]\n{}",
+                        task_id, bot_slug, badge, loop_res.step_count, loop_res.tools_executed, loop_res.final_text
+                    ),
+                    true,
+                );
+            } else {
+                let mgr = self.subagent_mgr.clone();
+                let sem = self.subagent_mgr.semaphore();
+                let tx = self.subagent_tx.clone();
+                let task_str = task_instruction.to_string();
+                let slug_str = bot_slug.clone();
+                let app_tx = self.approval_tx.clone();
+                let task_b_slug = bot_slug.clone();
+
+                tokio::spawn(async move {
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+
+                    if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        mgr.update_status(task_id, cynapse_core::subagent::SubagentStatus::Cancelled, Some("Cancelled before execution".into()));
+                        let _ = tx.send(cynapse_core::subagent::SubagentAnnouncement {
+                            task_id,
+                            bot_slug: slug_str,
+                            status: cynapse_core::subagent::SubagentStatus::Cancelled,
+                            result: "Task cancelled before execution.".into(),
+                        });
+                        return;
+                    }
+
+                    mgr.update_status(task_id, cynapse_core::subagent::SubagentStatus::Running, None);
+
+                    let approval_fn = move |tool_name: String, arg1: String, arg2: Option<String>| {
+                        let tx = app_tx.clone();
+                        let b_slug = task_b_slug.clone();
+                        async move {
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                            let req = ToolApprovalRequest {
+                                task_id,
+                                bot_slug: b_slug,
+                                tool_name,
+                                arg1,
+                                arg2,
+                                response_tx: resp_tx,
+                            };
+                            if tx.send(req).is_err() {
+                                return false;
+                            }
+                            resp_rx.await.unwrap_or(false)
+                        }
+                    };
+
+                    let loop_res = cynapse_core::subagent::run_subagent_loop(
+                        &task_str,
+                        &bot_profile,
+                        &persona_text,
+                        MAX_AGENT_STEPS,
+                        Some(Arc::clone(&cancel_flag)),
+                        |prompt: String, sys: String| {
+                            let ep = endpoint.clone();
+                            let mn = model_name.clone();
+                            async move {
+                                let mut response_buf = String::new();
+                                let _stats = query_model_stream(
+                                    tier,
+                                    &ep,
+                                    &mn,
+                                    &prompt,
+                                    &sys,
+                                    |_ttype, tok| {
+                                        response_buf.push_str(tok);
+                                    },
+                                )
+                                .await?;
+                                Ok(response_buf)
+                            }
+                        },
+                        Some(approval_fn),
+                    )
+                    .await;
+
+                    let status = if loop_res.cancelled {
+                        cynapse_core::subagent::SubagentStatus::Cancelled
+                    } else if loop_res.completed {
+                        cynapse_core::subagent::SubagentStatus::Done
+                    } else {
+                        cynapse_core::subagent::SubagentStatus::Failed(loop_res.final_text.clone())
+                    };
+
+                    mgr.update_status(task_id, status.clone(), Some(loop_res.final_text.clone()));
+                    let _ = tx.send(cynapse_core::subagent::SubagentAnnouncement {
+                        task_id,
+                        bot_slug: slug_str,
+                        status,
+                        result: loop_res.final_text,
+                    });
+                });
+
+                return (
+                    format!(
+                        "[subagent #{} · @{} · spawned in background]\nTask: {}\nStatus: Running (concurrency cap: {})",
+                        task_id, bot_slug, task_instruction, self.subagent_mgr.max_concurrent()
+                    ),
+                    true,
+                );
+            }
         }
 
         match cynapse_core::execute_tool(name, &arg1, arg2.as_deref()) {
@@ -972,6 +1271,16 @@ impl TuiApp {
 
                             match key.code {
                                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Tab => {
+                                    if self.modal == ActiveModal::ToolApproval {
+                                        if let Some(pending) = self.pending_approval.take() {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("❌ Tool execution denied by user: `{}` (@{})", pending.tool_name, pending.bot_slug),
+                                                thinking: None,
+                                            });
+                                            self.save_current_session();
+                                        }
+                                    }
                                     self.modal = ActiveModal::None;
                                 }
                                 KeyCode::Left => match self.modal {
@@ -1002,6 +1311,9 @@ impl TuiApp {
                                     ActiveModal::PersonaManager => {
                                         self.selected_persona_idx = self.selected_persona_idx.saturating_sub(1);
                                     }
+                                    ActiveModal::Bots => {
+                                        self.selected_bot_idx = self.selected_bot_idx.saturating_sub(1);
+                                    }
                                     _ => {}
                                 },
                                 KeyCode::Down => match self.modal {
@@ -1019,6 +1331,9 @@ impl TuiApp {
                                     }
                                     ActiveModal::PersonaManager => {
                                         self.selected_persona_idx = self.selected_persona_idx.saturating_add(1);
+                                    }
+                                    ActiveModal::Bots => {
+                                        self.selected_bot_idx = self.selected_bot_idx.saturating_add(1);
                                     }
                                     _ => {}
                                 },
@@ -1077,7 +1392,22 @@ impl TuiApp {
                                     }
                                     _ => {}
                                 },
+                                KeyCode::Char('y') | KeyCode::Char('Y') => match self.modal {
+                                    ActiveModal::ToolApproval => {
+                                        self.handle_approval_decision(true);
+                                    }
+                                    _ => {}
+                                },
+                                KeyCode::Char('n') | KeyCode::Char('N') => match self.modal {
+                                    ActiveModal::ToolApproval => {
+                                        self.handle_approval_decision(false);
+                                    }
+                                    _ => {}
+                                },
                                 KeyCode::Enter => match self.modal {
+                                    ActiveModal::ToolApproval => {
+                                        self.handle_approval_decision(true);
+                                    }
                                     ActiveModal::ModelList => {
                                         let scanned = self.scan_models_sync();
                                         if !scanned.is_empty() {
@@ -1118,6 +1448,9 @@ impl TuiApp {
                                                 thinking: None,
                                             });
                                         }
+                                        self.modal = ActiveModal::None;
+                                    }
+                                    ActiveModal::Bots => {
                                         self.modal = ActiveModal::None;
                                     }
                                     _ => {
@@ -1438,6 +1771,190 @@ impl TuiApp {
                                     continue;
                                 }
 
+                                if trimmed == "/bots" || trimmed == "/bots list" || trimmed == "/agents" {
+                                    let _ = self.bot_registry.load_all();
+                                    self.selected_bot_idx = 0;
+                                    self.modal = ActiveModal::Bots;
+                                    continue;
+                                }
+
+                                if let Some(rest) = trimmed.strip_prefix("/bots spawn ") {
+                                    let mut parts = rest.trim().splitn(2, |c: char| c.is_whitespace());
+                                    let slug = parts.next().unwrap_or("").trim();
+                                    let task = parts.next().unwrap_or("").trim();
+                                    if slug.is_empty() || task.is_empty() {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "⚠️ Usage: `/bots spawn <bot-slug> <task description>`".into(),
+                                            thinking: None,
+                                        });
+                                    } else {
+                                        self.messages.push(ChatMessage {
+                                            role: "user".into(),
+                                            content: trimmed.clone(),
+                                            thinking: None,
+                                        });
+                                        let call = cynapse_core::offline_agent::ToolCall {
+                                            name: "spawn_subagent".into(),
+                                            arguments: serde_json::json!({
+                                                "bot": slug,
+                                                "task": task,
+                                                "wait": false,
+                                            }),
+                                        };
+                                        let (out, _ok) = self.execute_tool_and_format(&call);
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: out,
+                                            thinking: None,
+                                        });
+                                        self.save_current_session();
+                                    }
+                                    continue;
+                                }
+
+                                if trimmed == "/bots status" {
+                                    let tasks = self.subagent_mgr.list_tasks();
+                                    if tasks.is_empty() {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "ℹ️ No subagent tasks recorded in current session.".into(),
+                                            thinking: None,
+                                        });
+                                    } else {
+                                        let mut lines = vec![format!("🤖 **Subagent Tasks ({} total, {} running)**:", tasks.len(), self.subagent_mgr.running_count())];
+                                        for t in &tasks {
+                                            let status_str = match &t.status {
+                                                cynapse_core::subagent::SubagentStatus::Pending => "⏳ Pending".to_string(),
+                                                cynapse_core::subagent::SubagentStatus::Running => "⚙️ Running".to_string(),
+                                                cynapse_core::subagent::SubagentStatus::Done => "✅ Done".to_string(),
+                                                cynapse_core::subagent::SubagentStatus::Failed(e) => format!("❌ Failed: {}", e),
+                                                cynapse_core::subagent::SubagentStatus::Cancelled => "⚠️ Cancelled".to_string(),
+                                            };
+                                            lines.push(format!("• **#{}** [@{}] — {}: `{}`", t.id, t.bot_slug, status_str, if t.task.len() > 40 { format!("{}...", &t.task[..37]) } else { t.task.clone() }));
+                                        }
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: lines.join("\n"),
+                                            thinking: None,
+                                        });
+                                    }
+                                    continue;
+                                }
+
+                                if let Some(rest) = trimmed.strip_prefix("/bots status ") {
+                                    if let Ok(id) = rest.trim().parse::<usize>() {
+                                        if let Some(t) = self.subagent_mgr.get_task(id) {
+                                            let status_str = match &t.status {
+                                                cynapse_core::subagent::SubagentStatus::Pending => "Pending".to_string(),
+                                                cynapse_core::subagent::SubagentStatus::Running => "Running".to_string(),
+                                                cynapse_core::subagent::SubagentStatus::Done => "Done".to_string(),
+                                                cynapse_core::subagent::SubagentStatus::Failed(e) => format!("Failed ({})", e),
+                                                cynapse_core::subagent::SubagentStatus::Cancelled => "Cancelled".to_string(),
+                                            };
+                                            let result_str = t.result.as_deref().unwrap_or("[no output recorded]");
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("📋 **Task #{} Details**\n- **Bot**: @{}\n- **Status**: {}\n- **Task**: {}\n- **Result**:\n{}", t.id, t.bot_slug, status_str, t.task, result_str),
+                                                thinking: None,
+                                            });
+                                        } else {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("❌ Subagent task #{} not found.", id),
+                                                thinking: None,
+                                            });
+                                        }
+                                    } else {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "⚠️ Usage: `/bots status <id>`".into(),
+                                            thinking: None,
+                                        });
+                                    }
+                                    continue;
+                                }
+
+                                if let Some(rest) = trimmed.strip_prefix("/bots cancel ") {
+                                    let target = rest.trim();
+                                    if target == "all" {
+                                        let tasks = self.subagent_mgr.list_tasks();
+                                        let mut cancelled_count = 0;
+                                        for t in tasks {
+                                            if matches!(t.status, cynapse_core::subagent::SubagentStatus::Running | cynapse_core::subagent::SubagentStatus::Pending) {
+                                                if self.subagent_mgr.cancel_task(t.id) {
+                                                    cancelled_count += 1;
+                                                }
+                                            }
+                                        }
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: format!("⚠️ Cancelled {} active subagent tasks.", cancelled_count),
+                                            thinking: None,
+                                        });
+                                    } else if let Ok(id) = target.parse::<usize>() {
+                                        if self.subagent_mgr.cancel_task(id) {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("⚠️ Subagent task #{} cancellation signal sent.", id),
+                                                thinking: None,
+                                            });
+                                        } else {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("❌ Could not cancel task #{}: task not found or already finished.", id),
+                                                thinking: None,
+                                            });
+                                        }
+                                    } else {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "⚠️ Usage: `/bots cancel <id|all>`".into(),
+                                            thinking: None,
+                                        });
+                                    }
+                                    continue;
+                                }
+
+                                // @slug <task> Direct Subagent Routing
+                                if trimmed.starts_with('@') {
+                                    let rest = &trimmed[1..];
+                                    let mut parts = rest.splitn(2, |c: char| c.is_whitespace());
+                                    let slug = parts.next().unwrap_or("").trim();
+                                    let task = parts.next().unwrap_or("").trim();
+                                    if !slug.is_empty() {
+                                        if task.is_empty() {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("⚠️ Usage: `@{}` <task description>", slug),
+                                                thinking: None,
+                                            });
+                                            continue;
+                                        }
+                                        self.messages.push(ChatMessage {
+                                            role: "user".into(),
+                                            content: trimmed.clone(),
+                                            thinking: None,
+                                        });
+                                        let call = cynapse_core::offline_agent::ToolCall {
+                                            name: "spawn_subagent".into(),
+                                            arguments: serde_json::json!({
+                                                "bot": slug,
+                                                "task": task,
+                                                "wait": false,
+                                            }),
+                                        };
+                                        let (out, _ok) = self.execute_tool_and_format(&call);
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: out,
+                                            thinking: None,
+                                        });
+                                        self.save_current_session();
+                                        continue;
+                                    }
+                                }
+
                                 // User Prompt Execution
                                 self.messages.push(ChatMessage {
                                     role: "user".into(),
@@ -1541,6 +2058,50 @@ impl TuiApp {
     }
 
     fn poll_stream_events(&mut self) {
+        while let Ok(req) = self.approval_rx.try_recv() {
+            if self.pending_approval.is_none() {
+                self.pending_approval = Some(PendingToolApproval {
+                    task_id: req.task_id,
+                    bot_slug: req.bot_slug,
+                    tool_name: req.tool_name,
+                    arg1: req.arg1,
+                    arg2: req.arg2,
+                    response_tx: Some(req.response_tx),
+                });
+                self.modal = ActiveModal::ToolApproval;
+            } else {
+                let _ = req.response_tx.send(false);
+            }
+        }
+
+        while let Ok(ann) = self.subagent_rx.try_recv() {
+            let status_badge = match &ann.status {
+                cynapse_core::subagent::SubagentStatus::Done => "✅ Done",
+                cynapse_core::subagent::SubagentStatus::Failed(_) => "❌ Failed",
+                cynapse_core::subagent::SubagentStatus::Cancelled => "⚠️ Cancelled",
+                _ => "ℹ️ Completed",
+            };
+            self.messages.push(ChatMessage {
+                role: "system".into(),
+                content: format!(
+                    "📢 **Subagent Task #{} Announcement** [@{} · {}]:\n{}",
+                    ann.task_id, ann.bot_slug, status_badge, ann.result
+                ),
+                thinking: None,
+            });
+            self.save_current_session();
+        }
+
+        let stalled_ids = self.subagent_mgr.check_and_cancel_stalled_tasks(120_000);
+        for id in stalled_ids {
+            self.messages.push(ChatMessage {
+                role: "system".into(),
+                content: format!("=== NOTICE ===\n⚠️ Subagent task #{} stalled (> 2m) and was auto-cancelled.", id),
+                thinking: None,
+            });
+            self.save_current_session();
+        }
+
         let mut events = Vec::new();
         if let Some(rx) = &mut self.stream_rx {
             while let Ok(event) = rx.try_recv() {
@@ -1560,7 +2121,6 @@ impl TuiApp {
                     self.last_tok_per_sec = tok_per_sec;
                     self.last_latency_sec = elapsed_sec;
 
-                    const MAX_AGENT_STEPS: usize = 5;
                     let tools_allowed = !self.finalization_inflight;
                     if self.finalization_inflight {
                         self.finalization_inflight = false;
@@ -2165,6 +2725,21 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 Line::from(vec![Span::styled(" State: ", label_style), Span::styled("Disconnected", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
                 Line::from(vec![Span::styled(" Mode : ", label_style), Span::styled("Isolated Test", Style::default().fg(Color::Cyan))]),
                 Line::from(vec![Span::styled(" Cmd  : ", label_style), Span::styled("/dendrite for atlas", t.dim_text())]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("◖ ", Style::default().fg(Color::LightCyan)),
+                    Span::styled("AGENCY & BOTS", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ◗", Style::default().fg(Color::LightCyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Active: ", label_style),
+                    Span::styled(format!("{} active", self.subagent_mgr.running_count()), if self.subagent_mgr.running_count() > 0 { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { value_style }),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Cap   : ", label_style),
+                    Span::styled(format!("max {} concurrent", self.subagent_mgr.max_concurrent()), t.dim_text()),
+                ]),
+                Line::from(vec![Span::styled(" Cmd   : ", label_style), Span::styled("@slug or /bots", t.dim_text())]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("◖ ", Style::default().fg(Color::Rgb(100, 180, 255))),
@@ -2957,6 +3532,199 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 );
                 f.render_widget(preview_p, chunks[1]);
             }
+            ActiveModal::Bots => {
+                let area = centered_rect(82, 75, f.area());
+                f.render_widget(Clear, area);
+
+                let outer_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 🤖 Subagent Bot Profiles (~/.cynapse/bots/) ")
+                    .border_style(t.active_border_style());
+
+                let inner_area = outer_block.inner(area);
+                f.render_widget(outer_block, area);
+
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+                    .split(inner_area);
+
+                let bots = self.bot_registry.list();
+                let selected_idx = self.selected_bot_idx.min(bots.len().saturating_sub(1));
+
+                // Left Panel: Available bot profile slugs
+                let items: Vec<ListItem> = bots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        let is_selected = i == selected_idx;
+                        let cursor = if is_selected { "> " } else { "  " };
+
+                        let style = if is_selected {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+
+                        ListItem::new(Line::from(vec![
+                            Span::styled(cursor, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!("@{}", b.slug), style),
+                        ]))
+                    })
+                    .collect();
+
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Plain)
+                            .title(format!(" Configured Bots ({}) ", bots.len()))
+                            .border_style(Style::default().fg(Color::DarkGray)),
+                    );
+                f.render_widget(list, chunks[0]);
+
+                // Right Panel: Bot details & permissions manifest
+                let mut right_lines = Vec::new();
+                if let Some(bot) = bots.get(selected_idx) {
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Bot Identifier: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("@{}", bot.slug), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::raw("  •  "),
+                        Span::styled(&bot.display_name, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    ]));
+
+                    if !bot.description.is_empty() {
+                        right_lines.push(Line::from(Span::styled(&bot.description, Style::default().fg(Color::Gray))));
+                    }
+                    right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Persona File: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(bot.persona_file.as_deref().unwrap_or("[Default Cynapse Identity]"), Style::default().fg(Color::White)),
+                    ]));
+
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Model Preset: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(bot.model_preset.as_deref().unwrap_or("[Inherit Active Model]"), Style::default().fg(Color::White)),
+                    ]));
+
+                    let allow_str = if bot.tools_allow.is_empty() || bot.tools_allow.iter().any(|a| a == "*") {
+                        "All tools (*) not explicitly denied".to_string()
+                    } else {
+                        bot.tools_allow.join(", ")
+                    };
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Tools Allowed: ", Style::default().fg(Color::Green)),
+                        Span::styled(allow_str, Style::default().fg(Color::White)),
+                    ]));
+
+                    let deny_str = if bot.tools_deny.is_empty() {
+                        "[None]".to_string()
+                    } else {
+                        bot.tools_deny.join(", ")
+                    };
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Tools Denied:  ", Style::default().fg(Color::Red)),
+                        Span::styled(deny_str, Style::default().fg(Color::LightRed)),
+                    ]));
+
+                    let ask_str = if bot.tools_ask.is_empty() {
+                        "[None - automated execution]".to_string()
+                    } else {
+                        bot.tools_ask.join(", ")
+                    };
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Approval (Ask):", Style::default().fg(Color::Yellow)),
+                        Span::styled(ask_str, Style::default().fg(Color::LightYellow)),
+                    ]));
+
+                    let ws_str = bot.workspace_restrict.as_deref().unwrap_or("[Workspace Root / Unrestricted]");
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Workspace:     ", Style::default().fg(Color::Cyan)),
+                        Span::styled(ws_str, Style::default().fg(Color::White)),
+                    ]));
+
+                    let conc_str = bot.max_concurrent.map(|c| c.to_string()).unwrap_or_else(|| "2 (default)".to_string());
+                    right_lines.push(Line::from(vec![
+                        Span::styled("Max Concurrency:", Style::default().fg(Color::Cyan)),
+                        Span::styled(conc_str, Style::default().fg(Color::White)),
+                    ]));
+
+                    right_lines.push(Line::from("──────────────────────────────────────────────────────────"));
+                    right_lines.push(Line::from(Span::styled("Controls:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+                    right_lines.push(Line::from("  • Up/Down Arrow : Navigate bot profiles"));
+                    right_lines.push(Line::from("  • Esc / q / Enter: Close bots modal"));
+                } else {
+                    right_lines.push(Line::from(Span::styled("No bot profiles found in ~/.cynapse/bots/", Style::default().fg(Color::Red))));
+                }
+
+                let preview_p = Paragraph::new(right_lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" Bot Profile Manifest ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+                f.render_widget(preview_p, chunks[1]);
+            }
+            ActiveModal::ToolApproval => {
+                let area = centered_rect(65, 45, f.area());
+                f.render_widget(Clear, area);
+
+                let outer_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" ⚠️ Tool Execution Approval Required ")
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+
+                let inner_area = outer_block.inner(area);
+                f.render_widget(outer_block, area);
+
+                let (bot, tool, a1, a2) = if let Some(ref p) = self.pending_approval {
+                    (
+                        p.bot_slug.as_str(),
+                        p.tool_name.as_str(),
+                        p.arg1.as_str(),
+                        p.arg2.as_deref().unwrap_or(""),
+                    )
+                } else {
+                    ("unknown", "unknown", "", "")
+                };
+
+                let text = vec![
+                    Line::from(vec![
+                        Span::styled("Target Bot Profile: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("@{}", bot), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Requested Action:   ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(tool, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Argument 1:         ", Style::default().fg(Color::Gray)),
+                        Span::styled(a1, Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Argument 2:         ", Style::default().fg(Color::Gray)),
+                        Span::styled(a2, Style::default().fg(Color::White)),
+                    ]),
+                    Line::from("──────────────────────────────────────────────────────────"),
+                    Line::from(vec![
+                        Span::styled("Notice: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled("This tool is listed in `tools_ask` requiring interactive confirmation.", Style::default().fg(Color::Gray)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(" [Y / Enter] Approve ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                        Span::raw("   "),
+                        Span::styled(" [N / Esc] Deny ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ]),
+                ];
+
+                let p = Paragraph::new(text).wrap(Wrap { trim: true });
+                f.render_widget(p, inner_area);
+            }
             ActiveModal::None => {}
         }
     }
@@ -3417,5 +4185,278 @@ mod tests {
         app.reflection_worker.spawn_reflection(messages, app.turn_verified);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         assert!(graph.all().len() > 0);
+    }
+
+    #[test]
+    fn test_bots_modal_and_registry_tui_integration() {
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:11434".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        let bots = app.bot_registry.list();
+        assert!(!bots.is_empty(), "Bot registry should load default seeded profiles");
+        assert!(app.bot_registry.get("coder").is_some());
+        assert!(app.bot_registry.get("researcher").is_some());
+
+        // Simulate /bots slash command opening modal
+        app.modal = ActiveModal::Bots;
+        app.selected_bot_idx = 0;
+        assert_eq!(app.modal, ActiveModal::Bots);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_subagent_inline_and_background_workflow() {
+        use serde_json::json;
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:59999".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        // 1. Inline execution (wait=true)
+        let inline_call = cynapse_core::offline_agent::ToolCall {
+            name: "spawn_subagent".into(),
+            arguments: json!({
+                "task": "Refactor module error types",
+                "bot": "coder",
+                "wait": true
+            }),
+        };
+        let (inline_res, ok1) = app.execute_tool_and_format(&inline_call);
+        assert!(ok1);
+        assert!(inline_res.contains("[subagent #1 · @coder ·"));
+        assert!(app.subagent_mgr.get_status(1).is_some());
+
+        // 2. Background execution (wait=false)
+        let bg_call = cynapse_core::offline_agent::ToolCall {
+            name: "spawn_subagent".into(),
+            arguments: json!({
+                "task": "Audit codebase dependencies",
+                "bot": "auditor",
+                "wait": false
+            }),
+        };
+        let (bg_res, ok2) = app.execute_tool_and_format(&bg_call);
+        assert!(ok2);
+        assert!(bg_res.contains("[subagent #2 · @auditor · spawned in background]"));
+
+        // Wait for background tokio task to finish and announce back
+        let mut announced = false;
+        for _ in 0..100 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            app.poll_stream_events();
+            if app.messages.iter().any(|m| m.content.contains("Subagent Task #2 Announcement")) {
+                announced = true;
+                break;
+            }
+        }
+        assert!(announced, "Expected announcement system message in conversation history");
+        assert!(app.subagent_mgr.get_status(2).is_some());
+    }
+
+    #[test]
+    fn test_tool_approval_modal_and_execution_workflow() {
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:59999".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        // 1. Set pending approval
+        app.pending_approval = Some(PendingToolApproval {
+            task_id: 1,
+            bot_slug: "auditor".into(),
+            tool_name: "execute_command".into(),
+            arg1: "echo 'approved by user'".into(),
+            arg2: None,
+            response_tx: None,
+        });
+        app.modal = ActiveModal::ToolApproval;
+
+        // 2. Approve via decision handler
+        app.handle_approval_decision(true);
+
+        assert_eq!(app.modal, ActiveModal::None);
+        assert!(app.pending_approval.is_none());
+        assert!(app.messages.iter().any(|m| m.content.contains("approved `execute_command`")));
+
+        // 3. Set another pending approval and deny via decision handler
+        app.pending_approval = Some(PendingToolApproval {
+            task_id: 1,
+            bot_slug: "auditor".into(),
+            tool_name: "execute_command".into(),
+            arg1: "rm -rf /tmp/dangerous".into(),
+            arg2: None,
+            response_tx: None,
+        });
+        app.modal = ActiveModal::ToolApproval;
+
+        app.handle_approval_decision(false);
+
+        assert_eq!(app.modal, ActiveModal::None);
+        assert!(app.pending_approval.is_none());
+        assert!(app.messages.iter().any(|m| m.content.contains("denied `execute_command`")));
+    }
+
+    #[test]
+    fn test_spawn_subagent_unknown_slug_fails_closed() {
+        use serde_json::json;
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:59999".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        let unknown_call = cynapse_core::offline_agent::ToolCall {
+            name: "spawn_subagent".into(),
+            arguments: json!({
+                "task": "Do something unsafe",
+                "bot": "nonexistent_bot",
+                "wait": false
+            }),
+        };
+
+        let (res, ok) = app.execute_tool_and_format(&unknown_call);
+        assert!(!ok, "Unknown bot profile spawn must fail closed");
+        assert!(res.contains("Unknown bot profile '@nonexistent_bot'"));
+    }
+
+    #[tokio::test]
+    async fn test_background_subagent_approval_and_denial_channel_workflow() {
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:59999".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = ToolApprovalRequest {
+            task_id: 42,
+            bot_slug: "coder".into(),
+            tool_name: "write_file".into(),
+            arg1: "test.rs".into(),
+            arg2: Some("fn main() {}".into()),
+            response_tx: tx,
+        };
+
+        // 1. Send request through approval channel
+        app.approval_tx.send(req).unwrap();
+
+        // 2. Poll stream events to trigger modal
+        app.poll_stream_events();
+        assert_eq!(app.modal, ActiveModal::ToolApproval);
+        assert!(app.pending_approval.is_some());
+
+        // 3. User approves in modal
+        app.handle_approval_decision(true);
+        assert_eq!(app.modal, ActiveModal::None);
+
+        // 4. Verify oneshot channel received true
+        let received = rx.await.unwrap();
+        assert!(received);
+    }
+
+    #[tokio::test]
+    async fn test_at_slug_routing_and_bots_slash_commands() {
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:59999".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        // 1. Simulate @coder <task> input routing
+        app.input = "@coder Write tests for parser".into();
+        app.input_cursor = app.input.len();
+        let _ = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        // Run the input handler logic directly
+        let trimmed = app.input.trim().to_string();
+        if trimmed.starts_with('@') {
+            let rest = &trimmed[1..];
+            let mut parts = rest.splitn(2, |c: char| c.is_whitespace());
+            let slug = parts.next().unwrap_or("").trim();
+            let task = parts.next().unwrap_or("").trim();
+            let call = cynapse_core::offline_agent::ToolCall {
+                name: "spawn_subagent".into(),
+                arguments: serde_json::json!({
+                    "bot": slug,
+                    "task": task,
+                    "wait": false,
+                }),
+            };
+            let (out, ok) = app.execute_tool_and_format(&call);
+            assert!(ok);
+            assert!(out.contains("[subagent #1 · @coder · spawned in background]"));
+        }
+
+        // 2. Test /bots status listing
+        let tasks = app.subagent_mgr.list_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].bot_slug, "coder");
+
+        // 3. Test /bots cancel
+        let cancelled = app.subagent_mgr.cancel_task(1);
+        assert!(cancelled);
+        assert_eq!(app.subagent_mgr.get_status(1), Some(cynapse_core::subagent::SubagentStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_poll_stream_events_auto_cancels_stalled_tasks() {
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:59999".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        let (task_id, cancel_flag) = app.subagent_mgr.create_task("Hanging computation", "researcher", false);
+        app.subagent_mgr.update_status(task_id, cynapse_core::subagent::SubagentStatus::Running, None);
+
+        // Artificially age the task to >2m
+        let old_time = cynapse_core::subagent::SubagentManager::now_ms().saturating_sub(180_000);
+        app.subagent_mgr.set_task_started_at_for_test(task_id, old_time);
+
+        app.poll_stream_events();
+        assert!(cancel_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(app.subagent_mgr.get_status(task_id), Some(cynapse_core::subagent::SubagentStatus::Cancelled));
+        assert!(app.messages.iter().any(|m| m.content.contains("stalled (> 2m) and was auto-cancelled")));
     }
 }

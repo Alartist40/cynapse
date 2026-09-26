@@ -60,6 +60,7 @@ Type `/` in the prompt bar to trigger the floating command menu:
 | `/model` | Open interactive model selector & scanner |
 | `/pull` | Download GGUF models from HuggingFace (curated catalog & custom URLs) |
 | `/persona` | Manage agent personality markdown files (`IDENTITY`, `SOUL`, `USER`, custom `.md`) |
+| `/bots` | Manage bot profiles; `/bots spawn <slug> <task>`, `/bots status [id]`, `/bots cancel <id\|all>` |
 | `/doctor` | Launch Cynapse Doctor self-healing diagnostic dashboard |
 | `/memory` | Launch 3D Orbital Galaxy Memory Atlas visualizer |
 | `/drawer` | Open interactive Dendrite Memory drawer inspector |
@@ -93,7 +94,7 @@ cynapse-mini/
 ├── harness/
 │   ├── src/main.rs             # CLI & TUI entrypoint dispatcher
 │   ├── cynapse-tui/            # Ratatui visual interface, modals, 3D visualizer
-│   └── cynapse-core/           # Tool execution, GBNF parser, session manager, doctor
+│   └── cynapse-core/           # Tool execution, GBNF parser, bot registry, subagent loop, session manager, doctor
 ├── memory/
 │   └── cynapse-memory/         # Dendrite graph engine, SQLite FTS5 store, BM25 ranker
 ├── engine/
@@ -129,6 +130,13 @@ Five hardening stages layered on the Atomic-Agent elevation:
 - **Concurrency-Safe Batch Partitioning**: Tools carry `concurrency_safe` metadata (`read_file`/`grep` safe, `write_file`/`execute_command` exclusive); batches partition into contiguous safe runs and singletons as the seam for future parallel dispatch.
 - **Verified Reflection Admission**: Reflection distills only clean turns — tool errors, LoopGuard vetoes, step exhaustion, and stream failures set `turn_verified = false` and skip distillation.
 
+### Agency Capabilities (Task 2, Stages 18-21)
+Delegation to scoped specialist bots with fail-closed permission enforcement:
+- **Bot Profiles & Registry**: TOML profiles at `~/.cynapse/bots/` (`tools_allow`/`tools_deny`/`tools_ask`, workspace restriction, persona, concurrency cap); deny beats allow, unknown tools fail closed; seeds `@coder`, `@researcher`, `@auditor`.
+- **Autonomous Subagent Loop**: `spawn_subagent` runs a budgeted loop (5 steps + forced finalization) with GBNF tool parsing, LoopGuard cycle detection, cancellation tokens, and a concurrency semaphore (2); results announce back into the conversation.
+- **Interactive Approval Gates**: `tools_ask` tools in background subagents pause for a `y/n` approval modal (`[tool denied by user]` on deny); inline subagents and unknown bot slugs fail closed.
+- **Orchestration UX**: `@slug <task>` input routing, `/bots spawn|status|cancel` commands, 120s stall auto-cancel with `=== NOTICE ===` steering, sidebar agency telemetry, and a doctor registry check.
+
 ### Offline Agent Capabilities & GBNF Grammar Engine
 - **NDJSON Streaming**: Polymorphic streaming parser supporting multiple API formats (Ollama, vLLM, generic).
 - **GBNF Grammar Constraints**: Enforces valid JSON tool-call schema syntax, preventing output formatting panics offline.
@@ -148,7 +156,7 @@ Fire-and-forget reflection worker distills conversation turns into atomic facts,
 - **Dynamic Prompt Compiler**: Injects direct system instructions into every model prompt without generic LLM headers.
 
 ### Cynapse Doctor Self-Healing Engine (`/doctor`)
-- **12-Subsystem Auditing**: RAM headroom, SIMD availability, GGUF magic headers, SQLite health, GBNF grammar parser, local tools, Tokio runtimes, persona subsystem, API connectivity, endpoint health, model availability, native engine catalog.
+- **13-Subsystem Auditing**: Host RAM headroom, GPU & hardware acceleration, SIMD (AVX2), model storage directory, GGUF file integrity, SQLite connection, SQLite table/index health, GBNF grammar compiler, local host tools, Tokio scheduler, Tier-1 endpoint & model catalog, persona catalog, bot registry & profile catalog.
 - **Auto-Fix Mode (`--fix`)**: Automatically recreates missing directories, repairs database indexes, clears stale files.
 
 ### Visual Themes & UI Experience
@@ -163,11 +171,11 @@ Fire-and-forget reflection worker distills conversation turns into atomic facts,
 
 | Metric | Value |
 |--------|-------|
-| Tests passed | 258 |
+| Tests passed | 281 |
 | Tests failed | 0 |
 | Build | `cargo build --release` succeeds |
-| System doctor | 100% health (12 Pass, 0 Warn, 0 Failed) |
-| Acceptance gates | G1-G18 all PASSED |
+| System doctor | 100% health (13 Pass, 0 Warn, 0 Failed) |
+| Acceptance gates | G1-G22 all PASSED |
 
 ---
 

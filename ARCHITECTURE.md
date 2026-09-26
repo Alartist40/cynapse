@@ -21,6 +21,8 @@ cynapse-mini/
 │           ├── lib.rs               # Tool definitions (with concurrency_safe), path validation, execute_command, partition_tool_calls
 │           ├── offline_agent.rs     # GBNF tool call validation, Zone A/B prefix compilation, LoopGuard, ToolLoopTracker
 │           ├── receipts.rs          # ReadReceiptRegistry, receipt_checked_read (verified read receipts)
+│           ├── bots.rs              # BotProfile/BotRegistry, allow-deny-ask permissions, workspace confinement
+│           ├── subagent.rs          # SubagentManager, run_subagent_loop, approval_fn channel, stall detection
 │           ├── compressor.rs        # Tool output compression (max 400 chars)
 │           ├── persona.rs           # Persona file management
 │           ├── session.rs           # Session persistence
@@ -196,6 +198,14 @@ Tool calls are validated against GBNF grammar supporting:
 
 Parsing tries each format in order; first successful parse wins.
 
+### Bot Profiles & Subagent Orchestration
+
+Specialist tasks delegate to bot profiles (`bots.rs`) — TOML definitions in `~/.cynapse/bots/` carrying `tools_allow`, `tools_deny`, `tools_ask`, `workspace_restrict`, persona, and `max_concurrent`. Permission resolution is fail-closed: deny beats allow, unknown tools are rejected, unknown spawn slugs error with the available list.
+
+`spawn_subagent` dispatches `run_subagent_loop` (`subagent.rs`): an injected `query_fn` runs up to 5 steps (plus one forced finalization turn), each step parsing GBNF tool calls, consulting `LoopGuard`, and dispatching through `execute_tool_with_profile`. Background spawns run under a concurrency semaphore (2) with results announced back into the conversation; inline spawns join on a dedicated runtime thread.
+
+`tools_ask` tools pause background execution through an injected `approval_fn`: the loop sends a `ToolApprovalRequest` over an mpsc channel drained every event-loop tick, the `ToolApproval` modal captures a y/n decision, and a oneshot resolves the loop — approve executes via `execute_tool_with_profile_approved` (bypassing only the ask check), deny returns `[tool denied by user]`. Inline subagents (UI blocked) and stalled tasks (>120s) fail closed with steering notices.
+
 ## Data Flow
 
 ```
@@ -268,9 +278,11 @@ Parsing tries each format in order; first successful parse wins.
 
 | File | Responsibility |
 |------|---------------|
-| `harness/cynapse-tui/src/app.rs` | TUI event loop, reprompt mechanism, prompt assembly, Phase 1-6 + Stage 13-17 integration (receipts wiring, finalization guard, turn_verified, partitioned dispatch) |
+| `harness/cynapse-tui/src/app.rs` | TUI event loop, reprompt mechanism, prompt assembly, Phase 1-6 + Stage 13-21 integration (receipts wiring, finalization guard, turn_verified, partitioned dispatch, spawn_subagent dispatch, approval modal, @mention routing, /bots commands, sidebar telemetry) |
 | `harness/cynapse-core/src/offline_agent.rs` | GBNF tool call validation, Zone A/B prefix compilation, LoopGuard, ToolLoopTracker |
-| `harness/cynapse-core/src/lib.rs` | Tool definitions (`concurrency_safe`), path validation, `execute_command`, `partition_tool_calls`, compressor |
+| `harness/cynapse-core/src/lib.rs` | Tool definitions (`concurrency_safe`), path validation, `execute_command`, `partition_tool_calls`, `execute_tool_with_profile(_approved)` permission dispatch, compressor |
+| `harness/cynapse-core/src/bots.rs` | BotProfile/BotRegistry, deny>allow precedence, tools_ask flags, workspace confinement, TOML seeding |
+| `harness/cynapse-core/src/subagent.rs` | SubagentManager (lifecycle, cancel, semaphore), run_subagent_loop, approval_fn injection, stall detection |
 | `harness/cynapse-core/src/receipts.rs` | ReadReceiptRegistry, hash-verified read receipts with context-window anchor checks |
 | `engine/cynapse-engine/src/lib.rs` | Tier routing, query streaming, `ProviderFallbackChain`, shared HTTP client |
 | `engine/cynapse-engine/src/daemon.rs` | llama-server daemon lifecycle |
@@ -295,9 +307,9 @@ cargo test -p cynapse-engine
 cargo test --workspace -- --nocapture
 ```
 
-Current test count: **258 passed, 0 failed** (core 28, engine 8, memory 16, tui 7, leafcutter 197, e2e 1, doctest 1).
+Current test count: **281 passed, 0 failed** (core 44, engine 8, memory 16, tui 14, leafcutter 197, e2e 1, doctest 1).
 
-Acceptance gates G1-G18 all passed — see `GATES.md`.
+Acceptance gates G1-G22 all passed — see `GATES.md`.
 
 ## Build
 

@@ -89,3 +89,23 @@
   CHECK: cargo test -p cynapse-memory && cargo test --workspace && echo "G18 PASS"
   EXPECT: G18 PASS
   EVIDENCE: 258 tests passed (0 failed) — core 28, engine 8, memory 16, tui 7, leafcutter 197, e2e 1, doctest 1. `verified: bool` admission gate added to `ReflectionWorker::spawn_reflection`; `TuiApp` tracks `turn_verified` across tool dispatches, vetoes, step exhaustion, and stream errors; unverified/failed turns are blocked from distilling lessons into the graph; unit tests verify gate filtering on unverified and verified turns.
+
+- [x] G19: Bot profiles load, validate, and list from the registry
+  CHECK: cargo test -p cynapse-core && cargo test --workspace && echo "G19 PASS"
+  EXPECT: G19 PASS
+  EVIDENCE: 263 tests passed (0 failed) — core 32, engine 8, memory 16, tui 8, leafcutter 197, e2e 1, doctest 1. `BotProfile` and `BotRegistry` implemented in `bots.rs`; default profiles (`coder`, `researcher`, `auditor`) seeded; permissions precedence (`tools_deny` > `tools_allow`), approval flagging (`tools_ask`), and slug validation verified; interactive `/bots` modal integrated in TUI with manifest preview.
+
+- [x] G20: spawn_subagent executes a scoped subagent loop with status tracking and announce-back
+  CHECK: cargo test --workspace && echo "G20 PASS"
+  EXPECT: G20 PASS
+  EVIDENCE: 271 tests passed (0 failed) — core 39 (+7), engine 8, memory 16, tui 9 (+1), leafcutter 197, e2e 1, doctest 1. `run_subagent_loop` implemented in `subagent.rs` executing autonomous model querying, GBNF tool parsing, `execute_tool_with_profile` permission dispatch, `LoopGuard` cycle detection, atomic cancellation checks, and step budgets; inline execution running on isolated runtime thread; background execution running under semaphore cap (2) with async announcement channel drained into conversation history; unit tests verify multi-step tool execution under profile, cancellation mid-flight, and end-to-end inline/background announcement workflow. AUDIT RE-VERIFIED 2026-09-26: 271/0 re-run independently; loop confirmed real (subagent.rs:212-359 — injected query_fn, cancellation checks, finalization turn at step budget, LoopGuard check/record/outcome/veto, execute_tool_with_profile wired); inline path safe (fresh runtime on spawned thread, no runtime-in-runtime panic). BLOCKER recorded for Stage 20 start: engine lib.rs (outside Stage 19 OWNS) added `.timeout(4s)` to `shared_http_client`, which `try_llama_server_stream`/`try_ollama_stream` use for response bodies — reqwest total timeout kills any generation >4s. Remove that timeout (keep connect_timeout) before Stage 20.
+
+- [x] G21: Per-bot allow/deny/ask permissions enforced fail-closed with approval gates
+  CHECK: cargo test --workspace && echo "G21 PASS"
+  EXPECT: G21 PASS
+  EVIDENCE: 277 tests passed (0 failed) — core 42 (+3), engine 8, memory 16, tui 12 (+2), leafcutter 197, e2e 1, doctest 1. `execute_tool_with_profile` enforces allow−deny precedence, fail-closed unknown tool rejection, and path workspace confinement; `execute_tool_with_profile_approved` executes confirmed actions; `run_subagent_loop` accepts `approval_fn` (symmetric with `query_fn`) to interactively request approvals during execution; background subagents send `ToolApprovalRequest` over mpsc drained by `poll_stream_events` into `ActiveModal::ToolApproval`, resolving via `handle_approval_decision` oneshot channel; inline subagents deny `tools_ask` fail-closed with explanatory notice (documented limitation); `spawn_subagent` validates bot slugs fail-closed against `BotRegistry` (unknown slug rejected immediately); unit tests verify approval granted/denied/inline-fails-closed in subagent loop, unknown-slug rejection, and interactive approval modal channel workflow.
+
+- [x] G22: @mention delegation, cancellation, and doctor diagnostics operational
+  CHECK: cargo test --workspace && cargo run --bin cynapse doctor && echo "G22 PASS"
+  EXPECT: G22 PASS
+  EVIDENCE: 281 tests passed (0 failed) — core 44 (+2), engine 8, memory 16, tui 14 (+2), leafcutter 197, e2e 1, doctest 1. `@slug <task>` input routing wired reusing fail-closed `spawn_subagent` tool dispatch; `/bots spawn|status|cancel` slash commands implemented for background execution, subagent status inspection, single-task cancellation, and batch cancellation (`/bots cancel all`); stalled tasks (>120s) automatically cancelled with steering `=== NOTICE ===` lines in `poll_stream_events`; active subagent count and concurrency cap displayed in TUI sidebar telemetry; `cynapse doctor` updated with 13th subsystem check (`Agency & Bots` Bot Registry & Profile Catalog) verified 13/13 passing with 100% health score.

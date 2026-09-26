@@ -106,5 +106,51 @@ Harden security, fix TUI UTF-8 input crashes, integrate native Leafcutter routin
   - Low-confidence/failed turns skip memory distillation to prevent polluting procedural memory with failed patterns.
   - Unit tests: `test_reflection_admission_gate_unverified_skips`, `test_reflection_admission_gate_verified_runs`, `test_turn_verified_status_and_reflection_admission`.
 
+## Task 2: Agency Capabilities (Stages 18–21) [PENDING]
+
+Add first-class bot/agency capabilities: named bots with profiles, delegation via a spawn tool, per-bot permission scoping with approval gates, and orchestration UX.
+
+**Contract notes:**
+- **Rust-only rebuild strategy** — reference sources are pattern citations, never copied code. All Python sources (nanobot) are reimplemented in Rust idioms: asyncio → `tokio`, `asyncio.Semaphore` → `tokio::sync::Semaphore`, Pydantic config → `serde` + `toml` validation, `SubagentManager` → `Arc<RwLock<HashMap<TaskId, SubagentHandle>>>` + `CancellationToken`, announce template → structured message injection in `app.rs`.
+- **License policy** — gawkbot is Sustainable Use License: clean-room reimplementation of *ideas only*, no code copying (cite as Source, as in Stages 15–17). nanobot and cua are MIT (attribution), still rebuilt in Rust per the strategy above.
+- **Design ceiling (v1, YAGNI-excluded):** no HTTP/web broker, no multi-process office, no peer-to-peer bot message queues, no dollar budgets, no cross-restart subagent history.
+
+- **Stage 18: Bot Profiles & Registry (`cynapse-core`, `cynapse-tui`) [DONE]**
+  `OWNS: harness/cynapse-core/src/bots.rs, harness/cynapse-tui/src/app.rs`
+  - Source: gawkbot `internal/bot/types.go` BotConfig + nanobot `config/schema.py` (patterns, clean-room).
+  - New module `bots.rs`: `BotProfile` (serde/TOML: `slug`, `display_name`, `description`, `persona_file`, `model_preset`, `tools_allow`, `tools_deny`, `tools_ask`, `workspace_restrict`, `max_concurrent`) and `BotRegistry` loading `~/.cynapse/bots/*.toml` with validation (unique slugs, deny overrides allow, unknown-tool fail-closed warning).
+  - Seeded default bot profiles (`coder`, `researcher`, `auditor`) into registry directory.
+  - Added `/bots` TUI interactive modal (list + profile manifest preview) and registered in `SLASH_COMMANDS`.
+  - Unit tests: TOML roundtrip, permission precedence, default seeding/loading, slug validation, TUI modal integration.
+
+- **Stage 19: Subagent Spawn Runtime (`cynapse-core`, `cynapse-tui`) [DONE — G20 audit verified; engine `.timeout(4s)` blocker RESOLVED (removal verified by audit)]**
+  - **Audit deviation (accepted with fix condition):** out-of-OWNS edit in `engine/cynapse-engine/src/lib.rs` — `fetch_native_models` probe tightened (2s → 500ms, acceptable) but `.timeout(4s)` added to `shared_http_client` breaks streaming responses >4s (used by `try_llama_server_stream`/`try_ollama_stream`). Fix = delete the `.timeout(...)` line, keep `.connect_timeout(500ms)`.
+  `OWNS: harness/cynapse-core/src/subagent.rs, harness/cynapse-core/src/lib.rs, harness/cynapse-tui/src/app.rs`
+  - Source: nanobot `agent/tools/spawn.py` + `agent/subagent.py` (MIT, Python → Rust per contract note).
+  - New tool `spawn_subagent { task, bot?, wait? }` in `ToolDefinition` (exclusive, non-concurrency-safe).
+  - `SubagentManager`: task IDs, `tokio::sync::Semaphore` global cap (default 2), `SubagentStatus` (pending/running/done/failed/cancelled), `CancellationToken` per task.
+  - Subagent runs autonomous `run_subagent_loop` executing model queries, GBNF tool parsing, profile-scoped tool dispatch via `execute_tool_with_profile`, `LoopGuard` cycle detection, cancellation checking, and `MAX_AGENT_STEPS` budget.
+  - `wait=true` runs inline via dedicated runtime thread; `wait=false` spawns a background tokio task whose result is announced back as a `[subagent #id · slug · status]` system message injected into the conversation history.
+  - Unit tests: task lifecycle & status, semaphore concurrency cap, cancellation flag, tool calling under profile, inline and background workflow.
+
+- **Stage 20: Per-Bot Permissions & Approval Gates (`cynapse-core`, `cynapse-tui`) [DONE]**
+  `OWNS: harness/cynapse-core/src/bots.rs, harness/cynapse-core/src/lib.rs, harness/cynapse-core/src/subagent.rs, harness/cynapse-tui/src/app.rs`
+  - Source: cua `session_manifest.rs` allow/deny/ask capability manifest (MIT) + gawkbot approval-gate pattern (clean-room).
+  - Dispatch-time enforcement: requested tool ∩ `tools_allow` − `tools_deny`, unknown tool → deny (fail-closed, consistent with Stage 16 `unwrap_or(false)`).
+  - `tools_ask` entries pause background dispatch for interactive approval via `approval_fn` and mpsc/oneshot channel into `ActiveModal::ToolApproval` with `[y/Enter]` approval and `[n/Esc]` denial; user decisions logged in session transcript. Inline subagent execution fails-closed on `tools_ask` with explanatory notice.
+  - `spawn_subagent` validates bot slugs fail-closed against `BotRegistry` before task creation.
+  - `workspace_restrict`: subagent path tools confined to the profile's workspace prefix, layered on existing path validation.
+  - Unit tests: `test_execute_tool_with_profile_permissions_and_confinement`, `test_tool_approval_modal_and_execution_workflow`, `test_subagent_loop_approval_granted`, `test_subagent_loop_approval_denied`, `test_subagent_loop_approval_inline_fails_closed`, `test_spawn_subagent_unknown_slug_fails_closed`, `test_background_subagent_approval_and_denial_channel_workflow`.
+
+- **Stage 21: Agency Orchestration UX & Diagnostics (`cynapse-tui`, `cynapse-core`) [DONE — G22 audit verified; DEF-1 recorded below]**
+  `OWNS: harness/cynapse-tui/src/app.rs, harness/cynapse-core/src/doctor.rs, harness/cynapse-core/src/subagent.rs, harness/cynapse-core/src/lib.rs`
+  - **AUDIT DEF-1 (fix before Task 3):** stall clock measures total runtime (`started_at_epoch_ms`, never reset) — healthy tasks >120s are auto-cancelled, not just stuck ones; a task awaiting approval burns the same clock, and `approval_fn` resolving after auto-cancel executes the tool (no cancel-flag check between approval and `execute_tool_with_profile_approved`). Fix: track `last_progress_at` (reset per completed step/tool result), pause the clock while `pending_approval` is open, re-check cancel flag after approval before executing.
+  - Source: gawkbot `internal/orchestration/delegator.go` @mention routing (clean-room) + nanobot status tracking.
+  - User input `@slug <task>` routes directly to `spawn_subagent` with that bot (background default) using the exact same fail-closed registry check.
+  - `/bots spawn|status|cancel` slash commands; cancel flips the task's cancellation flag; stuck timeout (120s) → auto-cancel + `=== NOTICE ===` steering line in `poll_stream_events`.
+  - Sidebar telemetry: active subagent count & concurrency cap.
+  - `cynapse doctor` gains bot-registry check (subsystem 13: `Agency & Bots` — verified 13/13 passing).
+  - Unit tests: `test_doctor_diagnostics_includes_bot_registry`, `test_subagent_stalled_task_auto_cancellation`, `test_at_slug_routing_and_bots_slash_commands`, `test_poll_stream_events_auto_cancels_stalled_tasks`.
+
 ## Acceptance Gates
-Defined in `GATES.md` (G1 through G18: ALL PASSED).
+Defined in `GATES.md` (G1 through G22: ALL PASSED, Task 2 agency complete).
