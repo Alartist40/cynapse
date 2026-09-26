@@ -121,14 +121,22 @@ Six architecture phases inspired by the Atomic-Agent reference implementation:
 - **Notice Injection**: `=== NOTICE ===` prompt tail for loop detector and steering redirections.
 - **Provider Fallback Chain**: Sticky multi-provider fallback (llama-server -> Ollama -> NativeLeafcutter) with escalating cooldowns (30s -> 60s -> 300s) and lazy probe recovery.
 
+### Agent Loop Hardening (Stages 13-17)
+Five hardening stages layered on the Atomic-Agent elevation:
+- **Verified Read Receipts**: Re-reading an unchanged file within the 6-message context window returns `[File unchanged since read #N]` instead of re-sending content — verified against a content hash *and* the anchor's presence in actual model context.
+- **Forced Finalization**: On step exhaustion (`MAX_AGENT_STEPS = 5`), one final no-tools turn demands an honest status report (completed / outstanding / errors) instead of an abrupt stop; a `tools_allowed` guard hard-blocks tool execution on that reply.
+- **Memory Injection Sanitization**: Recalled memory is fenced with an `[UNTRUSTED MEMORY]` banner; code fences (``` -> `` ` ``) and channel headers (`===` -> `= = =`) inside stored nodes are neutralized so they cannot spoof prompt channels.
+- **Concurrency-Safe Batch Partitioning**: Tools carry `concurrency_safe` metadata (`read_file`/`grep` safe, `write_file`/`execute_command` exclusive); batches partition into contiguous safe runs and singletons as the seam for future parallel dispatch.
+- **Verified Reflection Admission**: Reflection distills only clean turns — tool errors, LoopGuard vetoes, step exhaustion, and stream failures set `turn_verified = false` and skip distillation.
+
 ### Offline Agent Capabilities & GBNF Grammar Engine
 - **NDJSON Streaming**: Polymorphic streaming parser supporting multiple API formats (Ollama, vLLM, generic).
 - **GBNF Grammar Constraints**: Enforces valid JSON tool-call schema syntax, preventing output formatting panics offline.
 - **KV-Cache Slot Affinity**: Slot 0 pinned for chat, slot 1 for reflection, with `cache_prompt: true` for warm cache reuse.
-- **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 5`) to prevent runaway recursive tool execution.
+- **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 5`) with forced finalization — one no-tools status-report turn on exhaustion prevents runaway recursive tool execution.
 
 ### Async Background Reflection
-Fire-and-forget reflection worker distills conversation turns into atomic facts, procedures, and lessons without blocking the UI. Runs on a dedicated background thread after each turn completion.
+Fire-and-forget reflection worker distills conversation turns into atomic facts, procedures, and lessons without blocking the UI. Runs on a dedicated background thread after each turn completion, gated by verified-run admission: turns with tool failures, vetoes, or exhaustion are not distilled.
 
 ### Offline Model Downloader & Model Management (`/pull`)
 - **Curated Recommendations**: Probes system RAM and GPU VRAM to tag optimal model sizes.
@@ -140,7 +148,7 @@ Fire-and-forget reflection worker distills conversation turns into atomic facts,
 - **Dynamic Prompt Compiler**: Injects direct system instructions into every model prompt without generic LLM headers.
 
 ### Cynapse Doctor Self-Healing Engine (`/doctor`)
-- **11-Subsystem Auditing**: RAM headroom, SIMD availability, GGUF magic headers, SQLite health, GBNF grammar parser, local tools, Tokio runtimes, persona subsystem, API connectivity, endpoint health, model availability.
+- **12-Subsystem Auditing**: RAM headroom, SIMD availability, GGUF magic headers, SQLite health, GBNF grammar parser, local tools, Tokio runtimes, persona subsystem, API connectivity, endpoint health, model availability, native engine catalog.
 - **Auto-Fix Mode (`--fix`)**: Automatically recreates missing directories, repairs database indexes, clears stale files.
 
 ### Visual Themes & UI Experience
@@ -155,11 +163,11 @@ Fire-and-forget reflection worker distills conversation turns into atomic facts,
 
 | Metric | Value |
 |--------|-------|
-| Tests passed | 242 |
+| Tests passed | 258 |
 | Tests failed | 0 |
 | Build | `cargo build --release` succeeds |
-| System doctor | 92% health (11 Pass, 1 Warn, 0 Failed) |
-| Acceptance gates | G1-G13 all PASSED |
+| System doctor | 100% health (12 Pass, 0 Warn, 0 Failed) |
+| Acceptance gates | G1-G18 all PASSED |
 
 ---
 

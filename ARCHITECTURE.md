@@ -18,8 +18,9 @@ cynapse-mini/
 │   │       └── theme.rs            # Color theme definitions
 │   └── cynapse-core/                # Core agent logic
 │       └── src/
-│           ├── lib.rs               # Tool definitions, path validation, execute_command
+│           ├── lib.rs               # Tool definitions (with concurrency_safe), path validation, execute_command, partition_tool_calls
 │           ├── offline_agent.rs     # GBNF tool call validation, Zone A/B prefix compilation, LoopGuard, ToolLoopTracker
+│           ├── receipts.rs          # ReadReceiptRegistry, receipt_checked_read (verified read receipts)
 │           ├── compressor.rs        # Tool output compression (max 400 chars)
 │           ├── persona.rs           # Persona file management
 │           ├── session.rs           # Session persistence
@@ -91,8 +92,9 @@ User Query → Inference → Parse Tool Call(s) → Execute → Compose Results 
 Key invariants:
 - One inference per step (no internal reasoning loops)
 - `agent_step_count` incremented once per batch (max 5 steps)
+- On step exhaustion: one forced finalization turn (no-tools status report) — never an abrupt stop
 - `LoopGuard` checks every tool call before execution
-- Batch tool arrays `[{"tool": ...}, ...]` parsed and executed sequentially
+- Batch tool arrays `[{"tool": ...}, ...]` parsed and partitioned into concurrency-safe runs / exclusive singletons
 - Single reprompt with all batch results combined
 
 ### LoopGuard & ToolLoopTracker
@@ -131,20 +133,42 @@ Structured memory injection into the prompt:
 | Channel | Budget | Source | Content |
 |---------|--------|--------|---------|
 | `SESSION FACTS` | 500 tokens | `TurnLog` nodes | Key=value lines from recent turns |
-| `RECALLED KNOWLEDGE` | 60% of total | BM25-scored nodes | Full node content for relevant knowledge |
+| `RECALLED KNOWLEDGE` | 60% of total | BM25-scored nodes | Full node content for relevant knowledge, behind `[UNTRUSTED MEMORY]` banner |
 | `MEMORY INDEX` | 300 tokens | All non-core nodes | `#id [tags] preview` compact pointers |
 
 Budget allocation: `max_tokens = SESSION_FACTS + RECALLED + INDEX + core`.
+
+**Injection sanitization**: all untrusted render sites pass through `neutralize_untrusted()` (triple backticks become spaced backticks, `===` becomes `= = =`) *before* token estimation, so stored nodes cannot forge channel headers or smuggle fenced tool blocks. Core identity nodes are trusted and exempt.
 
 ### Async Background Reflection
 
 Fire-and-forget reflection worker:
 - Triggered on turn completion (after `save_current_session()`)
 - Extracts last 6 messages as `ReflMessage` array
+- **Verified-run admission**: `spawn_reflection(msgs, turn_verified)` returns immediately when the turn had a tool error, LoopGuard veto, step exhaustion, or stream failure
 - `InFlightGuard` prevents overlapping reflections
 - Distills into `NodeType::Lesson`, `NodeType::Procedure`, or `NodeType::AtomicFact`
 - Persists to Dendrite graph and SQLite store
 - Never blocks the TUI event loop
+
+### Verified Read Receipts
+
+Token-saving mechanism for repeated file reads within a turn:
+1. `read_file` resolves the canonical path, reads + hashes content (I/O only — no token cost on hit).
+2. If the registry has a receipt for that path with an **identical hash** AND the `cynapse-read #N` anchor is verifiably present in the **last 6 messages** (the actual reprompt context window), the model receives `[File unchanged since read #N: path]` instead of the content.
+3. Otherwise: full content (compressed) + post-compression `[cynapse-read #N: path | hash=...]` footer, and the receipt is refreshed.
+4. The stub itself carries the anchor id, keeping it alive in the window across repeated reads; registry resets on `/clear` and `load_session`.
+
+### Forced Finalization on Step Exhaustion
+
+```
+step_count >= 5 with new tool calls
+  → warning + assistant attempt recorded (previously dropped)
+  → finalization turn: === NOTICE === (do-not-call-tools + status report) 
+                       + original === USER INSTRUCTION ===
+  → finalization_inflight=true; reply accepted with tools_allowed=false
+  → flags reset; exactly one finalization turn per exhaustion
+```
 
 ### Batch Tool Execution
 
@@ -155,11 +179,12 @@ Model can emit array of tool calls:
 
 Execution flow:
 1. Parse array via `validate_gbnf_tool_calls`
-2. Iterate sequentially:
+2. Partition via `partition_tool_calls` — contiguous runs of concurrency-safe tools grouped; exclusive tools (`write_file`, `execute_command`) become singleton batches (unknown tools fail closed)
+3. Iterate partitions sequentially (parallel dispatch deferred — `execute_tool_and_format` is `&mut self`):
    - `loop_guard.check(call)` → `record_call(call)` → `execute(call)` → `record_outcome(call, result)`
-   - On veto: `record_veto(call)`, include veto message in results
-3. Combine all results into single system message
-4. Single reprompt with combined output
+   - On veto: `record_veto(call)`, include veto message in results; any tool error or veto sets `turn_verified = false`
+4. Combine all results into single system message
+5. Single reprompt with combined output
 
 ### GBNF Tool Call Grammar
 
@@ -243,9 +268,10 @@ Parsing tries each format in order; first successful parse wins.
 
 | File | Responsibility |
 |------|---------------|
-| `harness/cynapse-tui/src/app.rs` | TUI event loop, reprompt mechanism, prompt assembly, Phase 1-6 integration |
+| `harness/cynapse-tui/src/app.rs` | TUI event loop, reprompt mechanism, prompt assembly, Phase 1-6 + Stage 13-17 integration (receipts wiring, finalization guard, turn_verified, partitioned dispatch) |
 | `harness/cynapse-core/src/offline_agent.rs` | GBNF tool call validation, Zone A/B prefix compilation, LoopGuard, ToolLoopTracker |
-| `harness/cynapse-core/src/lib.rs` | Tool definitions, path validation, `execute_command`, compressor |
+| `harness/cynapse-core/src/lib.rs` | Tool definitions (`concurrency_safe`), path validation, `execute_command`, `partition_tool_calls`, compressor |
+| `harness/cynapse-core/src/receipts.rs` | ReadReceiptRegistry, hash-verified read receipts with context-window anchor checks |
 | `engine/cynapse-engine/src/lib.rs` | Tier routing, query streaming, `ProviderFallbackChain`, shared HTTP client |
 | `engine/cynapse-engine/src/daemon.rs` | llama-server daemon lifecycle |
 | `engine/cynapse-engine/src/slots.rs` | KV-cache slot management |
@@ -269,7 +295,9 @@ cargo test -p cynapse-engine
 cargo test --workspace -- --nocapture
 ```
 
-Current test count: **242 passed, 0 failed**.
+Current test count: **258 passed, 0 failed** (core 28, engine 8, memory 16, tui 7, leafcutter 197, e2e 1, doctest 1).
+
+Acceptance gates G1-G18 all passed — see `GATES.md`.
 
 ## Build
 
