@@ -183,6 +183,15 @@ pub fn render_synapse_ascii_line(line: &str, indent: usize, theme: &AppTheme) ->
     Line::from(spans)
 }
 
+pub fn finalization_notice(max_steps: usize) -> String {
+    format!(
+        "TOOL BUDGET EXHAUSTED after {} steps. Do NOT emit tool calls or JSON blocks. \
+         Reply in plain text ONLY with an honest status report: (1) what is completed, \
+         (2) what remains outstanding, (3) any errors encountered.",
+        max_steps
+    )
+}
+
 pub struct TuiApp {
     pub models_dir: PathBuf,
     pub active_model_name: String,
@@ -230,6 +239,8 @@ pub struct TuiApp {
     pub show_thinking: bool,
     pub loop_guard: LoopGuard,
     pub agent_step_count: usize,
+    pub finalization_inflight: bool,
+    pub turn_verified: bool,
 
     // Model Downloader state
     pub puller_step: PullerStep,
@@ -251,6 +262,7 @@ pub struct TuiApp {
     pub persona_edit_cursor: usize,
     pub cached_zone_a_prefix: Option<String>,
     pub reflection_worker: ReflectionWorker,
+    pub read_receipts: cynapse_core::receipts::ReadReceiptRegistry,
 }
 
 impl TuiApp {
@@ -317,6 +329,8 @@ impl TuiApp {
             galaxy_anim_spin: 0.0,
             loop_guard: LoopGuard::default(),
             agent_step_count: 0,
+            finalization_inflight: false,
+            turn_verified: true,
             puller_step: PullerStep::CuratedList,
             selected_pull_idx: 0,
             custom_pull_url: String::new(),
@@ -332,6 +346,7 @@ impl TuiApp {
             persona_edit_buffer: String::new(),
             persona_edit_cursor: 0,
             cached_zone_a_prefix: None,
+            read_receipts: cynapse_core::receipts::ReadReceiptRegistry::default(),
         }
     }
 
@@ -529,6 +544,42 @@ impl TuiApp {
             }
         };
 
+        if name == "read_file" {
+            let Self { read_receipts, messages, .. } = self;
+            return match cynapse_core::receipts::receipt_checked_read(
+                read_receipts,
+                &arg1,
+                &|id| {
+                    let anchor = format!("cynapse-read #{}", id);
+                    messages.iter().rev().take(6).any(|m| m.content.contains(&anchor))
+                },
+            ) {
+                Ok(cynapse_core::receipts::ReadOutcome::Unchanged { receipt_id }) => (
+                    format!("[File unchanged since read #{}: {}]", receipt_id, arg1),
+                    true,
+                ),
+                Ok(cynapse_core::receipts::ReadOutcome::Full {
+                    content,
+                    receipt_id,
+                    content_hash,
+                }) => {
+                    let compressed = cynapse_core::compressor::compress_tool_result(&content, false, None);
+                    (
+                        format!(
+                            "{}\n[cynapse-read #{}: {} | hash={:016x}]",
+                            compressed.summary, receipt_id, arg1, content_hash
+                        ),
+                        true,
+                    )
+                }
+                Err(e) => {
+                    let err = format!("Tool execution error: {}", e);
+                    let c = cynapse_core::compressor::compress_tool_result(&err, true, None);
+                    (c.summary, false)
+                }
+            };
+        }
+
         match cynapse_core::execute_tool(name, &arg1, arg2.as_deref()) {
             Ok(output) => {
                 let compressed = cynapse_core::compressor::compress_tool_result(&output, false, None);
@@ -544,6 +595,7 @@ impl TuiApp {
 
     pub fn load_session(&mut self, session_id: &str) -> Result<()> {
         self.autocomplete_idx = 0;
+        self.read_receipts = Default::default();
         let data = self.session_mgr.load_session(session_id)?;
         self.session_id = data.session_id;
         self.session_created_at = data.created_at;
@@ -1223,6 +1275,7 @@ impl TuiApp {
 
                                 if trimmed == "/clear" || trimmed == "/cls" {
                                     self.messages.clear();
+                                    self.read_receipts = Default::default();
                                     self.scroll_offset = 0;
                                     self.auto_scroll = true;
                                     continue;
@@ -1393,6 +1446,8 @@ impl TuiApp {
                                 });
 
                                 self.agent_step_count = 0;
+                                self.finalization_inflight = false;
+                                self.turn_verified = true;
                                 self.is_generating = true;
                                 self.current_thinking_buf.clear();
                                 self.current_response_buf.clear();
@@ -1506,20 +1561,96 @@ impl TuiApp {
                     self.last_latency_sec = elapsed_sec;
 
                     const MAX_AGENT_STEPS: usize = 5;
+                    let tools_allowed = !self.finalization_inflight;
+                    if self.finalization_inflight {
+                        self.finalization_inflight = false;
+                        self.agent_step_count = 0;
+                    }
 
                     // Offline Agent: GBNF tool call check (response buffer fallback to thinking buffer) & circular LoopGuard intervention
                     let detected_tools = validate_gbnf_tool_calls(&self.current_response_buf)
                         .or_else(|_| validate_gbnf_tool_calls(&self.current_thinking_buf));
 
                     if let Ok(tool_calls) = detected_tools {
-                        if !tool_calls.is_empty() {
+                        if !tool_calls.is_empty() && tools_allowed {
                             if self.agent_step_count >= MAX_AGENT_STEPS {
+                                self.turn_verified = false;
                                 self.messages.push(ChatMessage {
                                     role: "system".into(),
                                     content: format!("⚠️ MAX AGENT STEPS REACHED ({} steps): Automated tool execution loop paused to prevent runaway execution.", MAX_AGENT_STEPS),
                                     thinking: None,
                                 });
+
+                                let assistant_content = if self.current_response_buf.trim().is_empty() {
+                                    let names: Vec<String> = tool_calls.iter().map(|t| format!("`{}`", t.name)).collect();
+                                    format!("Executing tools: {}", names.join(", "))
+                                } else {
+                                    self.current_response_buf.clone()
+                                };
+                                self.messages.push(ChatMessage {
+                                    role: "assistant".into(),
+                                    content: assistant_content,
+                                    thinking: if self.current_thinking_buf.is_empty() {
+                                        None
+                                    } else {
+                                        Some(self.current_thinking_buf.clone())
+                                    },
+                                });
                                 self.save_current_session();
+
+                                reprompting = true;
+                                self.finalization_inflight = true;
+                                let (tx, rx) = mpsc::unbounded_channel();
+                                self.stream_rx = Some(rx);
+                                self.is_generating = true;
+                                self.current_thinking_buf.clear();
+                                self.current_response_buf.clear();
+
+                                let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
+                                let system_prompt = self.get_or_compile_zone_a_prefix();
+                                let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&user_msg, 1500, true, false);
+                                let endpoint = self.tier1_endpoint.clone();
+                                let model_name = self.active_model_name.clone();
+
+                                let history_context: String = self.messages.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev()
+                                    .map(|m| format!("{}: {}", m.role.to_uppercase(), m.content))
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+
+                                let notice = finalization_notice(MAX_AGENT_STEPS);
+                                let prompt = cynapse_core::offline_agent::compile_zone_b_tail(
+                                    &memory_prompt,
+                                    &history_context,
+                                    &user_msg,
+                                    Some(&notice),
+                                );
+
+                                let tier = self.active_tier;
+                                tokio::spawn(async move {
+                                    let res = query_model_stream(
+                                        tier,
+                                        &endpoint,
+                                        &model_name,
+                                        &prompt,
+                                        &system_prompt,
+                                        |ttype, token| {
+                                            let _ = tx.send(StreamEvent::Token { ttype, text: token.to_string() });
+                                        },
+                                    )
+                                    .await;
+
+                                    match res {
+                                        Ok(stats) => {
+                                            let _ = tx.send(StreamEvent::Done {
+                                                tok_per_sec: stats.tok_per_sec,
+                                                elapsed_sec: stats.elapsed_sec,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(StreamEvent::Error(e.to_string()));
+                                        }
+                                    }
+                                });
                             } else {
                                 self.agent_step_count += 1;
                                 let mut tool_results: Vec<String> = Vec::new();
@@ -1543,20 +1674,27 @@ impl TuiApp {
                                     },
                                 });
 
-                                for tool_call in &tool_calls {
-                                    tool_names.push(tool_call.name.clone());
-                                    match self.loop_guard.check(tool_call) {
-                                        Ok(()) => {
-                                            all_vetoed = false;
-                                            self.loop_guard.record_call(tool_call);
-                                            let (tool_output, _ok) = self.execute_tool_and_format(tool_call);
-                                            self.loop_guard.record_outcome(tool_call, &tool_output);
-                                            tool_results.push(format!("[{}]\n{}", tool_call.name, tool_output));
-                                        }
-                                        Err(loop_warn) => {
-                                            self.loop_guard.record_veto(tool_call);
-                                            veto_notices.push(format!("Loop intervention for `{}`: {}", tool_call.name, loop_warn));
-                                            tool_results.push(format!("[{}] Vetoed: {}", tool_call.name, loop_warn));
+                                let partitions = cynapse_core::partition_tool_calls(&tool_calls);
+                                for batch in partitions {
+                                    for tool_call in &batch {
+                                        tool_names.push(tool_call.name.clone());
+                                        match self.loop_guard.check(tool_call) {
+                                            Ok(()) => {
+                                                all_vetoed = false;
+                                                self.loop_guard.record_call(tool_call);
+                                                let (tool_output, ok) = self.execute_tool_and_format(tool_call);
+                                                if !ok {
+                                                    self.turn_verified = false;
+                                                }
+                                                self.loop_guard.record_outcome(tool_call, &tool_output);
+                                                tool_results.push(format!("[{}]\n{}", tool_call.name, tool_output));
+                                            }
+                                            Err(loop_warn) => {
+                                                self.turn_verified = false;
+                                                self.loop_guard.record_veto(tool_call);
+                                                veto_notices.push(format!("Loop intervention for `{}`: {}", tool_call.name, loop_warn));
+                                                tool_results.push(format!("[{}] Vetoed: {}", tool_call.name, loop_warn));
+                                            }
                                         }
                                     }
                                 }
@@ -1693,7 +1831,7 @@ impl TuiApp {
                                     ReflMessage::text(role, m.content.clone())
                                 })
                                 .collect();
-                            self.reflection_worker.spawn_reflection(recent_refl_msgs);
+                            self.reflection_worker.spawn_reflection(recent_refl_msgs, self.turn_verified);
                         }
 
                         self.is_generating = false;
@@ -1701,6 +1839,7 @@ impl TuiApp {
                     }
                 }
                 StreamEvent::Error(err) => {
+                    self.turn_verified = false;
                     self.messages.push(ChatMessage {
                         role: "error".into(),
                         content: format!("Error querying engine: {}", err),
@@ -3109,5 +3248,174 @@ mod tests {
         assert!(app.cached_zone_a_prefix.is_none());
         let p3 = app.get_or_compile_zone_a_prefix();
         assert_eq!(p1, p3);
+    }
+
+    #[test]
+    fn test_read_receipt_workflow_in_app() {
+        use cynapse_core::offline_agent::ToolCall;
+
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:11434".into(),
+            graph,
+            None,
+            ctx,
+        );
+
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("cynapse_tui_receipt_test.txt");
+        std::fs::write(&test_file, "hello receipts in tui").unwrap();
+
+        let call = ToolCall {
+            name: "read_file".into(),
+            arguments: serde_json::json!({
+                "path": test_file.to_string_lossy()
+            }),
+        };
+
+        // 1. First execution returns full content with anchor footer
+        let (output1, success1) = app.execute_tool_and_format(&call);
+        assert!(success1);
+        assert!(output1.contains("hello receipts in tui"));
+        assert!(output1.contains("[cynapse-read #1:"));
+
+        // Simulate message added to app.messages containing the anchor
+        app.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: output1.clone(),
+            thinking: None,
+        });
+
+        // 2. Second execution returns stub since file is unchanged and anchor is in last 6 messages
+        let (output2, success2) = app.execute_tool_and_format(&call);
+        assert!(success2);
+        assert!(output2.contains("[File unchanged since read #1:"));
+
+        // 3. Clear messages -> resets anchor visibility -> next read returns full
+        app.messages.clear();
+        let (output3, success3) = app.execute_tool_and_format(&call);
+        assert!(success3);
+        assert!(output3.contains("[cynapse-read #2:"));
+
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[test]
+    fn test_finalization_notice_no_tool_directive() {
+        let n = super::finalization_notice(5);
+        assert!(n.contains("Do NOT emit tool calls"));
+        assert!(n.contains("status report"));
+        assert!(n.contains('5'));
+    }
+
+    #[test]
+    fn test_finalization_prompt_structure() {
+        let notice = super::finalization_notice(5);
+        let prompt = cynapse_core::offline_agent::compile_zone_b_tail(
+            "mem", "history", "Original user request", Some(&notice));
+        let notice_idx = prompt.find("=== NOTICE ===").unwrap();
+        let user_idx = prompt.find("=== USER INSTRUCTION ===").unwrap();
+        assert!(notice_idx < user_idx);           // notice precedes instruction
+        assert!(prompt.contains("Original user request"));  // query preserved
+        assert!(prompt.contains("Do NOT emit tool calls")); // directive present
+    }
+
+    #[test]
+    fn test_batch_partitioning_execution() {
+        use serde_json::json;
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:11434".into(),
+            graph,
+            None,
+            ctx,
+        );
+        let calls = vec![
+            cynapse_core::offline_agent::ToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path": "Cargo.toml"}),
+            },
+            cynapse_core::offline_agent::ToolCall {
+                name: "grep".into(),
+                arguments: json!({"pattern": "cynapse"}),
+            },
+            cynapse_core::offline_agent::ToolCall {
+                name: "execute_command".into(),
+                arguments: json!({"command": "echo 'partition test'"}),
+            },
+        ];
+
+        let partitions = cynapse_core::partition_tool_calls(&calls);
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0].len(), 2); // [read_file, grep]
+        assert_eq!(partitions[1].len(), 1); // [execute_command]
+
+        for batch in partitions {
+            for call in &batch {
+                assert!(app.loop_guard.check(call).is_ok());
+                app.loop_guard.record_call(call);
+                let (output, ok) = app.execute_tool_and_format(call);
+                assert!(ok);
+                app.loop_guard.record_outcome(call, &output);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_turn_verified_status_and_reflection_admission() {
+        use serde_json::json;
+        let graph = Arc::new(cynapse_memory::graph::Dendrite::new());
+        let ctx = cynapse_memory::context::DendriteContext::new(Arc::clone(&graph), None);
+        let mut app = TuiApp::new(
+            PathBuf::from("./models"),
+            "ministral-3:3b".into(),
+            "http://127.0.0.1:11434".into(),
+            graph.clone(),
+            None,
+            ctx,
+        );
+
+        // Initially verified
+        assert!(app.turn_verified);
+
+        // Failing tool execution marks turn unverified
+        let fail_call = cynapse_core::offline_agent::ToolCall {
+            name: "execute_command".into(),
+            arguments: json!({"command": "rm -rf /"}), // blocked by sandbox
+        };
+        let (_output, ok) = app.execute_tool_and_format(&fail_call);
+        assert!(!ok);
+        if !ok {
+            app.turn_verified = false;
+        }
+        assert!(!app.turn_verified);
+
+        let messages = vec![
+            cynapse_memory::reflection::Message::text(
+                cynapse_memory::reflection::Role::User,
+                "try dangerous operation",
+            ),
+            cynapse_memory::reflection::Message::text(
+                cynapse_memory::reflection::Role::Assistant,
+                "failed to execute dangerous command",
+            ),
+        ];
+
+        // spawn_reflection with turn_verified=false must be rejected
+        app.reflection_worker.spawn_reflection(messages.clone(), app.turn_verified);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(graph.all().len(), 0);
+
+        // Clean verified turn admits reflection
+        app.turn_verified = true;
+        app.reflection_worker.spawn_reflection(messages, app.turn_verified);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert!(graph.all().len() > 0);
     }
 }

@@ -11,13 +11,15 @@ pub mod doctor;
 pub mod downloader;
 pub mod offline_agent;
 pub mod persona;
+pub mod receipts;
 pub mod session;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolDefinition {
     pub name: &'static str,
     pub description: &'static str,
+    pub concurrency_safe: bool,
 }
 
 pub fn list_tools() -> Vec<ToolDefinition> {
@@ -25,20 +27,58 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "read_file",
             description: "Read text contents of a file within permitted workspace",
+            concurrency_safe: true,
         },
         ToolDefinition {
             name: "write_file",
             description: "Write content to a file within permitted workspace",
+            concurrency_safe: false,
         },
         ToolDefinition {
             name: "grep",
             description: "Search regex pattern recursively across workspace files",
+            concurrency_safe: true,
         },
         ToolDefinition {
             name: "execute_command",
             description: "Execute a safe bash shell command with timeout",
+            concurrency_safe: false,
         },
     ]
+}
+
+/// Returns true if a tool is safe for concurrent read/inspection execution.
+pub fn is_tool_concurrency_safe(name: &str) -> bool {
+    list_tools()
+        .into_iter()
+        .find(|t| t.name == name)
+        .map(|t| t.concurrency_safe)
+        .unwrap_or(false)
+}
+
+/// Partitions a slice of tool calls into execution batches:
+/// contiguous runs of concurrency-safe tools are grouped together,
+/// while exclusive (state-mutating) tools are placed into individual singleton batches.
+pub fn partition_tool_calls(calls: &[offline_agent::ToolCall]) -> Vec<Vec<offline_agent::ToolCall>> {
+    let mut partitions = Vec::new();
+    let mut current_safe_batch = Vec::new();
+
+    for call in calls {
+        if is_tool_concurrency_safe(&call.name) {
+            current_safe_batch.push(call.clone());
+        } else {
+            if !current_safe_batch.is_empty() {
+                partitions.push(std::mem::take(&mut current_safe_batch));
+            }
+            partitions.push(vec![call.clone()]);
+        }
+    }
+
+    if !current_safe_batch.is_empty() {
+        partitions.push(current_safe_batch);
+    }
+
+    partitions
 }
 
 /// Validate path safety: prevents path traversal and symlink bypass to sensitive system files.
@@ -93,23 +133,29 @@ fn validate_safe_path(p_str: &str, for_write: bool) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+/// Shared safe file reading helper returning the canonical path and full content.
+pub(crate) fn read_file_at(path: &str) -> Result<(PathBuf, String)> {
+    let safe_path = validate_safe_path(path, false)?;
+    if !safe_path.exists() {
+        bail!("File not found: {}", path);
+    }
+    if safe_path.is_dir() {
+        bail!("Path is a directory, not a file: {}", path);
+    }
+    let metadata = fs::metadata(&safe_path)?;
+    if metadata.len() > 10 * 1024 * 1024 {
+        bail!("File too large to read into context ({} bytes, limit is 10 MB)", metadata.len());
+    }
+    let content = fs::read_to_string(&safe_path)
+        .with_context(|| format!("Failed to read file {}", safe_path.display()))?;
+    Ok((safe_path, content))
+}
+
 /// Native implementation of atomic-agent tools with sandboxing and execution timeout.
 pub fn execute_tool(name: &str, arg1: &str, arg2: Option<&str>) -> Result<String> {
     match name {
         "read_file" => {
-            let safe_path = validate_safe_path(arg1, false)?;
-            if !safe_path.exists() {
-                bail!("File not found: {}", arg1);
-            }
-            if safe_path.is_dir() {
-                bail!("Path is a directory, not a file: {}", arg1);
-            }
-            let metadata = fs::metadata(&safe_path)?;
-            if metadata.len() > 10 * 1024 * 1024 {
-                bail!("File too large to read into context ({} bytes, limit is 10 MB)", metadata.len());
-            }
-            let content = fs::read_to_string(&safe_path)
-                .with_context(|| format!("Failed to read file {}", safe_path.display()))?;
+            let (_path, content) = read_file_at(arg1)?;
             Ok(content)
         }
         "write_file" => {
@@ -281,6 +327,58 @@ mod tests {
                 assert!(res.is_err());
             }
         }
+    }
+
+    #[test]
+    fn test_tool_concurrency_classification() {
+        assert!(is_tool_concurrency_safe("read_file"));
+        assert!(is_tool_concurrency_safe("grep"));
+        assert!(!is_tool_concurrency_safe("write_file"));
+        assert!(!is_tool_concurrency_safe("execute_command"));
+        assert!(!is_tool_concurrency_safe("unknown_tool"));
+    }
+
+    #[test]
+    fn test_partition_tool_calls_mixed() {
+        use serde_json::json;
+        let calls = vec![
+            offline_agent::ToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path": "a.txt"}),
+            },
+            offline_agent::ToolCall {
+                name: "grep".into(),
+                arguments: json!({"pattern": "foo"}),
+            },
+            offline_agent::ToolCall {
+                name: "write_file".into(),
+                arguments: json!({"path": "b.txt", "content": "hi"}),
+            },
+            offline_agent::ToolCall {
+                name: "execute_command".into(),
+                arguments: json!({"command": "ls"}),
+            },
+            offline_agent::ToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path": "c.txt"}),
+            },
+        ];
+
+        let partitions = partition_tool_calls(&calls);
+        assert_eq!(partitions.len(), 4);
+        // Batch 1: contiguous safe [read_file, grep]
+        assert_eq!(partitions[0].len(), 2);
+        assert_eq!(partitions[0][0].name, "read_file");
+        assert_eq!(partitions[0][1].name, "grep");
+        // Batch 2: singleton exclusive [write_file]
+        assert_eq!(partitions[1].len(), 1);
+        assert_eq!(partitions[1][0].name, "write_file");
+        // Batch 3: singleton exclusive [execute_command]
+        assert_eq!(partitions[2].len(), 1);
+        assert_eq!(partitions[2][0].name, "execute_command");
+        // Batch 4: singleton safe [read_file]
+        assert_eq!(partitions[3].len(), 1);
+        assert_eq!(partitions[3][0].name, "read_file");
     }
 
     #[test]

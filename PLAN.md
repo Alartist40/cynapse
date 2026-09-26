@@ -64,5 +64,47 @@ Harden security, fix TUI UTF-8 input crashes, integrate native Leafcutter routin
   - Modularized streaming into `try_llama_server_stream`, `try_ollama_stream`, `try_native_leafcutter_stream`.
   - Wired `query_tier1_stream` to consult `shared_fallback_chain().resolve_provider()` with automatic success/failure recording and candidate iteration.
 
+- **Stage 13: Verified Read Receipts (`cynapse-tui`, `cynapse-core`) [DONE]**
+  `OWNS: harness/cynapse-tui/src/app.rs, harness/cynapse-core/src/lib.rs, harness/cynapse-core/src/receipts.rs`
+  - Created `ReadReceiptRegistry` and `receipt_checked_read` in `harness/cynapse-core/src/receipts.rs`.
+  - Extracted `pub(crate) fn read_file_at` in `harness/cynapse-core/src/lib.rs`.
+  - Wired into `TuiApp` at `execute_tool_and_format`: anchors on `cynapse-read #id` within the last 6 messages (`take(6)` reprompt window).
+  - Skips re-reading unchanged files with `[File unchanged since read #<id>: <path>]` stub.
+  - Reset on `load_session` and `/clear`.
+  - Verified with 5 unit tests in `receipts.rs` and workflow unit test in `app.rs`.
+
+- **Stage 14: Forced Finalization on Step Exhaustion (`cynapse-tui`) [DONE]**
+  `OWNS: harness/cynapse-tui/src/app.rs`
+  - Added `finalization_inflight: bool` flag to `TuiApp` state and constructor.
+  - Implemented `finalization_notice(max_steps: usize)` notice composer.
+  - Replaced abrupt stop at `agent_step_count >= MAX_AGENT_STEPS` with a single finalization turn injecting the budget exhaustion directive before user instruction.
+  - Guarded `StreamEvent::Done` with `tools_allowed = !self.finalization_inflight` to strictly disallow tool execution on finalization replies and reset flags.
+  - Reset `finalization_inflight = false` on every new user turn.
+  - Verified with 2 unit tests (`test_finalization_notice_no_tool_directive` and `test_finalization_prompt_structure`).
+
+- **Stage 15: Fence Neutralization on Memory Injection (`cynapse-memory`) [DONE]**
+  `OWNS: memory/cynapse-memory/src/context.rs`
+  - Source: gawkbot `internal/team/scoped_memory.go` (wrapUntrustedMemoryBrief).
+  - Before injecting RECALLED KNOWLEDGE / MEMORY INDEX content into the prompt, neutralize code-fence and `===` header delimiters inside recalled content and wrap it as explicitly untrusted data (`neutralize_untrusted`).
+  - Preserve channel header structure owned by `assemble()`; only mutate inner recalled payloads.
+  - Added untrusted memory reference banner to `=== RECALLED KNOWLEDGE ===`.
+  - Unit tests: `test_neutralize_untrusted_blocks_spoofing` and `test_assembled_prompt_cannot_be_spoofed_by_node_content`.
+
+- **Stage 16: Parallel-Safe Tool Classification (`cynapse-core`, `cynapse-tui`) [DONE]**
+  `OWNS: harness/cynapse-core/src/lib.rs, harness/cynapse-tui/src/app.rs`
+  - Source: nanobot `agent/tools/execution.py` (concurrency_safe/exclusive partitioning).
+  - Added `concurrency_safe: bool` to `ToolDefinition` and `is_tool_concurrency_safe` in `cynapse-core/src/lib.rs` (`read_file: true`, `grep: true`, `write_file: false`, `execute_command: false`).
+  - Implemented `partition_tool_calls`: contiguous runs of safe tools grouped into batches, exclusive tools placed into singleton batches; batch structure created as the seam for future parallel dispatch (execution is currently sequential — `execute_tool_and_format` is `&mut self`, parallelization deferred).
+  - Preserved per-call `LoopGuard` check/record ordering within each batch in `app.rs`.
+  - Unit tests: `test_tool_concurrency_classification`, `test_partition_tool_calls_mixed`, `test_batch_partitioning_execution`.
+
+- **Stage 17: Verified Reflection Admission (`cynapse-memory`, `cynapse-tui`) [DONE]**
+  `OWNS: memory/cynapse-memory/src/reflection.rs, harness/cynapse-tui/src/app.rs`
+  - Source: gawkbot `internal/team/task_distill.go` (verification-gated distillation).
+  - Added `verified: bool` admission gate to `ReflectionWorker::spawn_reflection`.
+  - Wired `turn_verified: bool` on `TuiApp` to track execution quality across turns; resets on user turn, flips false on tool error, loop guard veto, step exhaustion, or stream failure.
+  - Low-confidence/failed turns skip memory distillation to prevent polluting procedural memory with failed patterns.
+  - Unit tests: `test_reflection_admission_gate_unverified_skips`, `test_reflection_admission_gate_verified_runs`, `test_turn_verified_status_and_reflection_admission`.
+
 ## Acceptance Gates
-Defined in `GATES.md` (G1 through G13: ALL PASSED).
+Defined in `GATES.md` (G1 through G18: ALL PASSED).

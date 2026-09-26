@@ -70,7 +70,12 @@ impl ReflectionWorker {
 
     /// Run reflection on recent conversation messages in a background Tokio
     /// task, guarding against overlapping background runs.
-    pub fn spawn_reflection(&self, messages: Vec<Message>) {
+    ///
+    /// Admission gating: only runs if `verified` is true (the turn had no tool execution failures or vetoes).
+    pub fn spawn_reflection(&self, messages: Vec<Message>, verified: bool) {
+        if !verified {
+            return;
+        }
         if messages.len() < 2 {
             return;
         }
@@ -198,5 +203,35 @@ mod tests {
         let all = graph.all();
         let proc_node = all.iter().find(|n| n.node_type == NodeType::Procedure);
         assert!(proc_node.is_some(), "Expected a Procedure node to be distilled from procedural steps");
+    }
+
+    #[tokio::test]
+    async fn test_reflection_admission_gate_unverified_skips() {
+        let graph = Arc::new(Dendrite::new());
+        let worker = ReflectionWorker::new(graph.clone(), None);
+        let messages = vec![
+            Message::text(Role::User, "run command failed with permission error"),
+            Message::text(Role::Assistant, "let me try something else"),
+        ];
+
+        // Gated: verified = false -> nothing distilled
+        worker.spawn_reflection(messages, false);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert_eq!(graph.all().len(), 0, "Unverified turn must not admit reflections into memory graph");
+    }
+
+    #[tokio::test]
+    async fn test_reflection_admission_gate_verified_runs() {
+        let graph = Arc::new(Dendrite::new());
+        let worker = ReflectionWorker::new(graph.clone(), None);
+        let messages = vec![
+            Message::text(Role::User, "how to deploy cynapse mini?"),
+            Message::text(Role::Assistant, "Procedure: step 1 run cargo test, step 2 run cargo build."),
+        ];
+
+        // Gated: verified = true -> reflection runs
+        worker.spawn_reflection(messages, true);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert!(graph.all().len() > 0, "Verified turn must admit reflections into memory graph");
     }
 }
