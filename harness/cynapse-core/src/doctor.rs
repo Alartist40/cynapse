@@ -3,6 +3,101 @@ use std::io::Read;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
+/// Well-known local inference backend ports, probed in order.
+/// 11434 = stock Ollama, 11435 = alternate Ollama, 38265 = llama-server daemon.
+pub const LOCAL_BACKEND_PORTS: [u16; 3] = [11434, 11435, 38265];
+
+const PROBE_CONNECT_TIMEOUT_MS: u64 = 300;
+const PROBE_READ_TIMEOUT_MS: u64 = 700;
+
+/// Probe a single TCP endpoint with a minimal HTTP GET and report whether it
+/// answers with any HTTP status line. Dependency-free, synchronous.
+///
+/// Sends `GET /api/tags` first; if that yields no `HTTP/` response (e.g.
+/// llama-server on 38265 answers 404/HTML differently or closes silently),
+/// retries once with `GET /health`.
+pub fn probe_port(host: &str, port: u16) -> bool {
+    fn handshake(host: &str, port: u16, path: &str) -> bool {
+        use std::io::{Read, Write};
+        use std::net::{TcpStream, ToSocketAddrs};
+        use std::time::Duration;
+
+        let addrs: Vec<std::net::SocketAddr> = match (host, port).to_socket_addrs() {
+            Ok(a) => a.collect(),
+            Err(_) => return false,
+        };
+        let mut stream = None;
+        for addr in addrs {
+            if let Ok(s) =
+                TcpStream::connect_timeout(&addr, Duration::from_millis(PROBE_CONNECT_TIMEOUT_MS))
+            {
+                stream = Some(s);
+                break;
+            }
+        }
+        let mut stream = match stream {
+            Some(s) => s,
+            None => return false,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(PROBE_READ_TIMEOUT_MS)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(PROBE_READ_TIMEOUT_MS)));
+        let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 512];
+        match stream.read(&mut buf) {
+            Ok(n) if n > 0 => std::str::from_utf8(&buf[..n])
+                .map(|resp| resp.starts_with("HTTP/"))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    handshake(host, port, "/api/tags") || handshake(host, port, "/health")
+}
+
+/// Probe the well-known local inference backends in order and return the base
+/// URL (e.g. `http://127.0.0.1:11434`) of the first live one, or `None`.
+pub fn probe_local_backend() -> Option<String> {
+    for port in LOCAL_BACKEND_PORTS {
+        if probe_port("127.0.0.1", port) {
+            return Some(format!("http://127.0.0.1:{}", port));
+        }
+    }
+    None
+}
+
+/// Build the "Inference Backend Reachability" doctor item from a probe result.
+fn build_backend_reachability_item(live: Option<String>) -> DoctorItem {
+    match live {
+        Some(endpoint) => DoctorItem {
+            subsystem: "Cynapse Engine".into(),
+            check_name: "Inference Backend Reachability".into(),
+            status: DoctorStatus::Pass,
+            detail: format!("Inference backend reachable at {}", endpoint),
+            fix_recommendation: None,
+        },
+        None => DoctorItem {
+            subsystem: "Cynapse Engine".into(),
+            check_name: "Inference Backend Reachability".into(),
+            status: DoctorStatus::Failed,
+            detail: format!(
+                "No backend reachable on 127.0.0.1 ports {} (stock Ollama / alternate Ollama / llama-server daemon).",
+                LOCAL_BACKEND_PORTS
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            fix_recommendation: Some(
+                "Install Ollama (https://ollama.com/download) or run ./install.sh to install an inference backend, then re-run 'cynapse doctor'."
+                    .into(),
+            ),
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DoctorStatus {
     Pass,
@@ -94,6 +189,9 @@ impl CynapseDoctor {
 
         // Check 8: Tier 1 LLM Engine Endpoint & Model Registration Alignment
         items.push(self.check_llm_endpoint_and_models());
+
+        // Check 8b: Tier 1 Inference Backend Reachability (fail-loud)
+        items.push(self.check_inference_backend_reachability());
 
         // Check 9: Markdown Persona System & System Prompt Directory Integrity
         items.push(self.check_persona_subsystem());
@@ -463,6 +561,10 @@ impl CynapseDoctor {
         }
     }
 
+    fn check_inference_backend_reachability(&self) -> DoctorItem {
+        build_backend_reachability_item(probe_local_backend())
+    }
+
     fn check_persona_subsystem(&self) -> DoctorItem {
         let p_dir = crate::persona::PersonaManager::default_dir();
         match crate::persona::PersonaManager::new(&p_dir) {
@@ -526,10 +628,76 @@ mod tests {
         let doctor = CynapseDoctor::new(models_dir, db_path, false);
         let report = doctor.run_diagnostics();
 
-        // 13 subsystem checks total
-        assert_eq!(report.items.len(), 13);
+        // 14 subsystem checks total (13 original + Inference Backend Reachability)
+        assert_eq!(report.items.len(), 14);
         let bot_check = report.items.iter().find(|i| i.subsystem == "Agency & Bots");
         assert!(bot_check.is_some());
         assert_eq!(bot_check.unwrap().status, DoctorStatus::Pass);
+    }
+
+    #[test]
+    fn test_probe_port_closed_port_reports_dead() {
+        // Bind an ephemeral port, release it, then probe: nothing listens.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = held.local_addr().unwrap().port();
+        drop(held);
+
+        assert!(!probe_port("127.0.0.1", closed_port));
+        assert!(!probe_port("127.0.0.1", 0));
+    }
+
+    #[test]
+    fn test_backend_reachability_item_fail_loud_strings() {
+        let failed = build_backend_reachability_item(None);
+        assert_eq!(failed.subsystem, "Cynapse Engine");
+        assert_eq!(failed.check_name, "Inference Backend Reachability");
+        assert_eq!(failed.status, DoctorStatus::Failed);
+        assert!(failed.detail.contains("No backend reachable"));
+        assert_eq!(
+            failed.fix_recommendation.as_deref(),
+            Some(
+                "Install Ollama (https://ollama.com/download) or run ./install.sh to install an inference backend, then re-run 'cynapse doctor'."
+            )
+        );
+
+        let passed = build_backend_reachability_item(Some("http://127.0.0.1:11434".into()));
+        assert_eq!(passed.status, DoctorStatus::Pass);
+        assert!(passed.detail.contains("Inference backend reachable at http://127.0.0.1:11434"));
+        assert!(passed.fix_recommendation.is_none());
+    }
+
+    #[test]
+    fn test_probe_port_live_http_listener_reports_alive() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+
+        let server = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        assert!(probe_port("127.0.0.1", port));
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
     }
 }

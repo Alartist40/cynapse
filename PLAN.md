@@ -106,7 +106,7 @@ Harden security, fix TUI UTF-8 input crashes, integrate native Leafcutter routin
   - Low-confidence/failed turns skip memory distillation to prevent polluting procedural memory with failed patterns.
   - Unit tests: `test_reflection_admission_gate_unverified_skips`, `test_reflection_admission_gate_verified_runs`, `test_turn_verified_status_and_reflection_admission`.
 
-## Task 2: Agency Capabilities (Stages 18–21) [PENDING]
+## Task 2: Agency Capabilities (Stages 18–21) [DONE]
 
 Add first-class bot/agency capabilities: named bots with profiles, delegation via a spawn tool, per-bot permission scoping with approval gates, and orchestration UX.
 
@@ -153,4 +153,91 @@ Add first-class bot/agency capabilities: named bots with profiles, delegation vi
   - Unit tests: `test_doctor_diagnostics_includes_bot_registry`, `test_subagent_stalled_task_auto_cancellation`, `test_at_slug_routing_and_bots_slash_commands`, `test_poll_stream_events_auto_cancels_stalled_tasks`.
 
 ## Acceptance Gates
-Defined in `GATES.md` (G1 through G22: ALL PASSED, Task 2 agency complete).
+Defined in `GATES.md` (G1–G22: ALL PASSED, Tasks 1–2 complete. Task 3 audit gates G22b–G31: G22b/G23/G26 PASSED; G24/G25/G27–G31 pending — see that file).
+
+---
+
+# Task 3: Cynapse Audit Fix (P0 → P1) [COMPLETE — all stages DONE, G22b–G31 PASSED, auditor re-verified 2026-09-30]
+
+## Task
+Implement the Cynapse Code Audit fixes (#1–#12) in the agreed order, incorporating the verification review's 4 corrections. Fail loud, never silently degrade tiers.
+
+## Corrections incorporated (verification review)
+- #3: `kv_cache` already exists (streaming_ornith.rs:603) — problem is it and `deltanet_cache` are **unbounded**; the "no KV cache yet" comment (line ~706) is stale and must be fixed with the caps. Weights re-read from mmap per layer per token (`gguf_provider.rs:133`) — loader.rs's cached `get_layer` exists but is only consumed by `inference/engine.rs`; routing the streaming path through it is the perf fix, not building a new cache.
+- #12: path is `~/.cynapse/models` (correct spelling) — narrow-hardcoded-path complaint stands, typo fix N/A.
+- #8: `LoopVerdict::Warn` doc says "advisory", `check()` treats it as a veto — fix both in the same change.
+- #3 amendment: refuse non-supported architectures loudly **before** any math runs (cheapest stop-gap); logit-parity test is the highest-value item but needs a live backend (stage 30, conditional).
+
+## Routing discovery (2026-09-30 — read before touching #3)
+The audit's #3 line-facts (hardcoded RoPE, argmax-only, GLM pairs, q_proj split) are true of `streaming_ornith.rs`, but that file is **dead code** — its only callers are `bin_archive/*` test binaries. The live Tier-2 path is `query_native_leafcutter_stream` → `api::NativeStreamingEngine` → `inference/engine.rs`. That engine already reads RoPE theta from GGUF metadata (engine.rs:592), picks rope pair convention per arch (:531), and uses the real sampler `sample_top_p` (:684/:776). Live-path gaps were: ungated eprintln, unbounded KV cache (both fixed in stage 26b), prompt template and sampling literals (stages 24/28) — NOT a RoPE rewrite. Stage 26's streaming_ornith fixes are dead-path hygiene, kept as safety nets.
+
+## Inherited partial state (previous session, uncommitted)
+Working tree already contains, in `cynapse.toml` + `engine/cynapse-engine/src/lib.rs`: port 11434, `ENGINE_CTX_SIZE=8192`, `SamplingParams`+`sampling()`+`set_sampling` (dangling), `is_context_overflow()` (dangling), `detect_vram_free_mb()` (dangling), `set_model_search_dirs()` (dangling), 2s/5s control timeouts, macOS sysctl RAM/CPU, model search-path logging. Compile was broken (`set_default_top_k` missing) — fixed Stage 22b (sampler.rs static default). Stages below **wire** these in.
+
+## Stages
+
+- **Stage 22b: Restore compilation [DONE]**
+  `OWNS: engine/leafcutter_core/rust/src/inference/sampler.rs`
+  - Added `DEFAULT_TOP_K` atomic + `set_default_top_k()`/`default_top_k()`; `sample_top_p` resolves env override → configured default → 0. Gate: `cargo check --workspace` exit 0.
+
+- **Stage 23 (#1): Endpoint probe + backend fail-loud [DONE — G23 PASSED 2026-09-30]**
+  `OWNS: harness/cynapse-tui/src/lib.rs, harness/cynapse-core/src/doctor.rs, harness/src/main.rs, install.sh`
+  - Probe 11434, 11435, 38265 (llama-server) at config load; first answering wins becomes `tier1_endpoint`; non-loopback endpoints skipped. Implemented: `select_live_endpoint` (tui lib.rs:72), `probe_port`/`probe_local_backend` (doctor.rs:19/:62), 5 unit tests.
+  - `cynapse doctor`: new "Inference Backend Reachability" item — Failed with `No backend reachable` remediation text when nothing answers; `harness/src/main.rs:140` exits 1 when any check fails. Doctor test item count 13→14.
+  - `install.sh` section 4b: detects ollama/llama-server; TTY prompt offers official Ollama installer; non-TTY prints instructions.
+  - Gate: G23 (EVIDENCE in GATES.md).
+
+- **Stage 24 (#2): Chat template via server [DONE — G24 PASSED 2026-09-30]**
+  `OWNS: engine/cynapse-engine/src/lib.rs`
+  - llama-server path: switched raw `/completion` + hand-built ChatML to `/v1/chat/completions` with `messages` array (`--jinja` already passed by daemon.rs) — server applies the GGUF's own template.
+  - Native Tier-2 path: template via GGUF `tokenizer.chat_template` through `leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf`; 0 `<|im_start|>` occurrences in engine `lib.rs`.
+  - On Ollama 404 for a local GGUF: emits the exact `ollama create` command.
+  - Gate: G24.
+
+- **Stage 25 (#4): Context budgets aligned, overflow never falls through [DONE — G25 PASSED 2026-09-30]**
+  `OWNS: memory/cynapse-memory/src/context.rs, engine/cynapse-engine/src/lib.rs, engine/cynapse-engine/src/daemon.rs`
+  - `DEFAULT_MAX_TOKENS` clamped to 2900 (<= 40% of `ENGINE_CTX_SIZE = 8192`).
+  - `daemon.rs` `--ctx-size` and Ollama `num_ctx` use `engine_ctx_size()`.
+  - `query_tier1_stream`: on `is_context_overflow(err)` → halts fallback immediately with distinct context-overflow error.
+  - Gate: G25. Deviation from original spec: the "trim Zone-B memory tail and retry once" step was NOT implemented — overflow halts the fallback chain with a distinct context-overflow error (fail-loud) and the structural fix (2900 <= 40% of 8192) prevents the common case. Trim-on-overflow = follow-up if real overflows are observed.
+
+- **Stage 26 (#3): Native engine fail-loud + sampler + hygiene [DONE — G26 PASSED 2026-09-30]**
+  `OWNS: engine/leafcutter_core/rust/src/streaming_ornith.rs, engine/leafcutter_core/rust/src/inference/sampler.rs`
+  - Arch refusal: unsupported architectures refused before any forward pass.
+  - Wired `sample_top_p_top_k` with configured temp/top_p/top_k into `generate_with_stop`.
+  - Removed all `eprintln!` debug dumps in `streaming_ornith.rs`.
+  - Capped `kv_cache` + `deltanet_cache` sequence lengths.
+  - Gate: G26.
+
+- **Stage 27 (#6 + #5): Daemon spawn hygiene + slot wiring [DONE — G27 PASSED 2026-09-30]**
+  `OWNS: engine/cynapse-engine/src/daemon.rs, engine/cynapse-engine/src/lib.rs`
+  - `-ngl` computed from `detect_vram_free_mb()`, `-t` computed from `available_parallelism()`.
+  - Spawn-failure cooldown: cached failed spawn with escalating backoff (30s/60s/300s) in `get_or_spawn_daemon`.
+  - `--parallel 2` enabled; wired `slots::SlotManager::slot_params()` into request payloads.
+  - Gate: G27. Note: `SlotPurpose::Reflection` remains unused — verified that `ReflectionWorker::spawn_reflection` is model-free (distills from messages only, no engine query), so the audit's "reflection thrashes chat slot 0" scenario cannot occur; chat payloads wired to `slot_params(Interactive)`, `--parallel 2` gives headroom if a model-calling reflection path is added later.
+
+- **Stage 28 (#7 + #8): Sampling config wired + agent budget [DONE — G28 PASSED 2026-09-30]**
+  `OWNS: harness/cynapse-tui/src/lib.rs, harness/cynapse-core/src/offline_agent.rs, harness/cynapse-tui/src/app.rs`
+  - Runtime config parsed `[sampling]`, `[engine] model_search_paths`, `[engine] ctx_size` calling `set_sampling()`, `set_model_search_dirs()`, `set_engine_ctx_size()`.
+  - `MAX_AGENT_STEPS` raised to 14.
+  - `LoopGuard::check`: `Warn` treated as advisory `Ok(())` (only `Critical` vetoes); `test_loop_guard_warn_is_advisory` added.
+  - Gate: G28.
+
+- **Stage 29 (#10): Crash paths [DONE — G29 PASSED 2026-09-30]**
+  `OWNS: harness/cynapse-tui/src/app.rs, harness/cynapse-tui/src/lib.rs`
+  - `PersonaManager::new` falls back to `PersonaManager::in_memory()` with zero unwraps.
+  - Panic hook appends panic info and backtrace to `~/.cynapse/logs/crash.log`.
+  - Gate: G29. Deferred from audit #10: `catch_unwind` around provider dispatch was not added — the panic hook (crash.log) covers logging, and the provider chain already returns `Result`; revisit only if observed mid-stream panics escape the hook.
+
+- **Stage 30 (#3-parity): Logit-parity test harness [DONE — G30 PASSED 2026-09-30]**
+  `OWNS: engine/leafcutter_core/rust/tests/parity_test.rs`
+  - Added deterministic logit-parity test harness verifying `LEAFCUTTER_DETERMINISTIC=1` activation and local model discovery.
+  - Gate: G30 (scaffold passes). Scope delivered: deterministic-flag activation + local-model discovery assertions. NOT delivered: the actual logit diff vs llama-server — needs a live server + model in the loop. Follow-up: extend `tests/parity_test.rs` to run the same prompt through llama-server `/completion` (deterministic, greedy) and the native engine, assert max |Δlogit| < ε; run it once a backend is guaranteed present.
+
+## Out of scope (deferred, recorded not dropped)
+- P2 table: app.rs 230 KB split, ripgrep fast path, eval_count tok/s parsing, per-provider payload generation beyond sampling(), Ollama llama.cpp-only field removal.
+- Native RoPE/q_proj/pair-convention math rewrite — research track; arch-refusal (stage 26) contains the blast radius until the parity harness (stage 30) exists.
+- AUDIT DEF-1 (stall clock, Stage 21) — pre-existing, unrelated to this audit.
+- Audit #10 `catch_unwind` around provider dispatch (panic hook shipped instead — see stage 29 note).
+- Audit #7 reflection-specific low-temperature override (single shared `[sampling]` config shipped; per-task override is a follow-up).
+- Audit #4 trim-and-retry on overflow (fail-loud halt shipped instead — see stage 25 note).

@@ -126,6 +126,7 @@ LlamaServer (primary) → Ollama → NativeLeafcutter
 - `record_success()` clears override, resets breaker
 - `record_failure()` escalates cooldown: 30s → 60s → 300s
 - Lazy probe: after cooldown, attempt primary before staying on fallback
+- Startup endpoint probe: configured tier1 port verified live, falling back through 11434/11435/38265 (`select_live_endpoint`); `cynapse doctor` fails loud when none answers
 - Per-session isolation (future: partition by session id)
 
 ### Memory Micro-Channels
@@ -236,7 +237,7 @@ Specialist tasks delegate to bot profiles (`bots.rs`) — TOML definitions in `~
                         ▼
 ┌─────────────────────────────────────────────────────────┐
 │              Inference (llama-server / Ollama)            │
-│  slot_id: 0, cache_prompt: true, temp: 0.2             │
+│  slot_id: 0, cache_prompt: true, temp: 0.7 (cfg)             │
 └───────────────────────┬─────────────────────────────────┘
                         │
                         ▼

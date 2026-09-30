@@ -24,6 +24,147 @@ pub fn compute_reserve_bytes(model_bytes: u64) -> u64 {
 
 pub const DEFAULT_RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
 
+/// Shared prompt context size for every backend (llama-server `--ctx-size`,
+/// Ollama `num_ctx`, native engine max tokens). Must stay in sync with the
+/// memory context budget: `memory::context::DEFAULT_MAX_TOKENS` is sized to
+/// ~36% of this value so assembled prompts cannot overflow the engine.
+pub const ENGINE_CTX_SIZE: usize = 8192;
+
+static ENGINE_CTX: OnceLock<usize> = OnceLock::new();
+
+/// Install the process-wide context size from cynapse.toml `[engine] ctx_size`
+/// (called once at startup from the TUI session config load).
+pub fn set_engine_ctx_size(n: usize) {
+    if n >= 2048 {
+        let _ = ENGINE_CTX.set(n);
+    }
+}
+
+/// Effective context size: cynapse.toml value if set, else `ENGINE_CTX_SIZE`.
+/// Drives llama-server `--ctx-size`, Ollama `num_ctx`, and overflow reporting.
+pub fn engine_ctx_size() -> usize {
+    ENGINE_CTX.get().copied().unwrap_or(ENGINE_CTX_SIZE)
+}
+
+/// Shared sampling defaults, applied to every provider payload from ONE
+/// config so Ollama options and llama-server payloads cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 40,
+            repeat_penalty: 1.05,
+            repeat_last_n: 256,
+        }
+    }
+}
+
+static SAMPLING: OnceLock<StdMutex<SamplingParams>> = OnceLock::new();
+
+/// Process-wide sampling config (set once from cynapse.toml at startup).
+pub fn sampling() -> SamplingParams {
+    let lock = SAMPLING.get_or_init(|| StdMutex::new(SamplingParams::default()));
+    lock.lock().map(|g| *g).unwrap_or_default()
+}
+
+/// Install sampling config from cynapse.toml (called once at startup).
+pub fn set_sampling(params: SamplingParams) {
+    let lock = SAMPLING.get_or_init(|| StdMutex::new(SamplingParams::default()));
+    if let Ok(mut g) = lock.lock() {
+        *g = params;
+    }
+    // Keep the native engine's sampler default top-k in sync.
+    leafcutter::inference::sampler::set_default_top_k(params.top_k);
+}
+
+static MODEL_SEARCH_DIRS: OnceLock<StdMutex<Vec<std::path::PathBuf>>> = OnceLock::new();
+
+/// Register extra GGUF search directories from `[engine] model_search_paths`.
+pub fn set_model_search_dirs(dirs: Vec<std::path::PathBuf>) {
+    let lock = MODEL_SEARCH_DIRS.get_or_init(|| StdMutex::new(Vec::new()));
+    if let Ok(mut g) = lock.lock() {
+        *g = dirs;
+    }
+}
+
+fn extra_model_search_dirs() -> Vec<std::path::PathBuf> {
+    let lock = MODEL_SEARCH_DIRS.get_or_init(|| StdMutex::new(Vec::new()));
+    lock.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Append a line to ~/.cynapse/logs/engine.log (safe under a fullscreen TUI,
+/// unlike eprintln which corrupts the alternate screen).
+pub fn engine_log(msg: &str) {
+    let path = if let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::PathBuf::from(&home).join(".cynapse").join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("engine.log")
+    } else {
+        std::path::PathBuf::from("engine.log")
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "[{}] {}", chrono_like_now(), msg);
+    }
+}
+
+fn chrono_like_now() -> String {
+    // RFC3339-ish timestamp without pulling a date crate.
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}s", d.as_secs())
+}
+
+/// Free VRAM in MiB via nvidia-smi, if an NVIDIA GPU with a working driver
+/// is present. `None` = no information (do not guess).
+pub fn detect_vram_free_mb() -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| l.trim().parse::<u64>().ok())
+}
+
+/// True when an engine error means "prompt exceeds context" rather than a
+/// transient provider failure. Context overflows must NOT fall through to the
+/// next provider — every backend would receive the same oversized prompt.
+pub fn is_context_overflow(err_msg: &str) -> bool {
+    let m = err_msg.to_lowercase();
+    let has_400 = m.contains("400") || m.contains("bad request");
+    let overflow_words = [
+        "too long",
+        "context length",
+        "maximum context",
+        "n_ctx",
+        "context window",
+        "prompt is too long",
+        "exceeds",
+        "kv cache is full",
+    ];
+    has_400 && overflow_words.iter().any(|w| m.contains(w))
+        || m.contains("prompt is too long")
+        || m.contains("context length exceeds")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineTier {
     Tier1Fast,
@@ -64,6 +205,10 @@ impl ProviderKind {
             ProviderKind::Ollama => "Ollama",
             ProviderKind::NativeLeafcutter => "Native Leafcutter",
         }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.label()
     }
 }
 
@@ -160,31 +305,87 @@ pub struct RouteDecision {
     pub is_safetensors: bool,
 }
 
-pub fn available_ram_mb() -> u64 {
-    if let Ok(text) = fs::read_to_string("/proc/meminfo") {
-        for line in text.lines() {
-            if line.starts_with("MemAvailable:") {
-                if let Some(kb) = line.split_whitespace().nth(1) {
-                    if let Ok(val) = kb.parse::<u64>() {
-                        return val / 1024;
-                    }
-                }
-            }
+#[cfg(target_os = "linux")]
+fn read_meminfo_kb(key: &str) -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if line.starts_with(key) {
+            let kb = line.split_whitespace().nth(1)?;
+            return kb.parse::<u64>().ok();
         }
     }
-    4096
+    None
+}
+
+/// macOS: total RAM in MiB via sysctl hw.memsize (no /proc on macOS).
+#[cfg(target_os = "macos")]
+fn mac_total_ram_mb() -> Option<u64> {
+    let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim().parse::<u64>().ok().map(|b| b / (1024 * 1024))
+}
+
+/// macOS: available RAM in MiB by parsing `vm_stat` (free + file + inactive).
+#[cfg(target_os = "macos")]
+fn mac_available_ram_mb() -> Option<u64> {
+    let out = std::process::Command::new("vm_stat").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let page_size: u64 = text
+        .lines()
+        .find(|l| l.contains("page size of"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find(|t| t.len() >= 3 && t.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|t| t.parse().ok())
+        })
+        .unwrap_or(4096);
+    let mut free_kb: u64 = 0;
+    for line in text.lines() {
+        let count = |l: &str| -> u64 {
+            l.split_whitespace()
+                .nth(2)
+                .and_then(|t| t.trim_end_matches('.').parse().ok())
+                .unwrap_or(0)
+        };
+        if line.starts_with("Pages free")
+            || line.starts_with("Pages file")
+            || line.starts_with("Pages inactive")
+            || line.starts_with("Pages speculative")
+        {
+            free_kb += count(line) * page_size / 1024;
+        }
+    }
+    Some(free_kb / 1024)
+}
+
+pub fn available_ram_mb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(kb) = read_meminfo_kb("MemAvailable:") {
+            return kb / 1024;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(mb) = mac_available_ram_mb() {
+            return mb;
+        }
+    }
+    // Unknown platform — fall back to total RAM rather than a made-up number.
+    total_ram_mb()
 }
 
 pub fn total_ram_mb() -> u64 {
-    if let Ok(text) = fs::read_to_string("/proc/meminfo") {
-        for line in text.lines() {
-            if line.starts_with("MemTotal:") {
-                if let Some(kb) = line.split_whitespace().nth(1) {
-                    if let Ok(val) = kb.parse::<u64>() {
-                        return val / 1024;
-                    }
-                }
-            }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(kb) = read_meminfo_kb("MemTotal:") {
+            return kb / 1024;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(mb) = mac_total_ram_mb() {
+            return mb;
         }
     }
     16384
@@ -273,9 +474,8 @@ pub struct SystemHardwareInfo {
 pub fn probe_hardware_info() -> SystemHardwareInfo {
     let mut cpu_brand = "x86_64 Processor".to_string();
     let mut cpu_cores = 0usize;
-    let mut ram_total_mb = 16384u64;
-    let mut ram_avail_mb = 8192u64;
 
+    #[cfg(target_os = "linux")]
     if let Ok(text) = fs::read_to_string("/proc/cpuinfo") {
         for line in text.lines() {
             if line.starts_with("model name") {
@@ -288,30 +488,19 @@ pub fn probe_hardware_info() -> SystemHardwareInfo {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output() {
+        let brand = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !brand.is_empty() {
+            cpu_brand = brand;
+        }
+    }
     if cpu_cores == 0 {
         cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     }
 
-    if let Ok(text) = fs::read_to_string("/proc/meminfo") {
-        let mut total_kb = 0u64;
-        let mut avail_kb = 0u64;
-        for line in text.lines() {
-            if line.starts_with("MemTotal:") {
-                if let Some(kb) = line.split_whitespace().nth(1) {
-                    total_kb = kb.parse::<u64>().unwrap_or(0);
-                }
-            }
-            if line.starts_with("MemAvailable:") {
-                if let Some(kb) = line.split_whitespace().nth(1) {
-                    avail_kb = kb.parse::<u64>().unwrap_or(0);
-                }
-            }
-        }
-        if total_kb > 0 {
-            ram_total_mb = total_kb / 1024;
-            ram_avail_mb = avail_kb / 1024;
-        }
-    }
+    let ram_total_mb = total_ram_mb();
+    let ram_avail_mb = available_ram_mb();
 
     let ram_used_mb = ram_total_mb.saturating_sub(ram_avail_mb);
     let ram_used_pct = if ram_total_mb > 0 {
@@ -356,6 +545,9 @@ pub fn find_model_file_path(model_name: &str) -> Option<std::path::PathBuf> {
         std::path::PathBuf::from("models"),
     ];
 
+    // Extra dirs from cynapse.toml [engine] model_search_paths
+    dirs_to_search.extend(extra_model_search_dirs());
+
     if let Ok(home) = std::env::var("HOME") {
         let home_path = std::path::PathBuf::from(&home);
         dirs_to_search.push(home_path.join(".cynapse").join("models"));
@@ -375,6 +567,11 @@ pub fn find_model_file_path(model_name: &str) -> Option<std::path::PathBuf> {
                     if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
                         let lower_fname = fname.to_lowercase();
                         if lower_fname == lower_model {
+                            engine_log(&format!(
+                                "model '{}' resolved to {} (exact match)",
+                                model_name,
+                                path.display()
+                            ));
                             return Some(path);
                         }
                     }
@@ -397,6 +594,11 @@ pub fn find_model_file_path(model_name: &str) -> Option<std::path::PathBuf> {
                             || stripped_fname.contains(&stripped)
                             || stripped.contains(stripped_fname)
                         {
+                            engine_log(&format!(
+                                "model '{}' resolved to {} (fuzzy match)",
+                                model_name,
+                                path.display()
+                            ));
                             return Some(path);
                         }
                     }
@@ -417,6 +619,7 @@ pub fn fetch_native_models_sync() -> Vec<String> {
         Path::new("../models").to_path_buf(),
         Path::new("models").to_path_buf(),
     ];
+    search_dirs.extend(extra_model_search_dirs());
 
     if let Ok(home) = std::env::var("HOME") {
         let home_path = Path::new(&home);
@@ -447,9 +650,12 @@ pub async fn fetch_native_models(endpoint: &str) -> Vec<String> {
     let mut models = fetch_native_models_sync();
 
     // Query endpoint /api/tags if available
+    // Control endpoint (model listing) — generous timeout: cold-started
+    // Ollama on a Pi/NAS can take seconds to answer /api/tags. Never use a
+    // total timeout on generation streams (see G20).
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(250))
-        .timeout(std::time::Duration::from_millis(500))
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok();
     if let Some(c) = client {
@@ -755,18 +961,21 @@ pub fn query_native_leafcutter_stream(
     let path_str = model_path.to_string_lossy();
     let engine = get_or_load_native_engine(&path_str)?;
 
-    let full_prompt = if system_prompt.is_empty() {
+    let full_prompt = if let Ok(file) = leafcutter::model::gguf::GGUFile::open(model_path.to_str().unwrap_or(&path_str)) {
+        leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf(&file.metadata, system_prompt, prompt)
+    } else if system_prompt.is_empty() {
         prompt.to_string()
     } else {
-        format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", system_prompt, prompt)
+        format!("{}\n\n{}", system_prompt, prompt)
     };
 
     let start = Instant::now();
     let is_reasoning = is_reasoning_model(&path_str);
     let mut is_thinking = is_reasoning;
+    let s = sampling();
 
     let (_text, tokens) = engine
-        .generate_stream(&full_prompt, 4096, 0.2, 0.95, |token| {
+        .generate_stream(&full_prompt, 4096, s.temperature, s.top_p, |token| {
             if token.contains("<think>") {
                 is_thinking = true;
                 let clean = token.replace("<think>", "");
@@ -804,7 +1013,10 @@ pub fn shared_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(500))
+            // Connect timeout only — never a total timeout here: this client
+            // carries generation streams (G20). Control endpoints set their
+            // own total timeouts per request.
+            .connect_timeout(Duration::from_secs(2))
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
@@ -905,24 +1117,33 @@ pub async fn try_llama_server_stream(
     }
 
     let client = shared_http_client();
-    let llama_url = format!("http://127.0.0.1:{}/completion", daemon_port);
-    let full_p = if system_prompt.is_empty() {
-        format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
-    } else {
-        format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", system_prompt, prompt)
-    };
+    let llama_url = format!("http://127.0.0.1:{}/v1/chat/completions", daemon_port);
+    let mut messages = Vec::new();
+    if !system_prompt.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system_prompt
+        }));
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": prompt
+    }));
+
+    let (slot_id, cache_prompt) = slots::SlotManager::slot_params(slots::SlotPurpose::Interactive);
+    let s = sampling();
+
     let payload = serde_json::json!({
-        "prompt": full_p,
+        "messages": messages,
         "stream": true,
-        "cache_prompt": true,
-        "keep_alive": -1,
-        "slot_id": 0,
-        "id_slot": 0,
-        "temperature": 0.2,
-        "top_p": 0.95,
-        "top_k": 40,
-        "repeat_penalty": 1.1,
-        "repeat_last_n": 256
+        "cache_prompt": cache_prompt,
+        "slot_id": slot_id,
+        "id_slot": slot_id,
+        "temperature": s.temperature,
+        "top_p": s.top_p,
+        "top_k": s.top_k,
+        "repeat_penalty": s.repeat_penalty,
+        "repeat_last_n": s.repeat_last_n
     });
 
     let start = Instant::now();
@@ -952,22 +1173,26 @@ pub async fn try_ollama_stream(
     let available_tags = fetch_ollama_models(endpoint).await;
     let resolved = resolve_model_tag(model_name, &available_tags);
     let ollama_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
+    let (slot_id, cache_prompt) = slots::SlotManager::slot_params(slots::SlotPurpose::Interactive);
+    let s = sampling();
+    let ctx_size = engine_ctx_size();
+
     let payload = serde_json::json!({
         "model": resolved,
         "prompt": prompt,
         "system": system_prompt,
         "stream": true,
-        "cache_prompt": true,
+        "cache_prompt": cache_prompt,
         "keep_alive": -1,
-        "slot_id": 0,
-        "id_slot": 0,
+        "slot_id": slot_id,
+        "id_slot": slot_id,
         "options": {
-            "num_ctx": 4096,
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "top_k": 40,
-            "repeat_penalty": 1.1,
-            "repeat_last_n": 256
+            "num_ctx": ctx_size,
+            "temperature": s.temperature,
+            "top_p": s.top_p,
+            "top_k": s.top_k,
+            "repeat_penalty": s.repeat_penalty,
+            "repeat_last_n": s.repeat_last_n
         }
     });
 
@@ -981,34 +1206,44 @@ pub async fn try_ollama_stream(
         .context("Failed to connect to Ollama endpoint")?;
 
     if !resp.status().is_success() {
-        if resp.status() == reqwest::StatusCode::NOT_FOUND && resolved != model_name {
-            let retry_payload = serde_json::json!({
-                "model": model_name,
-                "prompt": prompt,
-                "system": system_prompt,
-                "stream": true,
-                "cache_prompt": true,
-                "slot_id": 0,
-                "id_slot": 0,
-                "options": {
-                    "num_ctx": 4096,
-                    "temperature": 0.2,
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "repeat_penalty": 1.1,
-                    "repeat_last_n": 256
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            if resolved != model_name {
+                let retry_payload = serde_json::json!({
+                    "model": model_name,
+                    "prompt": prompt,
+                    "system": system_prompt,
+                    "stream": true,
+                    "cache_prompt": cache_prompt,
+                    "slot_id": slot_id,
+                    "id_slot": slot_id,
+                    "options": {
+                        "num_ctx": ctx_size,
+                        "temperature": s.temperature,
+                        "top_p": s.top_p,
+                        "top_k": s.top_k,
+                        "repeat_penalty": s.repeat_penalty,
+                        "repeat_last_n": s.repeat_last_n
+                    }
+                });
+                if let Ok(retry_resp) = client
+                    .post(&ollama_url)
+                    .header("Accept", "application/x-ndjson, text/event-stream, application/json")
+                    .json(&retry_payload)
+                    .send()
+                    .await
+                {
+                    if retry_resp.status().is_success() {
+                        return parse_http_stream(retry_resp, model_name, start, on_token).await;
+                    }
                 }
-            });
-            if let Ok(retry_resp) = client
-                .post(&ollama_url)
-                .header("Accept", "application/x-ndjson, text/event-stream, application/json")
-                .json(&retry_payload)
-                .send()
-                .await
-            {
-                if retry_resp.status().is_success() {
-                    return parse_http_stream(retry_resp, model_name, start, on_token).await;
-                }
+            }
+            if let Some(local_path) = find_model_file_path(model_name) {
+                anyhow::bail!(
+                    "Ollama model '{}' not found (HTTP 404). To register this local GGUF, run:\nollama create {} -f Modelfile (with 'FROM {}')",
+                    model_name,
+                    model_name,
+                    local_path.display()
+                );
             }
         }
         anyhow::bail!("Ollama returned HTTP error: {}", resp.status());
@@ -1093,6 +1328,9 @@ pub async fn query_tier1_stream(
             }
             Err(e) => {
                 let err_msg = e.to_string();
+                if is_context_overflow(&err_msg) {
+                    anyhow::bail!("Context overflow detected in {}: {}", provider.name(), err_msg);
+                }
                 if let Ok(mut chain) = shared_fallback_chain().lock() {
                     chain.record_failure(provider, &err_msg);
                 }
@@ -1126,7 +1364,7 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
 
     // 1. Check if Ollama is running and pin with keep_alive: -1
     let tags_url = format!("{}/api/tags", endpoint_clean);
-    if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_millis(500)).send().await {
+    if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_secs(3)).send().await {
         if resp.status().is_success() {
             let available_tags = fetch_ollama_models(endpoint).await;
             let resolved = resolve_model_tag(model_name, &available_tags);

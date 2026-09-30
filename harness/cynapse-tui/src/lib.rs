@@ -19,15 +19,105 @@ pub mod theme;
 use memory_render::{render_dendrite_visualizer, render_memory_pipeline, truncate_smart, PipelineState, StepStatus};
 use app::TuiApp;
 
+/// Fallback inference backend candidates probed in order when the configured
+/// `tier1_endpoint` port is dead (sync with cynapse_core::doctor::LOCAL_BACKEND_PORTS):
+/// 11434 = stock Ollama, 11435 = alternate Ollama, 38265 = llama-server daemon.
+pub const FALLBACK_BACKEND_PORTS: [u16; 3] = [11434, 11435, 38265];
+
+/// Split an endpoint URL into (host, explicit port). `None` when no port is present.
+fn endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
+    let rest = endpoint.split_once("://").map(|(_, r)| r).unwrap_or(endpoint);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host_port = authority.rsplit_once('@').map(|(_, hp)| hp).unwrap_or(authority);
+    let (host, port) = host_port.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    Some((host, port))
+}
+
+fn is_loopback(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host == "127.0.0.1" || host.starts_with("127.")
+}
+
+/// Pick a working tier1 endpoint: keep `configured` while its port answers
+/// HTTP; otherwise fall back through `candidates` (first live wins); if every
+/// candidate is dead keep `configured` so `cynapse doctor` fails loud.
+fn select_endpoint_with_candidates(configured: &str, candidates: &[u16]) -> String {
+    let (host, port) = match endpoint_host_port(configured) {
+        Some(hp) => hp,
+        None => return configured.to_string(),
+    };
+    // Only loopback endpoints can be meaningfully probed from this process.
+    if !is_loopback(host) {
+        return configured.to_string();
+    }
+    if cynapse_core::doctor::probe_port("127.0.0.1", port) {
+        return configured.to_string();
+    }
+    for &candidate in candidates {
+        if candidate == port {
+            continue;
+        }
+        if cynapse_core::doctor::probe_port("127.0.0.1", candidate) {
+            return format!("http://127.0.0.1:{}", candidate);
+        }
+    }
+    configured.to_string()
+}
+
+/// Public endpoint resolution used by `TuiSession::new`.
+pub fn select_live_endpoint(configured: &str) -> String {
+    select_endpoint_with_candidates(configured, &FALLBACK_BACKEND_PORTS)
+}
+
+/// Install panic hook logging to ~/.cynapse/logs/crash.log
+pub fn install_panic_hook() {
+    static HOOK_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    HOOK_INSTALLED.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let log_dir = if let Some(home) = dirs::home_dir() {
+                home.join(".cynapse").join("logs")
+            } else {
+                PathBuf::from("./logs")
+            };
+            let _ = std::fs::create_dir_all(&log_dir);
+            let crash_log = log_dir.join("crash.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&crash_log) {
+                let _ = writeln!(f, "=== CYNAPSE CRASH REPORT ===");
+                let _ = writeln!(f, "Timestamp: {:?}", std::time::SystemTime::now());
+                let _ = writeln!(f, "Panic info: {}", info);
+                let _ = writeln!(f, "Backtrace:\n{:?}", std::backtrace::Backtrace::capture());
+            }
+            prev(info);
+        }));
+    });
+}
+
 #[derive(Debug, Deserialize)]
 struct RuntimeConfig {
     engine: Option<EngineConfig>,
+    sampling: Option<SamplingConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SamplingConfig {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    repeat_last_n: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EngineConfig {
     tier1_endpoint: Option<String>,
     default_model: Option<String>,
+    ctx_size: Option<usize>,
+    model_search_paths: Option<Vec<String>>,
 }
 
 pub struct TuiSession {
@@ -42,6 +132,7 @@ pub struct TuiSession {
 
 impl TuiSession {
     pub fn new(models_dir: PathBuf) -> Self {
+        install_panic_hook();
         let mut active_model_name = "ministral-3:3b".to_string();
         let mut tier1_endpoint = "http://127.0.0.1:11434".to_string();
 
@@ -62,12 +153,32 @@ impl TuiSession {
                             if let Some(m) = engine.default_model {
                                 active_model_name = m;
                             }
+                            if let Some(sz) = engine.ctx_size {
+                                cynapse_engine::set_engine_ctx_size(sz);
+                            }
+                            if let Some(paths) = engine.model_search_paths {
+                                let pbufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+                                cynapse_engine::set_model_search_dirs(pbufs);
+                            }
+                        }
+                        if let Some(s) = parsed.sampling {
+                            let mut p = cynapse_engine::sampling();
+                            if let Some(t) = s.temperature { p.temperature = t; }
+                            if let Some(tp) = s.top_p { p.top_p = tp; }
+                            if let Some(tk) = s.top_k { p.top_k = tk; }
+                            if let Some(rp) = s.repeat_penalty { p.repeat_penalty = rp; }
+                            if let Some(rn) = s.repeat_last_n { p.repeat_last_n = rn; }
+                            cynapse_engine::set_sampling(p);
                         }
                     }
                     break;
                 }
             }
         }
+
+        // Verify the configured endpoint's port is alive; otherwise fall back
+        // to the first live well-known backend (11434/11435/38265).
+        let tier1_endpoint = select_live_endpoint(&tier1_endpoint);
 
         let active_model_path = models_dir.join("model.gguf");
 
@@ -560,5 +671,78 @@ impl TuiSession {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Spawn a minimal HTTP responder on an ephemeral port; returns its port
+    /// and a stop flag so the server thread can be joined.
+    fn spawn_http_probe_listener() -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, stop, server)
+    }
+
+    fn closed_ephemeral_port() -> u16 {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        drop(held);
+        port
+    }
+
+    #[test]
+    fn test_endpoint_selection_probe_prefers_live_listener() {
+        let dead_port = closed_ephemeral_port();
+        let (live_port, stop, server) = spawn_http_probe_listener();
+
+        // Configured port dead -> fall back to the live candidate.
+        let configured = format!("http://127.0.0.1:{}", dead_port);
+        let picked = select_endpoint_with_candidates(&configured, &[live_port]);
+        assert_eq!(picked, format!("http://127.0.0.1:{}", live_port));
+
+        // Configured port alive -> kept verbatim even if candidates are dead.
+        let kept = select_endpoint_with_candidates(&format!("http://127.0.0.1:{}", live_port), &[dead_port]);
+        assert_eq!(kept, format!("http://127.0.0.1:{}", live_port));
+
+        // Everything dead -> configured value preserved (doctor fails loud).
+        let unchanged = select_endpoint_with_candidates(&configured, &[closed_ephemeral_port()]);
+        assert_eq!(unchanged, configured);
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_endpoint_host_port_parsing() {
+        assert_eq!(endpoint_host_port("http://127.0.0.1:11434"), Some(("127.0.0.1", 11434)));
+        assert_eq!(endpoint_host_port("http://127.0.0.1:38265/v1"), Some(("127.0.0.1", 38265)));
+        assert_eq!(endpoint_host_port("http://ollama.local:11435"), Some(("ollama.local", 11435)));
+        assert_eq!(endpoint_host_port("http://ollama.local"), None);
     }
 }

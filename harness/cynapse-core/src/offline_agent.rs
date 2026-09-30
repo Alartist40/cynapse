@@ -578,10 +578,10 @@ impl LoopGuard {
                     Ok(())
                 }
             }
-            LoopVerdict::Warn => Err(format!(
-                "LOOP GUARD INTERVENTION: Tool '{}' called {} times with identical parameters. Try a different strategy.",
-                tool.name, res.count + 1
-            )),
+            LoopVerdict::Warn => {
+                // Advisory notice: do not veto execution (only Critical vetoes)
+                Ok(())
+            }
             LoopVerdict::Ok => Ok(()),
         }
     }
@@ -668,11 +668,14 @@ mod tests {
             arguments: serde_json::json!({"path": "foo.rs"}),
         };
 
-        assert!(guard.record_and_check(&call).is_ok());
-        assert!(guard.record_and_check(&call).is_ok());
-        let res = guard.record_and_check(&call);
+        for _ in 0..2 {
+            assert!(guard.check(&call).is_ok());
+            guard.record_call(&call);
+            guard.record_outcome(&call, "content");
+        }
+        let res = guard.check(&call);
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("LOOP GUARD INTERVENTION"));
+        assert!(res.unwrap_err().contains("LOOP GUARD CRITICAL"));
     }
 
     #[test]
@@ -824,5 +827,21 @@ mod tests {
         assert!(conv_prefix.contains("You are Cynapse"));
         assert!(!conv_prefix.contains("Available Tools:"));
         assert!(!conv_prefix.contains("read_file"));
+    }
+
+    #[test]
+    fn test_loop_guard_warn_is_advisory() {
+        let mut guard = LoopGuard::default();
+        let tool = ToolCall {
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "main.rs"}),
+        };
+
+        // Repeated invocations trigger Warn verdict, which is advisory (Ok(()))
+        for _ in 0..4 {
+            assert!(guard.check(&tool).is_ok());
+            guard.record_call(&tool);
+            guard.record_outcome(&tool, "fn main() {}");
+        }
     }
 }

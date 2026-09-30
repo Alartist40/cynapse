@@ -98,6 +98,50 @@ else
     . "${HOME}/.cargo/env"
 fi
 
+# 4b. Inference Backend Check (Tier 1 endpoint needs a live local backend)
+echo ""
+echo "🤖 Inference Backend Check:"
+
+HAVE_BACKEND=""
+if command -v ollama >/dev/null 2>&1; then
+    HAVE_BACKEND="ollama"
+    echo "   [✓] Ollama found: $(command -v ollama)"
+elif command -v llama-server >/dev/null 2>&1; then
+    HAVE_BACKEND="llama-server"
+    echo "   [✓] llama-server found: $(command -v llama-server)"
+fi
+
+if [ -z "${HAVE_BACKEND}" ]; then
+    echo "   [!] No inference backend detected on PATH."
+    if [ -t 0 ]; then
+        printf "Install Ollama now? [y/N] "
+        read -r BACKEND_REPLY || BACKEND_REPLY=""
+        case "${BACKEND_REPLY}" in
+            y|Y|yes|YES)
+                if command -v curl >/dev/null 2>&1; then
+                    if curl -fsSL https://ollama.com/install.sh | sh; then
+                        echo "   [✓] Ollama installation finished."
+                    else
+                        echo "   [!] Ollama installation failed. Install manually: https://ollama.com/download"
+                    fi
+                else
+                    echo "   [!] curl not found; cannot install Ollama automatically."
+                    echo "       Install manually: https://ollama.com/download"
+                fi
+                ;;
+            *)
+                echo "   [!] Skipping Ollama installation (user declined)."
+                echo "       Install Ollama from https://ollama.com/download"
+                echo "       or build llama-server (llama.cpp) and ensure it is on PATH."
+                ;;
+        esac
+    else
+        echo "   [!] Non-interactive install (stdin is not a TTY) - skipping backend install."
+        echo "       Install Ollama from https://ollama.com/download"
+        echo "       or build llama-server (llama.cpp) and ensure it is on PATH."
+    fi
+fi
+
 # 5. Build Standalone Pure Rust Cynapse Release Binary
 echo ""
 echo "⚙️ Building Standalone Pure Rust Cynapse Binary (cargo build --release)..."

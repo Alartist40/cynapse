@@ -20,6 +20,83 @@ use crate::gguf_provider::{self, GGUFWeightProvider};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Maximum number of sequence positions the streaming caches may hold.
+///
+/// `kv_cache` appends one K/V row per token, so without a cap a long
+/// generation grows until OOM. Overflow is REFUSED (fail-loud), never
+/// evicted: attention requires every prior K/V, so dropping entries would
+/// silently corrupt the output. `deltanet_cache` holds one fixed-size state
+/// matrix and one fixed-size conv buffer per layer (bounded by layer count);
+/// it is gated by the same [`check_seq_len`] at sequence entry points.
+pub const MAX_SEQ_CACHE: usize = 4096;
+
+/// Whether this file's forward math implements `arch`.
+///
+/// The allow-list is deliberately a single variant, because the forward pass
+/// hard-codes the ornith hybrid's conventions:
+///   * `attention_forward` reads `self_attn.q_proj.weight` as `[2h, h]`
+///     (first h = Q, second h = output gate, applied as
+///     `attn_out *= sigmoid(gate)`) — the gated-attention layout the
+///     ornith/qwen35moe converter emits for `blk.N.attn_q.weight`;
+///   * RoPE is GLM-style split-pair with `rotary_dim = head_dim * 0.25` and
+///     `rope_theta = 10000000` hard-coded (config's `rope_theta` is ignored);
+///   * linear-attention layers require the `blk.N.ssm_*` DeltaNet tensors
+///     (`gguf_provider::LINEAR_ATTN_MAP`).
+/// `Qwen36` is the `ModelArchitecture::detect` arm for
+/// `general.architecture ∈ {"ornith", "qwen35moe", "qwen36"}` — the only
+/// family this math was written for (the project's own ornith GGUF reports
+/// `qwen35moe`, see `src/bin/inspect_ornith.rs`). Anything else
+/// (Llama/Qwen2/Gemma/Qwen35/GlmDsa/…) either trips
+/// `Tensor::from_vec`'s shape panic on the `[2h, h]` q_proj split or runs
+/// with the wrong RoPE/gate conventions and emits gibberish — so it is
+/// refused before any weight is read.
+pub fn streaming_arch_supported(arch: crate::model::arch::ModelArchitecture) -> bool {
+    matches!(arch, crate::model::arch::ModelArchitecture::Qwen36)
+}
+
+/// The exact refusal message for an unsupported `general.architecture`.
+pub fn arch_refusal_msg(arch: &str) -> String {
+    format!("native engine does not support architecture '{arch}' — use Tier 1 (llama-server/Ollama) instead")
+}
+
+/// Fail-loud sequence-length guard for the streaming caches.
+///
+/// `len` is the number of positions the cache would hold after this step.
+/// Returns `Err` past [`MAX_SEQ_CACHE`] instead of evicting.
+pub fn check_seq_len(len: usize) -> Result<(), String> {
+    if len > MAX_SEQ_CACHE {
+        return Err(format!(
+            "native engine context limit reached ({MAX_SEQ_CACHE} tokens) — shorten the prompt or use Tier 1"
+        ));
+    }
+    Ok(())
+}
+
+/// Append one token's K/V row to a layer's KV cache, refusing (fail-loud)
+/// once that layer already holds [`MAX_SEQ_CACHE`] positions. Returns the
+/// new sequence length. On `Err` nothing is appended and nothing is evicted.
+fn kv_cache_append(
+    cache: &mut HashMap<usize, (Vec<f32>, Vec<f32>)>,
+    layer_idx: usize,
+    k: &[f32],
+    v: &[f32],
+) -> Result<usize, String> {
+    if k.len() != v.len() {
+        return Err(format!("kv cache row length mismatch (k={} v={})", k.len(), v.len()));
+    }
+    let kv_dim = k.len();
+    if kv_dim == 0 {
+        return Err("kv cache row is empty".to_string());
+    }
+    let existing = cache.get(&layer_idx).map(|e| e.0.len()).unwrap_or(0);
+    let new_seq = existing / kv_dim + 1;
+    check_seq_len(new_seq)?;
+    let entry = cache.entry(layer_idx).or_insert_with(|| (Vec::new(), Vec::new()));
+    entry.0.extend_from_slice(k);
+    entry.1.extend_from_slice(v);
+    Ok(new_seq)
+}
+
 pub struct StreamingOrnith {
     pub cfg: OrnithConfig,
     pub weights: Box<dyn WeightProvider>,
@@ -45,10 +122,20 @@ impl StreamingOrnith {
     ///
     /// `gguf_path` — path to the .gguf file.
     /// `tokenizer_path` — path to tokenizer.json (can be in the same directory).
+    ///
+    /// Refuses (before any weight is read) architectures whose forward math
+    /// this file does not implement — see [`streaming_arch_supported`].
     pub fn open_gguf(gguf_path: &str, tokenizer_path: &str) -> Result<Self, String> {
         use crate::model::gguf::GGUFile;
         let gguf = GGUFile::open(gguf_path)
             .map_err(|e| format!("open GGUF: {e}"))?;
+        // Architecture refusal first: never proceed to math on an arch this
+        // forward pass does not implement (GLM split-pair RoPE + 0.25 head_dim
+        // rotary + Q/gate q_proj split are ornith-hybrid specific).
+        let arch = crate::model::arch::ModelArchitecture::detect(&gguf);
+        if !streaming_arch_supported(arch) {
+            return Err(arch_refusal_msg(arch.name()));
+        }
         let cfg = gguf_provider::extract_ornith_config(&gguf)?;
         let provider = GGUFWeightProvider::from_gguf(gguf)
             .map_err(|e| format!("GGUF provider: {e}"))?;
@@ -69,6 +156,8 @@ impl StreamingOrnith {
         let rms_eps = self.cfg.rms_norm_eps;
         let vocab_size = self.cfg.vocab_size;
         let seq_len = tokens.len();
+        // Sequence cap: refuse before any weight I/O (fail-loud, no eviction).
+        check_seq_len(seq_len)?;
 
         // 1. Embeddings for all tokens
         let embed_name = "model.language_model.embed_tokens.weight";
@@ -109,13 +198,6 @@ impl StreamingOrnith {
                 hidden_states[pos] = new_hidden;
             }
 
-            // Debug: dump last token's hidden at every layer
-            {
-                let last = seq_len - 1;
-                let ma = hidden_states[last].iter().map(|v| v.abs()).sum::<f32>() / h as f32;
-                eprintln!("[rust] L{} tok{} mean_abs={:.6} first4={:.4?}",
-                    layer_idx, last, ma, &hidden_states[last][..4]);
-            }
         }
 
         // 3. Final norm on last token
@@ -147,6 +229,8 @@ impl StreamingOrnith {
     ) -> Result<Vec<f32>, String> {
         // forward_sequence resets caches, so we can't use it for multi-token
         // unless we handle caching properly. For now, forward_one_token stays.
+        // Sequence cap: refuse before any weight I/O (fail-loud, no eviction).
+        check_seq_len(pos + 1)?;
         let h = self.cfg.hidden_size;
         let num_layers = self.cfg.num_hidden_layers;
         let layer_types: Vec<String> = self.cfg.layer_types.clone();
@@ -269,10 +353,6 @@ impl StreamingOrnith {
         // 1. Input norm
         let norm_w = w.get("input_layernorm.weight").ok_or("missing input_layernorm")?;
         let normed = rms_norm(hidden, norm_w, rms_eps);
-        if layer_idx < 2 {
-            let mn = normed.iter().map(|v| v.abs()).sum::<f32>() / h as f32;
-            eprintln!("[dbg] layer {} normed mean_abs={:.6} first4={:.4?}", layer_idx, mn, &normed[..4]);
-        }
         // 2. QKV projection: [1, h] @ [conv_dim, h]^T = [1, conv_dim]
         let qkv_w = w.get("linear_attn.in_proj_qkv.weight").ok_or("missing in_proj_qkv")?;
         let qkv_t = Tensor::from_vec(qkv_w.clone(), vec![conv_dim, h]);
@@ -310,29 +390,13 @@ impl StreamingOrnith {
             }
             conv_out[c] = sum;
         }
-        if layer_idx < 2 {
-            let pre_silu_ma = conv_out.iter().map(|v| v.abs()).sum::<f32>() / conv_out.len() as f32;
-            eprintln!("[dbg] layer {} conv pre-silu mean_abs={:.6} first4={:.4?}", layer_idx, pre_silu_ma, &conv_out[..4]);
-        }
         // SiLU after conv
         for v in conv_out.iter_mut() {
             *v = *v / (1.0 + (-*v).exp());
         }
-        // 4. Debug: check QKV section magnitudes
         let q_total = n_qk * d_k;   // 2048
         let k_total = n_qk * d_k;   // 2048
         let v_total = n_v * d_v;    // 4096
-        if layer_idx < 2 {
-            let qkv_ma = conv_out.iter().map(|v| v.abs()).sum::<f32>() / conv_out.len() as f32;
-            eprintln!("[dbg] layer {} conv+silu mean_abs={:.6}", layer_idx, qkv_ma);
-            let sect0 = &conv_out[..q_total];
-            let sect1 = &conv_out[q_total..q_total + k_total];
-            let sect2 = &conv_out[q_total + k_total..];
-            let m0 = sect0.iter().map(|v| v.abs()).sum::<f32>() / q_total as f32;
-            let m1 = sect1.iter().map(|v| v.abs()).sum::<f32>() / k_total as f32;
-            let m2 = sect2.iter().map(|v| v.abs()).sum::<f32>() / v_total as f32;
-            eprintln!("[dbg] layer {} QKV mean_abs: Q={:.6} K={:.6} V={:.6}", layer_idx, m0, m1, m2);
-        }
         // Split into Q, K, V — try Q|K|V order first
         let q_data = &conv_out[..q_total];
         let k_data = &conv_out[q_total..q_total + k_total];
@@ -356,11 +420,6 @@ impl StreamingOrnith {
         // Scale Q by 1/sqrt(d_k)
         let scale = 1.0f32 / (d_k as f32).sqrt();
         for v in q.iter_mut() { *v *= scale; }
-        if layer_idx < 2 {
-            let q_ma = q.iter().map(|v| v.abs()).sum::<f32>() / q.len() as f32;
-            let k_ma = k.iter().map(|v| v.abs()).sum::<f32>() / k.len() as f32;
-            eprintln!("[dbg] layer {} Q after norm+scale mean_abs={:.6} K after norm mean_abs={:.6}", layer_idx, q_ma, k_ma);
-        }
 
         // 6. Compute decay rates: decay = exp(softplus(alpha + dt_bias) * A)
         //    where alpha = hidden @ in_proj_a.weight, A = -exp(A_log)
@@ -380,24 +439,11 @@ impl StreamingOrnith {
             let dt = softplus(alpha_val + dt_val);
             decay[head] = (dt * a).exp();
         }
-        // Debug: check if any softplus overflows
-        if layer_idx < 2 {
-            let max_alpha = alpha.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let min_alpha = alpha.data.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_dt = (0..n_v).map(|h| softplus(alpha.data[h] + dt_bias.get(h).copied().unwrap_or(0.0))).fold(f32::NEG_INFINITY, f32::max);
-            eprintln!("[dbg] layer {} alpha range=[{:.2}, {:.2}] max_dt={:.2}", layer_idx, min_alpha, max_alpha, max_dt);
-        }
-
         // 7. Compute beta gates: beta = sigmoid(hidden @ in_proj_b.weight)
         let b_w = w.get("linear_attn.in_proj_b.weight").ok_or("missing in_proj_b")?;
         let b_t = Tensor::from_vec(b_w.clone(), vec![n_v, h]);
         let beta_logits = hidden_t.matmul(&b_t.transpose()); // [1, n_v]
         let beta: Vec<f32> = beta_logits.data.iter().map(|&v| sigmoid(v)).collect();
-        if layer_idx < 2 {
-            let d_ma = decay.iter().sum::<f32>() / decay.len() as f32;
-            let b_ma = beta.iter().sum::<f32>() / beta.len() as f32;
-            eprintln!("[dbg] layer {} decay mean={:.6} beta mean={:.6}", layer_idx, d_ma, b_ma);
-        }
 
         // 8. Delta rule state update + output
         let mut output = vec![0.0f32; v_total];
@@ -459,12 +505,6 @@ impl StreamingOrnith {
             }
         }
 
-        if layer_idx < 2 {
-            let delta_ma = output.iter().map(|v| v.abs()).sum::<f32>() / output.len() as f32;
-            eprintln!("[dbg] layer {} delta output mean_abs={:.8} first4={:.6?}",
-                layer_idx, delta_ma, &output[..4]);
-        }
-
         // 9. Per-head RMSNorm using linear_attn.norm.weight
         let norm_weight = w.get("linear_attn.norm.weight").ok_or("missing norm.weight")?;
         for head in 0..n_v {
@@ -476,26 +516,14 @@ impl StreamingOrnith {
                 output[base + d] = (output[base + d] / rms) * norm_weight.get(d).copied().unwrap_or(1.0);
             }
         }
-        if layer_idx < 2 {
-            let nm_ma = output.iter().map(|v| v.abs()).sum::<f32>() / output.len() as f32;
-            eprintln!("[dbg] layer {} after rmsnorm mean_abs={:.8} first4={:.6?}",
-                layer_idx, nm_ma, &output[..4]);
-        }
-
         // 10. Z-gate: z = hidden @ in_proj_z.weight, then output *= silu(z)
         let z_w = w.get("linear_attn.in_proj_z.weight").ok_or("missing in_proj_z")?;
         let z_t = Tensor::from_vec(z_w.clone(), vec![v_total, h]);
         let z = hidden_t.matmul(&z_t.transpose()); // [1, v_total]
-        let z_mean = z.data.iter().map(|v| v.abs()).sum::<f32>() / z.data.len() as f32;
         for i in 0..output.len() {
             let z_val = z.data[i];
             let silu_z = z_val * (1.0 / (1.0 + (-z_val).exp()));
             output[i] *= silu_z;
-        }
-        if layer_idx < 2 {
-            let z_out_ma = output.iter().map(|v| v.abs()).sum::<f32>() / output.len() as f32;
-            eprintln!("[dbg] layer {} z mean_abs={:.6} after-z-gate mean_abs={:.6}",
-                layer_idx, z_mean, z_out_ma);
         }
 
         // 11. Output projection: [1, v_total] @ [h, v_total]^T = [1, h]
@@ -503,12 +531,6 @@ impl StreamingOrnith {
         let o_t = Tensor::from_vec(o_w.clone(), vec![h, v_total]);
         let out_t = Tensor::from_vec(output, vec![1, v_total]);
         let result = out_t.matmul(&o_t.transpose());
-
-        if layer_idx < 2 {
-            let mean_abs = result.data.iter().map(|v| v.abs()).sum::<f32>() / h as f32;
-            eprintln!("[stream] layer {} (deltanet) OUT mean_abs={:.4} first 4 = {:?}",
-                layer_idx, mean_abs, &result.data[..4]);
-        }
         Ok(result.data)
     }
 
@@ -599,13 +621,13 @@ impl StreamingOrnith {
             }
         }
 
-        // Append current token's K, V to cache
-        let kv_entry = self.kv_cache.entry(layer_idx).or_insert((Vec::new(), Vec::new()));
-        kv_entry.0.extend_from_slice(&k);
-        kv_entry.1.extend_from_slice(&v);
+        // Append current token's K, V to cache — capped at MAX_SEQ_CACHE.
+        // Overflow returns Err (fail-loud) instead of evicting: attention
+        // requires every prior K/V, so dropping entries would corrupt output.
+        let seq_len = kv_cache_append(&mut self.kv_cache, layer_idx, &k, &v)?;
+        let kv_entry = self.kv_cache.get(&layer_idx).ok_or("kv cache entry missing after append")?;
         let cached_k = &kv_entry.0;
         let cached_v = &kv_entry.1;
-        let seq_len = cached_k.len() / (n_kv * head_dim);
 
         // Attention over all cached tokens
         let mut attn_out = vec![0.0f32; h];
@@ -653,9 +675,6 @@ impl StreamingOrnith {
         // Output projection
         let out_t = Tensor::from_vec(attn_out, vec![1, h]);
         let result = out_t.matmul(&Tensor::from_vec(o_w.clone(), vec![h, h]).transpose());
-        if layer_idx == 31 {
-            eprintln!("[stream] layer {layer_idx} (full_attn) done, o first 4 = {:?}", &result.data[..4]);
-        }
         Ok(result.data)
     }
 
@@ -703,8 +722,18 @@ impl StreamingOrnith {
     }
 
     /// Generate text: single-token autoregressive loop.
-    /// Note: no KV cache yet — each token re-processes all 32 layers.
+    ///
+    /// KV cache note: `kv_cache` DOES exist (one K/V row set per
+    /// full-attention layer, appended once per token in `attention_forward`)
+    /// and is now capped at `MAX_SEQ_CACHE` — overflowing it returns Err
+    /// (fail-loud, never eviction: attention needs every prior K/V).
+    /// `deltanet_cache` holds one fixed-size state matrix + conv buffer per
+    /// layer, gated by the same `check_seq_len` cap.
+    ///
     /// Generate text from a raw prompt (no chat wrapping).
+    /// Sampling uses the process-wide config from `inference::sampler`
+    /// (`set_default_sampling` temperature/top_p, `set_default_top_k` /
+    /// env `LEAFCUTTER_TOP_K` for top-k); temperature 0.0 stays greedy argmax.
     /// `stop_tokens` — generation stops when any of these token IDs is produced.
     pub fn generate_with_stop(
         &mut self,
@@ -713,12 +742,15 @@ impl StreamingOrnith {
         stop_tokens: &[i32],
     ) -> Result<String, String> {
         let mut ids = self.tok.encode(prompt, 1024);
-        eprintln!("[generate] prompt tokens: {}", ids.len());
+        // Process-wide sampling config (temperature 0.0 → greedy argmax inside
+        // sample_top_p_top_k; top_k resolution: env LEAFCUTTER_TOP_K wins).
+        let (temperature, top_p) = crate::inference::sampler::default_sampling();
+        let top_k = crate::inference::sampler::resolve_top_k();
         for _ in 0..max_tokens {
             let last = *ids.last().unwrap() as i32;
             let pos = ids.len() - 1;
             let logits = self.forward_one_token(last, pos)?;
-            let next = Self::argmax(&logits) as i32;
+            let next = crate::inference::sampler::sample_top_p_top_k(&logits, temperature, top_p, top_k) as i32;
             if stop_tokens.contains(&next) {
                 break;
             }
@@ -770,4 +802,109 @@ fn softplus(x: f32) -> f32 {
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0f32 / (1.0f32 + (-x).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::arch::ModelArchitecture;
+
+    #[test]
+    fn test_streaming_arch_supported_ornith_hybrid() {
+        // The forward math implements exactly the ornith hybrid
+        // (general.architecture: "ornith" | "qwen35moe" | "qwen36").
+        assert!(streaming_arch_supported(ModelArchitecture::Qwen36));
+    }
+
+    #[test]
+    fn test_streaming_arch_unsupported_foreign_archs() {
+        // Q/gate q_proj split + GLM split-pair RoPE (0.25 head_dim) do not
+        // fit these — they must be refused, not silently gibberish.
+        assert!(!streaming_arch_supported(ModelArchitecture::Llama));
+        assert!(!streaming_arch_supported(ModelArchitecture::Qwen2));
+        assert!(!streaming_arch_supported(ModelArchitecture::Gemma));
+        assert!(!streaming_arch_supported(ModelArchitecture::Qwen35));
+        assert!(!streaming_arch_supported(ModelArchitecture::GlmDsa));
+        assert!(!streaming_arch_supported(ModelArchitecture::Unknown));
+    }
+
+    #[test]
+    fn test_arch_refusal_msg_format() {
+        let msg = arch_refusal_msg("Llama");
+        assert_eq!(
+            msg,
+            "native engine does not support architecture 'Llama' — use Tier 1 (llama-server/Ollama) instead"
+        );
+        assert!(msg.starts_with("native engine does not support architecture '"));
+        assert!(msg.ends_with("' — use Tier 1 (llama-server/Ollama) instead"));
+    }
+
+    #[test]
+    fn test_open_gguf_refuses_unsupported_arch_before_any_load() {
+        use std::io::Write;
+        // Minimal GGUF: magic, version, 0 tensors, one metadata kv
+        // (general.architecture = "llama").
+        let path = std::env::temp_dir().join("streaming_ornith_arch_refusal.gguf");
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&0x46554747u32.to_le_bytes()); // "GGUF"
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+        buf.extend_from_slice(&1u64.to_le_bytes()); // metadata count
+        let key = b"general.architecture";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&8u32.to_le_bytes()); // GGUFValue::String
+        let val = b"llama";
+        buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        buf.extend_from_slice(val);
+        let mut f = std::fs::File::create(&path).expect("create temp gguf");
+        f.write_all(&buf).expect("write temp gguf");
+        drop(f);
+
+        // The tokenizer path deliberately does not exist: the ONLY way to get
+        // this exact error is if the arch refusal fired before any config,
+        // provider, tokenizer or weight work.
+        let err = match StreamingOrnith::open_gguf(
+            path.to_str().unwrap(),
+            "/nonexistent/tokenizer.json",
+        ) {
+            Ok(_) => panic!("unsupported arch must be refused before load succeeds"),
+            Err(e) => e,
+        };
+        assert_eq!(err, arch_refusal_msg("Llama"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_check_seq_len_at_cap_ok_past_cap_errors() {
+        assert!(check_seq_len(0).is_ok());
+        assert!(check_seq_len(MAX_SEQ_CACHE).is_ok());
+        let err = check_seq_len(MAX_SEQ_CACHE + 1).unwrap_err();
+        assert_eq!(
+            err,
+            "native engine context limit reached (4096 tokens) — shorten the prompt or use Tier 1"
+        );
+    }
+
+    #[test]
+    fn test_kv_cache_append_refuses_growth_past_cap() {
+        let mut cache: HashMap<usize, (Vec<f32>, Vec<f32>)> = HashMap::new();
+        let k = [0.5f32; 4];
+        let v = [0.25f32; 4];
+
+        for i in 0..MAX_SEQ_CACHE {
+            let seq = kv_cache_append(&mut cache, 0, &k, &v).expect("within cap must append");
+            assert_eq!(seq, i + 1);
+        }
+
+        let rows_before = cache.get(&0).map(|e| e.0.len()).unwrap_or(0);
+        let err = kv_cache_append(&mut cache, 0, &k, &v).unwrap_err();
+        assert!(err.contains("context limit reached"), "unexpected error: {err}");
+        // Fail-loud: the refused insert must not have grown the cache
+        // (and no earlier row was evicted).
+        let rows_after = cache.get(&0).map(|e| e.0.len()).unwrap_or(0);
+        assert_eq!(rows_after, rows_before);
+        assert_eq!(rows_before, MAX_SEQ_CACHE * k.len());
+        assert_eq!(cache.get(&0).unwrap().1.len(), MAX_SEQ_CACHE * v.len());
+    }
 }

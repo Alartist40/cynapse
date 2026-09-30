@@ -27,6 +27,8 @@ After installation, run the self-healing diagnostic to verify hardware, SIMD acc
 cynapse doctor --fix
 ```
 
+`cynapse doctor` exits 1 when no inference backend answers (Ollama on 11434/11435 or the llama-server daemon on 38265) and prints the exact remediation; the TUI probes those ports at startup and uses the first live one.
+
 ---
 
 ## Launch Modes
@@ -100,7 +102,7 @@ cynapse-mini/
 ├── engine/
 │   ├── cynapse-engine/         # Semantic hardware router, Tier-1 LLM client, provider fallback
 │   └── leafcutter_core/        # Pure Rust GGUF & Safetensors tensor kernels
-└── install.sh                  # Dual remote/local automated installer & setup script
+└── install.sh                  # Dual remote/local automated installer — also offers to install an Ollama/llama-server inference backend
 ```
 
 ---
@@ -125,7 +127,7 @@ Six architecture phases inspired by the Atomic-Agent reference implementation:
 ### Agent Loop Hardening (Stages 13-17)
 Five hardening stages layered on the Atomic-Agent elevation:
 - **Verified Read Receipts**: Re-reading an unchanged file within the 6-message context window returns `[File unchanged since read #N]` instead of re-sending content — verified against a content hash *and* the anchor's presence in actual model context.
-- **Forced Finalization**: On step exhaustion (`MAX_AGENT_STEPS = 5`), one final no-tools turn demands an honest status report (completed / outstanding / errors) instead of an abrupt stop; a `tools_allowed` guard hard-blocks tool execution on that reply.
+- **Forced Finalization**: On step exhaustion (`MAX_AGENT_STEPS = 14`), one final no-tools turn demands an honest status report (completed / outstanding / errors) instead of an abrupt stop; a `tools_allowed` guard hard-blocks tool execution on that reply.
 - **Memory Injection Sanitization**: Recalled memory is fenced with an `[UNTRUSTED MEMORY]` banner; code fences (``` -> `` ` ``) and channel headers (`===` -> `= = =`) inside stored nodes are neutralized so they cannot spoof prompt channels.
 - **Concurrency-Safe Batch Partitioning**: Tools carry `concurrency_safe` metadata (`read_file`/`grep` safe, `write_file`/`execute_command` exclusive); batches partition into contiguous safe runs and singletons as the seam for future parallel dispatch.
 - **Verified Reflection Admission**: Reflection distills only clean turns — tool errors, LoopGuard vetoes, step exhaustion, and stream failures set `turn_verified = false` and skip distillation.
@@ -141,7 +143,7 @@ Delegation to scoped specialist bots with fail-closed permission enforcement:
 - **NDJSON Streaming**: Polymorphic streaming parser supporting multiple API formats (Ollama, vLLM, generic).
 - **GBNF Grammar Constraints**: Enforces valid JSON tool-call schema syntax, preventing output formatting panics offline.
 - **KV-Cache Slot Affinity**: Slot 0 pinned for chat, slot 1 for reflection, with `cache_prompt: true` for warm cache reuse.
-- **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 5`) with forced finalization — one no-tools status-report turn on exhaustion prevents runaway recursive tool execution.
+- **Max Step Safeguards**: Configurable step limits (`MAX_AGENT_STEPS = 14`) with forced finalization — one no-tools status-report turn on exhaustion prevents runaway recursive tool execution.
 
 ### Async Background Reflection
 Fire-and-forget reflection worker distills conversation turns into atomic facts, procedures, and lessons without blocking the UI. Runs on a dedicated background thread after each turn completion, gated by verified-run admission: turns with tool failures, vetoes, or exhaustion are not distilled.
@@ -174,7 +176,7 @@ Fire-and-forget reflection worker distills conversation turns into atomic facts,
 | Tests passed | 281 |
 | Tests failed | 0 |
 | Build | `cargo build --release` succeeds |
-| System doctor | 100% health (13 Pass, 0 Warn, 0 Failed) |
+| System doctor | 14 checks, 100% health (14 Pass); exits non-zero if any check fails — e.g. no inference backend reachable |
 | Acceptance gates | G1-G22 all PASSED |
 
 ---

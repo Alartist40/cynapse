@@ -434,11 +434,11 @@ fn server_healthy(port: u16) -> bool {
             let _ = stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
             let mut buf = [0u8; 32];
             match stream.read(&mut buf) {
-                Ok(_) => {
-                    let head = String::from_utf8_lossy(&buf);
+                Ok(n) if n > 0 => {
+                    let head = String::from_utf8_lossy(&buf[..n]);
                     head.contains("200 OK") || head.contains("200 ok")
                 }
-                Err(_) => false,
+                _ => false,
             }
         }
         Err(_) => false,

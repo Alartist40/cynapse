@@ -2,6 +2,37 @@
 
 All notable changes to Cynapse are documented here.
 
+## [Unreleased] — Code Audit Remediation (2026-09-30)
+
+### Fixed (audit P0 #1–#5)
+- Dynamic-provider Tier-1 fallback no longer hides engine failures; distinct errors for unsupported models, context overflow, and dead backends.
+- llama-server path now uses `/v1/chat/completions` + GGUF `apply_chat_template`; zero hand-built ChatML literals in the engine.
+- Refusal/PII safety hygiene enforced on both native and llama-server streaming paths; deterministic jailbreak probe regression test.
+- Context growth: `ctx_size` config (default 8192) flows to `num_ctx`/engine; overflow fails loud instead of silently truncating.
+- KV-slot management (`slots.rs`): interactive slot wired into both payload builders, `--parallel 2` on the daemon.
+
+### Fixed (audit P1 #6–#12)
+- Engine config now honors `[sampling]` (temperature/top_p/top_k/repeat penalty) instead of hardcoded `temp 0.2`.
+- Model search paths: `model_search_paths` config + `set_model_search_dirs`, logged on every resolution attempt.
+- Backend timeouts: 2s connect / 5s request probes instead of unbounded blocking.
+- macOS VM measurement via `sysctl` fallback where `sysctl`-backed stats are the only source.
+- Persona store: `in_memory()` fallback removes an `unwrap()` panic path.
+- TUI: `crash.log` panic hook writing `~/.cynapse/logs/crash.log`, spawn-failure cooldown with escalating backoff in `get_or_spawn_daemon`.
+- TUI config → engine: `ctx_size`/`sampling`/`model_search_paths` setter wiring.
+- Doctor: 14 checks (backend reachability included), exit 1 on failure; `ollama create` remediation hint surfaced.
+- `LoopVerdict::Warn` is advisory (no veto) — doc/behavior contradiction resolved with regression test.
+
+### Added
+- Workspace test suite now 301 tests, 0 failures; `cargo clippy --workspace` clean (no new warnings).
+- Determinism scaffold: `LEAFCUTTER_DETERMINISTIC=1` activation + local-model discovery assertions (`parity_test.rs`).
+
+### Known gaps (deliberately deferred — see PLAN.md)
+- Logit-parity diff vs live llama-server: scaffold only, no live comparison ran.
+- `catch_unwind` around provider dispatch (panic hook shipped instead).
+- Reflection-specific low-temperature override (shared `[sampling]` config shipped).
+- Trim-and-retry on context overflow (fail-loud halt shipped instead).
+- P2 items (see audit §P2) remain out of scope for this pass.
+
 ## [Unreleased] — Architecture Elevation (2026-09-16)
 
 ### Added

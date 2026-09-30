@@ -136,6 +136,9 @@ async fn main() -> Result<()> {
             if report.total_fail > 0 && !fix {
                 println!("💡 Tip: Run 'cynapse doctor --fix' to execute automatic self-healing repairs.");
             }
+            if report.total_fail > 0 {
+                std::process::exit(1);
+            }
         }
         Some(Commands::Run { target }) => {
             if let Some(t) = target {

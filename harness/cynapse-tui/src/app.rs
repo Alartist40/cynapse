@@ -41,7 +41,7 @@ use cynapse_memory::ReflectionWorker;
 use crate::terminal::TuiRuntimeGuard;
 use crate::theme::AppTheme;
 
-pub const MAX_AGENT_STEPS: usize = 5;
+pub const MAX_AGENT_STEPS: usize = 14;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -375,7 +375,8 @@ impl TuiApp {
             current_download_state: None,
             doctor_report: None,
             persona_mgr: cynapse_core::persona::PersonaManager::new(cynapse_core::persona::PersonaManager::default_dir())
-                .unwrap_or_else(|_| cynapse_core::persona::PersonaManager::new("./persona").unwrap()),
+                .or_else(|_| cynapse_core::persona::PersonaManager::new("./persona"))
+                .unwrap_or_else(|_| cynapse_core::persona::PersonaManager::in_memory()),
             selected_persona_idx: 0,
             persona_editing: false,
             persona_edit_buffer: String::new(),

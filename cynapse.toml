@@ -5,9 +5,24 @@ name = "cynapse"
 version = "0.1.0"
 
 [engine]
-tier1_endpoint = "http://127.0.0.1:11435"
+# Stock Ollama listens on 11434; llama-server daemon uses 38265 (auto-probed).
+tier1_endpoint = "http://127.0.0.1:11434"
 default_model = "ministral-3:3b"
 memory_headroom_mb = 1536
+# Prompt context size shared by llama-server, Ollama num_ctx, and the native
+# engine. Memory context budget must stay below ~40% of this value.
+ctx_size = 8192
+# Optional extra directories to search for local GGUF models.
+model_search_paths = []
+
+# Shared sampling defaults (chat). Applied to every provider from one config
+# so Ollama options and llama-server payloads cannot drift apart.
+[sampling]
+temperature = 0.7
+top_p = 0.9
+top_k = 40
+repeat_penalty = 1.05
+repeat_last_n = 256
 
 [memory]
 subsystem = "DENDRITE"

@@ -38,6 +38,14 @@ impl PersonaManager {
         }
     }
 
+    /// In-memory fallback constructor when filesystem persona directories cannot be created.
+    pub fn in_memory() -> Self {
+        Self {
+            persona_dir: PathBuf::from("./persona"),
+            active_persona_file: None,
+        }
+    }
+
     /// Seed default persona files if they do not exist.
     pub fn init_defaults(&self) -> Result<()> {
         let identity_path = self.persona_dir.join("IDENTITY.md");

@@ -793,9 +793,18 @@ name = "cynapse"
 version = "0.1.0"
 
 [engine]
-tier1_endpoint = "http://127.0.0.1:11435"
+tier1_endpoint = "http://127.0.0.1:11434"
 default_model = "ministral-3:3b"
 memory_headroom_mb = 1536
+ctx_size = 8192
+model_search_paths = []
+
+[sampling]
+temperature = 0.7
+top_p = 0.9
+top_k = 40
+repeat_penalty = 1.05
+repeat_last_n = 256
 
 [memory]
 subsystem = "DENDRITE"

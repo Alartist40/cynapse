@@ -95,6 +95,18 @@ impl LlamaServerDaemon {
             (Stdio::null(), Stdio::null())
         };
 
+        let ngl = match crate::detect_vram_free_mb() {
+            Some(vram) if vram > 6000 => "99".to_string(),
+            Some(vram) if vram > 3000 => "33".to_string(),
+            Some(vram) if vram > 1000 => "16".to_string(),
+            _ => "0".to_string(),
+        };
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get().to_string())
+            .unwrap_or_else(|_| "4".to_string());
+        // Context size: uses configured engine context or default ENGINE_CTX_SIZE
+        let ctx_size = crate::engine_ctx_size().to_string();
+
         let child = Command::new(&bin)
             .arg("-m")
             .arg(model_path)
@@ -103,9 +115,9 @@ impl LlamaServerDaemon {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("-ngl")
-            .arg("-1")
+            .arg(&ngl)
             .arg("-t")
-            .arg("8")
+            .arg(&threads)
             .arg("--flash-attn")
             .arg("auto")
             .arg("--cache-type-k")
@@ -113,9 +125,9 @@ impl LlamaServerDaemon {
             .arg("--cache-type-v")
             .arg("q8_0")
             .arg("--parallel")
-            .arg("1")
+            .arg("2")
             .arg("--ctx-size")
-            .arg("4096")
+            .arg(&ctx_size)
             .arg("--no-webui")
             .arg("--jinja")
             .stdout(out_stdio)
@@ -141,11 +153,22 @@ impl LlamaServerDaemon {
         bail!("`llama-server` did not become healthy within 10 seconds. Check logs at {}", log_path.display());
     }
 
-    /// Singleton daemon spawner: checks health and spawns if binary and model exist.
+    /// Singleton daemon spawner: checks health, respects failure cooldown, and spawns if binary and model exist.
     pub fn get_or_spawn_daemon(model_path: &Path, port: u16) -> bool {
         static ACTIVE_DAEMON: std::sync::OnceLock<std::sync::Mutex<Option<LlamaServerDaemon>>> = std::sync::OnceLock::new();
+        static SPAWN_COOLDOWN: std::sync::OnceLock<std::sync::Mutex<(usize, Option<Instant>)>> = std::sync::OnceLock::new();
+
         if Self::is_healthy(port) {
             return true;
+        }
+
+        let cd_lock = SPAWN_COOLDOWN.get_or_init(|| std::sync::Mutex::new((0, None)));
+        if let Ok(cd) = cd_lock.lock() {
+            if let Some(until) = cd.1 {
+                if Instant::now() < until {
+                    return false;
+                }
+            }
         }
 
         let mutex = ACTIVE_DAEMON.get_or_init(|| std::sync::Mutex::new(None));
@@ -160,10 +183,24 @@ impl LlamaServerDaemon {
 
         match Self::spawn(model_path, port) {
             Ok(d) => {
+                if let Ok(mut cd) = cd_lock.lock() {
+                    *cd = (0, None);
+                }
                 *guard = Some(d);
                 true
             }
-            Err(_) => false,
+            Err(_) => {
+                if let Ok(mut cd) = cd_lock.lock() {
+                    cd.0 += 1;
+                    let backoff_secs = match cd.0 {
+                        1 => 30,
+                        2 => 60,
+                        _ => 300,
+                    };
+                    cd.1 = Some(Instant::now() + Duration::from_secs(backoff_secs));
+                }
+                false
+            }
         }
     }
 

@@ -10,7 +10,8 @@ use std::time::Instant;
 use crate::graph::{Node, NodeType, Dendrite};
 use crate::store::DendriteStore;
 
-pub const DEFAULT_MAX_TOKENS: usize = 6000;
+// Budgeted token limit for prompt assembly: <= 40% of ENGINE_CTX_SIZE (8192).
+pub const DEFAULT_MAX_TOKENS: usize = 2900;
 /// 40% of the token budget for core identity nodes.
 pub const CORE_NODE_BUDGET: f64 = 0.40;
 /// Minimum relevance score threshold for retrieved knowledge nodes.

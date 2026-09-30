@@ -26,6 +26,38 @@ use crate::llama_ffi::{LlamaModel, LlamaContext};
 #[cfg(feature = "llama-ffi")]
 use std::path::Path;
 
+/// Cached `LEAFCUTTER_DEBUG == "1"` flag, read once per process.
+///
+/// Debug output goes to stderr, which lands on the terminal even while the
+/// fullscreen TUI owns the alternate screen (corrupting it), and per-token
+/// prints are a measurable decode cost. Every non-essential diagnostic print
+/// in this file is therefore routed through this helper and stays silent
+/// unless `LEAFCUTTER_DEBUG=1` was set before start.
+fn debug_enabled() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| {
+        std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Fail-loud context-limit decision for the native path (pure, testable).
+///
+/// `KVCache::append` (cache/mod.rs:46-61) grows without bound — there is no
+/// capacity check and `KVCache::new` ignores its layer-count argument — and
+/// attention requires every prior K/V, so old entries are NEVER evicted.
+/// The generation entry points enforce the model's `max_seq_len` here:
+/// `seq_len_after` tokens are acceptable iff they do not exceed the limit.
+fn check_context_limit(seq_len_after: usize, max_seq_len: usize) -> Result<(), String> {
+    if seq_len_after > max_seq_len {
+        Err(format!(
+            "native engine context limit reached ({} tokens) — shorten the prompt or use Tier 1",
+            max_seq_len
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct Engine {
     pub model: GGUFModel,
     pub config: ModelConfig,
@@ -230,11 +262,15 @@ impl Engine {
         // Run pre-flight capability report
         let report = model.capability_report();
         if !report.can_run {
-            eprintln!("\n{}", report.print());
+            if debug_enabled() {
+                eprintln!("\n{}", report.print());
+            }
 
             // ── AUTO-FALLBACK: unsupported quants → try FFI ──────────
             if crate::llama_ffi::is_available() {
-                eprintln!("  Native path blocked. Trying llama.cpp FFI fallback...");
+                if debug_enabled() {
+                    eprintln!("  Native path blocked. Trying llama.cpp FFI fallback...");
+                }
                 #[cfg(feature = "llama-ffi")]
                 return Self::load_ffi(path);
                 #[cfg(not(feature = "llama-ffi"))]
@@ -261,8 +297,10 @@ impl Engine {
         if let Some(info) = model.file.get_tensor_info("token_embd.weight") {
             let actual_hidden = info.dimensions[0] as usize;
             if actual_hidden != config.hidden_size && actual_hidden > 0 {
-                eprintln!("  Correcting hidden_size: metadata={} → actual={}",
-                    config.hidden_size, actual_hidden);
+                if debug_enabled() {
+                    eprintln!("  Correcting hidden_size: metadata={} → actual={}",
+                        config.hidden_size, actual_hidden);
+                }
                 config.hidden_size = actual_hidden;
             }
         }
@@ -275,8 +313,10 @@ impl Engine {
             })
             .count();
         if actual_layers != config.num_hidden_layers && actual_layers > 0 {
-            eprintln!("  Correcting num_hidden_layers: metadata={} → actual={}",
-                config.num_hidden_layers, actual_layers);
+            if debug_enabled() {
+                eprintln!("  Correcting num_hidden_layers: metadata={} → actual={}",
+                    config.num_hidden_layers, actual_layers);
+            }
             config.num_hidden_layers = actual_layers;
         }
         let mut special_weights = model.load_special()?;
@@ -491,11 +531,13 @@ impl Engine {
 
                 // Cross-check: ensure 2*qk_h*head_k + v_h*head_v == conv_dim (sanity)
                 if num_qk_heads * head_k_dim * 2 + num_v_heads * head_v_dim != conv_dim {
-                    eprintln!(
-                        "  DeltaNet WARN: dim mismatch on layer {}: 2*{}*{} + {}*{} = {} != conv_dim {}",
-                        layer_idx, num_qk_heads, head_k_dim, num_v_heads, head_v_dim,
-                        2 * num_qk_heads * head_k_dim + num_v_heads * head_v_dim, conv_dim
-                    );
+                    if debug_enabled() {
+                        eprintln!(
+                            "  DeltaNet WARN: dim mismatch on layer {}: 2*{}*{} + {}*{} = {} != conv_dim {}",
+                            layer_idx, num_qk_heads, head_k_dim, num_v_heads, head_v_dim,
+                            2 * num_qk_heads * head_k_dim + num_v_heads * head_v_dim, conv_dim
+                        );
+                    }
                 }
 
                 let conv_kernel = if let Some(conv_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_conv1d.weight")) {
@@ -521,7 +563,9 @@ impl Engine {
                 };
             }
         }
-        eprintln!("  Warning: Could not infer DeltaNet params, using defaults");
+        if debug_enabled() {
+            eprintln!("  Warning: Could not infer DeltaNet params, using defaults");
+        }
         DeltaNetParams::default()
     }
     // -------------------------------------------------------------------------
@@ -633,6 +677,11 @@ impl Engine {
     /// Evaluates prompt tokens with common-prefix caching across turns (inspired by llama.cpp).
     /// Reuses matching prefix from `self.cached_prompt_tokens` and evaluates only uncached tokens.
     fn prefill_with_prefix_cache(&mut self, tokens: &[usize]) -> Result<Vec<f32>, String> {
+        // Fail loud BEFORE evaluating: the KV cache is unbounded (no
+        // eviction — attention needs every prior K/V), so a prompt already
+        // past the model context must refuse instead of growing forever.
+        check_context_limit(tokens.len(), self.config.max_seq_len)?;
+
         let common_prefix = if self.kv_cache.is_empty() {
             0
         } else {
@@ -677,7 +726,9 @@ impl Engine {
         let logits = match self.prefill_with_prefix_cache(tokens) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Forward pass failed: {}", e);
+                if debug_enabled() {
+                    eprintln!("Forward pass failed: {}", e);
+                }
                 return vec![];
             }
         };
@@ -694,7 +745,9 @@ impl Engine {
             let logits = match self.forward_native(&[next_token]) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("Forward pass failed: {}", e);
+                    if debug_enabled() {
+                        eprintln!("Forward pass failed: {}", e);
+                    }
                     break;
                 }
             };
@@ -769,7 +822,9 @@ impl Engine {
         let logits = match self.prefill_with_prefix_cache(tokens) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Forward pass failed: {}", e);
+                if debug_enabled() {
+                    eprintln!("Forward pass failed: {}", e);
+                }
                 return vec![];
             }
         };
@@ -801,7 +856,9 @@ impl Engine {
             let logits = match self.forward_native(&[next_token]) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("Forward pass failed: {}", e);
+                    if debug_enabled() {
+                        eprintln!("Forward pass failed: {}", e);
+                    }
                     break;
                 }
             };
@@ -902,7 +959,9 @@ impl Engine {
             return match ctx.forward(&tokens_i32) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("⚠️  FFI forward failed: {}", e);
+                    if debug_enabled() {
+                        eprintln!("⚠️  FFI forward failed: {}", e);
+                    }
                     vec![]
                 }
             };
@@ -910,7 +969,9 @@ impl Engine {
         self.forward_native(tokens).unwrap_or_else(|e| {
             // TODO(audit-2026-07, finding #5): propagate Result to callers.
             // For now, log and continue with empty so the chat loop survives.
-            eprintln!("Forward pass failed: {}", e);
+            if debug_enabled() {
+                eprintln!("Forward pass failed: {}", e);
+            }
             vec![]
         })
     }
@@ -918,6 +979,14 @@ impl Engine {
     /// Hybrid forward pass supporting both standard transformers and SSM/Transformer hybrids.
     pub fn forward_native(&mut self, tokens: &[usize]) -> Result<Vec<f32>, String> {
         let seq_len = tokens.len();
+
+        // Context-limit guard: KV/SSM state grows monotonically for the whole
+        // session (the cache never evicts — attention needs every prior K/V),
+        // so refuse past `max_seq_len` instead of growing without bound.
+        // `seq_offset` is the RoPE base (= cached length in normal flow);
+        // `kv_cache.total_seq_len()` catches callers that bypass prefix cache.
+        let seq_after = self.seq_offset.max(self.kv_cache.total_seq_len()) + seq_len;
+        check_context_limit(seq_after, self.config.max_seq_len)?;
 
         // Embedding lookup via mmap (avoids loading full embed matrix into RAM)
         let mut hidden = self.embed_lookup_mmap(tokens)?;
@@ -1232,7 +1301,9 @@ impl Engine {
         let mut hidden = match self.embed_lookup_mmap(tokens) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("embed_lookup_mmap failed: {}", e);
+                if debug_enabled() {
+                    eprintln!("embed_lookup_mmap failed: {}", e);
+                }
                 return vec![];
             }
         };
@@ -1866,4 +1937,37 @@ fn load_lm_head_cache(model: &GGUFModel, tensor_name: &str) -> Option<crate::ker
         );
     }
     Some(matrix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_context_limit_allows_up_to_max() {
+        assert!(check_context_limit(0, 4096).is_ok());
+        assert!(check_context_limit(4096, 4096).is_ok());
+    }
+
+    #[test]
+    fn test_context_limit_refuses_past_max() {
+        let err = check_context_limit(4097, 4096).unwrap_err();
+        assert_eq!(
+            err,
+            "native engine context limit reached (4096 tokens) — shorten the prompt or use Tier 1"
+        );
+    }
+
+    #[test]
+    fn test_context_limit_refusal_mentions_tier1_and_limit() {
+        let err = check_context_limit(131_073, 131_072).unwrap_err();
+        assert!(err.contains("(131072 tokens)"));
+        assert!(err.contains("use Tier 1"));
+    }
+
+    #[test]
+    fn test_context_limit_small_ctx_still_fails_loud() {
+        assert!(check_context_limit(513, 512).is_err());
+        assert!(check_context_limit(512, 512).is_ok());
+    }
 }
