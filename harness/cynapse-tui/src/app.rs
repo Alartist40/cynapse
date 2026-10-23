@@ -145,6 +145,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/bots", description: "List and inspect configured subagent bot profiles" },
     SlashCommand { name: "/thinking", description: "Toggle collapsible model thinking/reasoning blocks" },
     SlashCommand { name: "/unload", description: "Unload active LLM model from RAM immediately to free memory" },
+    SlashCommand { name: "/backup", description: "Create or restore AES-256-GCM encrypted backup of memory database" },
     SlashCommand { name: "/session", description: "Open saved sessions manager" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
     SlashCommand { name: "/exit", description: "Exit Cynapse TUI" },
@@ -1701,6 +1702,63 @@ impl TuiApp {
                                     continue;
                                 }
 
+                                if trimmed.starts_with("/backup") {
+                                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                                    let db_path = dirs::home_dir()
+                                        .map(|h| h.join(".cynapse").join("dendrite.db"))
+                                        .unwrap_or_else(|| PathBuf::from("data/dendrite.db"));
+                                    let backup_path = dirs::home_dir()
+                                        .map(|h| h.join(".cynapse").join("dendrite.enc"))
+                                        .unwrap_or_else(|| PathBuf::from("data/dendrite.enc"));
+
+                                    if parts.len() >= 3 && parts[1] == "restore" {
+                                        let passkey = parts[2..].join(" ");
+                                        match cynapse_core::backup::EncryptedBackup::restore_backup(&backup_path, &db_path, &passkey) {
+                                            Ok(()) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("Memory database restored successfully from AES-256-GCM vault: {:?}", backup_path),
+                                                    thinking: None,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("Backup restore failed: {}", e),
+                                                    thinking: None,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        let passkey = if parts.len() >= 2 { parts[1..].join(" ") } else { "cynapse_vault_default".to_string() };
+                                        if !db_path.exists() {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("Database file does not exist to back up: {:?}", db_path),
+                                                thinking: None,
+                                            });
+                                        } else {
+                                            match cynapse_core::backup::EncryptedBackup::create_backup(&db_path, &backup_path, &passkey) {
+                                                Ok(bytes) => {
+                                                    self.messages.push(ChatMessage {
+                                                        role: "system".into(),
+                                                        content: format!("AES-256-GCM Encrypted Backup created ({} bytes) at: {:?}", bytes, backup_path),
+                                                        thinking: None,
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    self.messages.push(ChatMessage {
+                                                        role: "system".into(),
+                                                        content: format!("Backup creation failed: {}", e),
+                                                        thinking: None,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
                                 if trimmed == "/model" || trimmed == "/list" || trimmed == "/ls" {
                                     self.selected_model_idx = 0;
                                     self.modal = ActiveModal::ModelList;
@@ -2642,8 +2700,15 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     },
                 ),
                 Span::styled("  │  ", t.dim_text()),
-                Span::styled("Dendrite: ", t.dim_text()),
-                Span::styled("Disconnected (Test)", Style::default().fg(Color::Yellow)),
+                Span::styled("Perf: ", t.dim_text()),
+                Span::styled(
+                    if self.last_tok_per_sec > 0.0 {
+                        format!("{:.1} t/s ({:.2}s)", self.last_tok_per_sec, self.last_latency_sec)
+                    } else {
+                        "idle".to_string()
+                    },
+                    Style::default().fg(Color::LightYellow),
+                ),
                 Span::styled("  │  ", t.dim_text()),
                 Span::styled(format!("[{}]", t.name()), t.dim_text()),
             ]

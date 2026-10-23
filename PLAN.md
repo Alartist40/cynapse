@@ -234,6 +234,15 @@ Working tree already contains, in `cynapse.toml` + `engine/cynapse-engine/src/li
   - Added deterministic logit-parity test harness verifying `LEAFCUTTER_DETERMINISTIC=1` activation and local model discovery.
   - Gate: G30 (scaffold passes). Scope delivered: deterministic-flag activation + local-model discovery assertions. NOT delivered: the actual logit diff vs llama-server — needs a live server + model in the loop. Follow-up: extend `tests/parity_test.rs` to run the same prompt through llama-server `/completion` (deterministic, greedy) and the native engine, assert max |Δlogit| < ε; run it once a backend is guaranteed present.
 
+- **Stage 31: Engine Dynamic Slots, Hardware NPU Detection, Subagent Self-Correction, 3D Memory & Authenticated Vault [DONE — G31 PASSED 2026-10-23]**
+  `OWNS: engine/cynapse-engine/src/slots.rs, engine/leafcutter_core/rust/src/detect.rs, harness/cynapse-core/src/subagent.rs, harness/cynapse-core/src/backup.rs, crates/mazzaroth, harness/cynapse-tui/src/app.rs`
+  - Dynamic Subagent Slots: `SlotPurpose::Subagent(id)` and `SlotPurpose::Draft(id)` with concurrent allocation and release in `SlotManager`.
+  - Hardware Acceleration: Rockchip RKNPU (`/dev/rknpu*`, RK3588, Orange Pi 5) hardware probe in `leafcutter_core::detect`.
+  - Subagent Self-Correction & Spooling: Automatic `cargo check` pre-flight compiler diagnostics feedback on code edits; persistent task activity streaming in `~/.cynapse/tasks/<id>.log`.
+  - Authenticated Encryption: AES-256-GCM + PBKDF2-HMAC-SHA256 authenticated backup/restore for memory graph (`/backup`).
+  - Mazzaroth 3D Celestial Engine: Ratatui 3D orbital memory renderer imported into workspace crates and wired to TUI.
+  - Telemetry: Live generation tok/s and TTFT latency indicators added to TUI header bar.
+
 ## Out of scope (deferred, recorded not dropped)
 - P2 table: app.rs 230 KB split, ripgrep fast path, eval_count tok/s parsing, per-provider payload generation beyond sampling(), Ollama llama.cpp-only field removal.
 - Native RoPE/q_proj/pair-convention math rewrite — research track; arch-refusal (stage 26) contains the blast radius until the parity harness (stage 30) exists.

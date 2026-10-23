@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use regex::Regex;
+pub mod backup;
 pub mod bots;
 pub mod compressor;
 pub mod doctor;

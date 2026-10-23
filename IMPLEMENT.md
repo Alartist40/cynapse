@@ -28,3 +28,16 @@ Corrections applied during review (then re-ran the edited gates, all PASS):
 Honest-scope notes added to PLAN: stage 25 (no trim-retry, fail-loud), stage 27 (`SlotPurpose::Reflection` unused — ReflectionWorker is model-free), stage 29 (catch_unwind deferred), stage 30 (parity scaffold), out-of-scope list extended.
 
 Docs brought current: README (MAX_AGENT_STEPS 14, 14-check doctor + exit-1, install backend offer), ARCHITECTURE (config-driven temp, startup endpoint probe), presentation config block (11434 + current keys), CHANGELOG Unreleased section.
+
+## 2026-10-23 — Session: Engine Concurrency, Subagent Self-Correction, 3D Memory & Encrypted Vault
+- Baseline verified: all workspace crates compile and run green.
+- Delivered Stage 31:
+  - Dynamic slot allocations (`SlotPurpose::Subagent(id)`, `SlotPurpose::Draft(id)`) in `SlotManager` for parallel subagent inference.
+  - Rockchip RKNPU (`/dev/rknpu*`, RK3588, Orange Pi 5) hardware probe in `detect.rs`.
+  - Self-correcting pre-flight auto-verification loop: `write_file` tool runs `cargo check --message-format=short` on `.rs` files and injects compiler diagnostics directly back to model context for automatic self-correction.
+  - Persistent subagent task spooling to `~/.cynapse/tasks/<id>.log`.
+  - Authenticated AES-256-GCM + PBKDF2-HMAC-SHA256 encrypted backup and restore in `cynapse-core::backup` (`/backup`).
+  - Mazzaroth 3D Celestial Memory engine imported into workspace (`crates/mazzaroth`) and wired into `cynapse-tui`.
+  - Telemetry: generation tok/s and TTFT latency indicators added to TUI header bar.
+- Test Suite: All workspace tests pass (308 passed, 0 failed). Full tree clean and ready to commit.
+

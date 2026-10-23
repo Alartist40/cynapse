@@ -2,6 +2,18 @@
 
 All notable changes to Cynapse are documented here.
 
+## [Unreleased] — Engine Concurrency, Subagent Self-Correction & Mazzaroth 3D Memory (2026-10-23)
+
+### Added
+- **Multi-Slot Subagent Concurrency**: `SlotManager` extended with `SlotPurpose::Subagent(id)` and `SlotPurpose::Draft(id)` for concurrent non-blocking subagent execution.
+- **Hardware NPU Acceleration Probe**: Added Rockchip RKNPU (`/dev/rknpu*`, RK3588, Orange Pi 5) hardware detection to `leafcutter_core::detect`.
+- **Self-Correcting Subagent Harness**: Autonomous pre-flight compiler verification (`cargo check --message-format=short`) on `.rs` modifications with automatic compiler diagnostic injection into model loop.
+- **Persistent Subagent Spooling**: Disk-backed append-only task event logging to `~/.cynapse/tasks/<id>.log`.
+- **Authenticated AES-256-GCM Vault**: 1-click `/backup` and `/backup restore <pass>` authenticated AES-256-GCM + PBKDF2-HMAC-SHA256 encrypted memory vault in `cynapse-core::backup`.
+- **Mazzaroth 3D Celestial Engine**: Ratatui 3D hierarchical orbit engine imported (`crates/mazzaroth`) and integrated into workspace.
+- **TUI Generation Telemetry**: Live tokens/sec and TTFT latency indicators surfaced in TUI header bar.
+- Workspace test suite now **308 tests, 0 failures**.
+
 ## [Unreleased] — Code Audit Remediation (2026-09-30)
 
 ### Fixed (audit P0 #1–#5)

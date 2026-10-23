@@ -1,0 +1,10 @@
+[package]
+name = "mazzaroth"
+version = "0.1.0"
+edition = "2021"
+authors = ["Xander <https://github.com/Alartist40>"]
+description = "Mazzaroth — Pure Rust Ratatui 3D Celestial Galaxy Visualization & Hierarchical Orbit Engine"
+license = "MIT"
+
+[dependencies]
+ratatui = { version = "0.29", default-features = false }

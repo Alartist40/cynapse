@@ -62,6 +62,8 @@ pub enum NpuKind {
     /// Arm China Zhouyi AIPU (`/dev/aipu`, kernel driver aliases
     /// `armchina,zhouyi-*`; used by e.g. the CIX Sky1 SoC).
     ZhouyiAipu,
+    /// Rockchip RKNPU (`/dev/rknpu*` or sysfs node; RK3588, RK3568, Orange Pi 5).
+    RockchipRknpu,
     /// Some other NPU recognised by its kernel driver node.
     Other,
 }
@@ -71,6 +73,7 @@ impl NpuKind {
         match self {
             NpuKind::None => "none",
             NpuKind::ZhouyiAipu => "zhouyi-aipu",
+            NpuKind::RockchipRknpu => "rockchip-rknpu",
             NpuKind::Other => "other",
         }
     }
@@ -389,6 +392,13 @@ fn probe_npu() -> NpuKind {
     if path_exists("/dev/aipu") || sysfs_misc_exists("aipu") {
         return NpuKind::ZhouyiAipu;
     }
+    if path_exists("/dev/rknpu")
+        || path_exists("/dev/rknpu0")
+        || sysfs_misc_exists("rknpu")
+        || Path::new("/sys/class/rknpu").exists()
+    {
+        return NpuKind::RockchipRknpu;
+    }
     NpuKind::None
 }
 
@@ -510,11 +520,15 @@ mod tests {
     fn npu_kind_labels_and_never_offloads() {
         assert_eq!(NpuKind::None.label(), "none");
         assert_eq!(NpuKind::ZhouyiAipu.label(), "zhouyi-aipu");
+        assert_eq!(NpuKind::RockchipRknpu.label(), "rockchip-rknpu");
+        assert_eq!(NpuKind::Other.label(), "other");
         assert!(!NpuKind::None.is_present());
         assert!(NpuKind::ZhouyiAipu.is_present());
+        assert!(NpuKind::RockchipRknpu.is_present());
         assert!(!NpuKind::ZhouyiAipu.supports_dynamic_offload());
+        assert!(!NpuKind::RockchipRknpu.supports_dynamic_offload());
         // An NPU must never upgrade the tier to GPU even if present.
-        let hw = HardwareInfo { npu: NpuKind::ZhouyiAipu, gpu: GpuKind::None, ..probe_hardware() };
+        let hw = HardwareInfo { npu: NpuKind::RockchipRknpu, gpu: GpuKind::None, ..probe_hardware() };
         assert_eq!(choose_tier(hw.gpu, hw.ram_available_mb, 40_000_000_000, true), Tier::StreamingCpu);
     }
 

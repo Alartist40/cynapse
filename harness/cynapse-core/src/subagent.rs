@@ -5,6 +5,10 @@
 //! cancellation tokens, status reporting, and background announce-back messaging.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -121,12 +125,15 @@ impl SubagentManager {
             flags.insert(id, Arc::clone(&cancel_flag));
         }
 
+        Self::append_task_log(id, &format!("SPAWN: bot=@{} wait={} task=\"{}\"", bot_slug, wait, task_instruction));
+
         (id, cancel_flag)
     }
 
     /// Updates the execution status and optional result payload of a subagent task.
     pub fn update_status(&self, id: usize, status: SubagentStatus, result: Option<String>) {
         let is_terminal = matches!(status, SubagentStatus::Done | SubagentStatus::Failed(_) | SubagentStatus::Cancelled);
+        Self::append_task_log(id, &format!("STATUS: {:?} (result_len={})", status, result.as_ref().map(|r| r.len()).unwrap_or(0)));
         if let Ok(mut tasks) = self.tasks.write() {
             if let Some(task) = tasks.get_mut(&id) {
                 task.status = status;
@@ -216,6 +223,57 @@ impl SubagentManager {
         }
         stalled
     }
+
+    /// Path to task log file in ~/.cynapse/tasks/<id>.log
+    pub fn task_log_path(task_id: usize) -> PathBuf {
+        let dir = dirs::home_dir()
+            .map(|h| h.join(".cynapse").join("tasks"))
+            .unwrap_or_else(|| PathBuf::from(".cynapse/tasks"));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}.log", task_id))
+    }
+
+    /// Appends a timestamped line to ~/.cynapse/tasks/<id>.log
+    pub fn append_task_log(task_id: usize, event: &str) {
+        let path = Self::task_log_path(task_id);
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let ts = Self::now_ms();
+            let _ = writeln!(file, "[{}] {}", ts, event);
+        }
+    }
+}
+
+/// Runs pre-flight verification on modified code files.
+/// If `file_path` ends with `.rs` and Cargo.toml is in parent hierarchy, runs `cargo check --message-format=short`.
+pub fn run_preflight_verification(file_path: &str) -> Option<String> {
+    let path = Path::new(file_path);
+    if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+        // Find ancestor with Cargo.toml
+        let mut curr = path.parent();
+        while let Some(dir) = curr {
+            if dir.join("Cargo.toml").exists() {
+                let out = Command::new("cargo")
+                    .arg("check")
+                    .arg("--message-format=short")
+                    .current_dir(dir)
+                    .output();
+                if let Ok(output) = out {
+                    if !output.status.success() {
+                        let err_text = String::from_utf8_lossy(&output.stderr);
+                        let short_err = err_text
+                            .lines()
+                            .take(15)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Some(format!("\n[Auto-Verification Error - cargo check failed]:\n{}", short_err));
+                    }
+                }
+                break;
+            }
+            curr = dir.parent();
+        }
+    }
+    None
 }
 
 /// Result returned from executing a subagent offline loop.
@@ -346,7 +404,7 @@ where
 
                             let (arg1, arg2) = extract_tool_args(call);
 
-                            let output_str = if !profile.is_tool_allowed(&call.name) {
+                            let mut output_str = if !profile.is_tool_allowed(&call.name) {
                                 format!("Tool error: Permission denied: tool '{}' is not permitted by bot profile '@{}'", call.name, profile.slug)
                             } else if profile.requires_approval(&call.name) {
                                 if let Some(ref mut ask) = approval_fn {
@@ -374,6 +432,13 @@ where
                                     Err(err) => format!("Tool error: {}", err),
                                 }
                             };
+
+                            // Auto-Verification for self-correcting code generation
+                            if call.name == "write_file" && !output_str.starts_with("Tool error:") {
+                                if let Some(verification_err) = run_preflight_verification(&arg1) {
+                                    output_str.push_str(&verification_err);
+                                }
+                            }
 
                             loop_guard.record_outcome(call, &output_str);
                             batch_results.push(format!("[{}]\n{}", call.name, output_str));
@@ -796,5 +861,20 @@ mod tests {
         assert_eq!(cancelled, vec![id2]);
         assert!(cancel2.load(Ordering::SeqCst));
         assert_eq!(manager.get_status(id2), Some(SubagentStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_subagent_task_logger() {
+        let manager = SubagentManager::new(2);
+        let (id, _cancel) = manager.create_task("Test log task", "coder", false);
+        manager.update_status(id, SubagentStatus::Running, None);
+        manager.update_status(id, SubagentStatus::Done, Some("Finished successfully".into()));
+
+        let log_path = SubagentManager::task_log_path(id);
+        assert!(log_path.exists());
+        let content = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(content.contains("SPAWN: bot=@coder"));
+        assert!(content.contains("STATUS: Running"));
+        assert!(content.contains("STATUS: Done"));
     }
 }
