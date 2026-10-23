@@ -83,6 +83,32 @@ pub struct PendingToolApproval {
     pub arg1: String,
     pub arg2: Option<String>,
     pub response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    pub edit_mode: bool,
+    pub editing_arg: usize,
+    pub edit_buffer: String,
+}
+
+impl PendingToolApproval {
+    pub fn new(
+        task_id: usize,
+        bot_slug: String,
+        tool_name: String,
+        arg1: String,
+        arg2: Option<String>,
+        response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    ) -> Self {
+        Self {
+            task_id,
+            bot_slug,
+            tool_name,
+            arg1,
+            arg2,
+            response_tx,
+            edit_mode: false,
+            editing_arg: 0,
+            edit_buffer: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,9 +552,16 @@ impl TuiApp {
                 if let Some(tx) = pending.response_tx.take() {
                     let _ = tx.send(approved);
                 }
+                let args_detail = if let Some(ref a2) = pending.arg2 {
+                    format!(" [args: '{}' / '{}']", pending.arg1, a2)
+                } else if !pending.arg1.is_empty() {
+                    format!(" [arg: '{}']", pending.arg1)
+                } else {
+                    String::new()
+                };
                 self.messages.push(ChatMessage {
                     role: "system".into(),
-                    content: format!("Decision recorded for subagent #{}: {} `{}` (@{})", pending.task_id, outcome_str, pending.tool_name, pending.bot_slug),
+                    content: format!("Decision recorded for subagent #{}: {} `{}` (@{}){}", pending.task_id, outcome_str, pending.tool_name, pending.bot_slug, args_detail),
                     thinking: None,
                 });
                 self.save_current_session();
@@ -1271,19 +1304,62 @@ impl TuiApp {
                                 continue;
                             }
 
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Tab => {
-                                    if self.modal == ActiveModal::ToolApproval {
-                                        if let Some(pending) = self.pending_approval.take() {
-                                            self.messages.push(ChatMessage {
-                                                role: "system".into(),
-                                                content: format!("❌ Tool execution denied by user: `{}` (@{})", pending.tool_name, pending.bot_slug),
-                                                thinking: None,
-                                            });
-                                            self.save_current_session();
+                            if self.modal == ActiveModal::ToolApproval {
+                                if let Some(ref mut pending) = self.pending_approval {
+                                    if pending.edit_mode {
+                                        match key.code {
+                                            KeyCode::Esc => {
+                                                pending.edit_mode = false;
+                                            }
+                                            KeyCode::Tab => {
+                                                if pending.editing_arg == 0 {
+                                                    pending.arg1 = pending.edit_buffer.clone();
+                                                    pending.editing_arg = 1;
+                                                    pending.edit_buffer = pending.arg2.clone().unwrap_or_default();
+                                                } else {
+                                                    pending.arg2 = Some(pending.edit_buffer.clone());
+                                                    pending.editing_arg = 0;
+                                                    pending.edit_buffer = pending.arg1.clone();
+                                                }
+                                            }
+                                            KeyCode::Enter => {
+                                                if pending.editing_arg == 0 {
+                                                    pending.arg1 = pending.edit_buffer.clone();
+                                                } else {
+                                                    pending.arg2 = Some(pending.edit_buffer.clone());
+                                                }
+                                                pending.edit_mode = false;
+                                            }
+                                            KeyCode::Backspace => {
+                                                pending.edit_buffer.pop();
+                                            }
+                                            KeyCode::Char(c) => {
+                                                pending.edit_buffer.push(c);
+                                            }
+                                            _ => {}
                                         }
+                                        continue;
+                                    } else if let KeyCode::Char('e') | KeyCode::Char('E') = key.code {
+                                        pending.edit_mode = true;
+                                        pending.editing_arg = 0;
+                                        pending.edit_buffer = pending.arg1.clone();
+                                        continue;
                                     }
-                                    self.modal = ActiveModal::None;
+                                }
+                            }
+
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    if self.modal == ActiveModal::ToolApproval {
+                                        self.handle_approval_decision(false);
+                                    } else {
+                                        self.modal = ActiveModal::None;
+                                    }
+                                }
+                                KeyCode::Tab => {
+                                    if self.modal != ActiveModal::ToolApproval {
+                                        self.modal = ActiveModal::None;
+                                    }
                                 }
                                 KeyCode::Left => match self.modal {
                                     ActiveModal::MemoryGraph => {
@@ -2119,14 +2195,14 @@ impl TuiApp {
     fn poll_stream_events(&mut self) {
         while let Ok(req) = self.approval_rx.try_recv() {
             if self.pending_approval.is_none() {
-                self.pending_approval = Some(PendingToolApproval {
-                    task_id: req.task_id,
-                    bot_slug: req.bot_slug,
-                    tool_name: req.tool_name,
-                    arg1: req.arg1,
-                    arg2: req.arg2,
-                    response_tx: Some(req.response_tx),
-                });
+                self.pending_approval = Some(PendingToolApproval::new(
+                    req.task_id,
+                    req.bot_slug,
+                    req.tool_name,
+                    req.arg1,
+                    req.arg2,
+                    Some(req.response_tx),
+                ));
                 self.modal = ActiveModal::ToolApproval;
             } else {
                 let _ = req.response_tx.send(false);
@@ -3747,46 +3823,85 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 let inner_area = outer_block.inner(area);
                 f.render_widget(outer_block, area);
 
-                let (bot, tool, a1, a2) = if let Some(ref p) = self.pending_approval {
+                let (bot, tool, a1, a2, edit_mode, edit_arg, edit_buf) = if let Some(ref p) = self.pending_approval {
                     (
                         p.bot_slug.as_str(),
                         p.tool_name.as_str(),
                         p.arg1.as_str(),
                         p.arg2.as_deref().unwrap_or(""),
+                        p.edit_mode,
+                        p.editing_arg,
+                        p.edit_buffer.as_str(),
                     )
                 } else {
-                    ("unknown", "unknown", "", "")
+                    ("unknown", "unknown", "", "", false, 0, "")
                 };
 
-                let text = vec![
+                let arg1_line = if edit_mode && edit_arg == 0 {
                     Line::from(vec![
-                        Span::styled("Target Bot Profile: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled("Argument 1 [EDITING]: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}_", edit_buf), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled("Argument 1:           ", Style::default().fg(Color::Gray)),
+                        Span::styled(a1, Style::default().fg(Color::White)),
+                    ])
+                };
+
+                let arg2_line = if edit_mode && edit_arg == 1 {
+                    Line::from(vec![
+                        Span::styled("Argument 2 [EDITING]: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}_", edit_buf), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled("Argument 2:           ", Style::default().fg(Color::Gray)),
+                        Span::styled(a2, Style::default().fg(Color::White)),
+                    ])
+                };
+
+                let mut text = vec![
+                    Line::from(vec![
+                        Span::styled("Target Bot Profile:   ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                         Span::styled(format!("@{}", bot), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                     ]),
                     Line::from(vec![
-                        Span::styled("Requested Action:   ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled("Requested Action:     ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                         Span::styled(tool, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                     ]),
-                    Line::from(vec![
-                        Span::styled("Argument 1:         ", Style::default().fg(Color::Gray)),
-                        Span::styled(a1, Style::default().fg(Color::White)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Argument 2:         ", Style::default().fg(Color::Gray)),
-                        Span::styled(a2, Style::default().fg(Color::White)),
-                    ]),
+                    arg1_line,
+                    arg2_line,
                     Line::from("──────────────────────────────────────────────────────────"),
-                    Line::from(vec![
+                ];
+
+                if edit_mode {
+                    text.push(Line::from(vec![
+                        Span::styled("Mode: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled("Editing Parameter. Type to edit, [Tab] switch field, [Enter] save, [Esc] cancel.", Style::default().fg(Color::Cyan)),
+                    ]));
+                    text.push(Line::from(""));
+                    text.push(Line::from(vec![
+                        Span::styled(" [Enter] Save Field ", Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                        Span::raw("   "),
+                        Span::styled(" [Tab] Switch Arg ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+                        Span::raw("   "),
+                        Span::styled(" [Esc] Cancel Edit ", Style::default().bg(Color::Red).fg(Color::White)),
+                    ]));
+                } else {
+                    text.push(Line::from(vec![
                         Span::styled("Notice: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                         Span::styled("This tool is listed in `tools_ask` requiring interactive confirmation.", Style::default().fg(Color::Gray)),
-                    ]),
-                    Line::from(""),
-                    Line::from(vec![
+                    ]));
+                    text.push(Line::from(""));
+                    text.push(Line::from(vec![
                         Span::styled(" [Y / Enter] Approve ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
                         Span::raw("   "),
                         Span::styled(" [N / Esc] Deny ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
-                    ]),
-                ];
+                        Span::raw("   "),
+                        Span::styled(" [E] Edit Parameters ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
 
                 let p = Paragraph::new(text).wrap(Wrap { trim: true });
                 f.render_widget(p, inner_area);
@@ -3806,15 +3921,11 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         // Canvas grid buffer initialized to clean empty space
         let mut grid: Vec<Vec<(char, Style)>> = vec![vec![(' ', Style::default()); width]; height];
 
-        let yaw = self.galaxy_yaw;
-        let pitch = self.galaxy_pitch;
-        let center_x = (width / 2) as f32;
-        let center_y = (height / 2) as f32;
-
-        let cos_y = yaw.cos();
-        let sin_y = yaw.sin();
-        let cos_p = pitch.cos();
-        let sin_p = pitch.sin();
+        let mut cam = mazzaroth::renderer::Camera3D::new();
+        cam.yaw = self.galaxy_yaw;
+        cam.pitch = self.galaxy_pitch;
+        cam.distance = 38.0;
+        cam.fov = 1.35;
 
         // 1. Faint, Minimal Cosmic Background Starfield
         let star_seeds = [
@@ -3824,58 +3935,56 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         ];
 
         for (sx, sy, sz) in star_seeds {
-            let x1 = sx * cos_y - sz * sin_y;
-            let z1 = sx * sin_y + sz * cos_y;
-            let y1 = sy * cos_p - z1 * sin_p;
-
-            let px = (center_x + x1 * 0.8) as i32;
-            let py = (center_y + y1 * 0.4) as i32;
-
-            if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
-                grid[py as usize][px as usize] = ('.', Style::default().fg(Color::Rgb(55, 55, 75)));
+            let pt = mazzaroth::renderer::GalaxyRenderer::project_point([sx, sy, sz], &cam, width as u16, height as u16);
+            if pt.visible {
+                let px = pt.screen_x as usize;
+                let py = pt.screen_y as usize;
+                if py < height && px < width {
+                    grid[py][px] = ('.', Style::default().fg(Color::Rgb(55, 55, 75)));
+                }
             }
         }
 
-        // 2. Clean Planetary Orbital Tracks (Cleanly spaced dashed guides, no dense clumping)
+        // 2. Clean Planetary Orbital Tracks (Cleanly spaced dashed guides)
         let planetary_tracks = [9.0f32, 16.0f32, 23.0f32, 30.0f32, 37.0f32];
         for r in planetary_tracks {
-            let steps = 32;
+            let steps = 36;
             for s in 0..steps {
                 let theta = (s as f32) * (2.0 * std::f32::consts::PI / (steps as f32));
                 let rx = r * theta.cos();
                 let rz = r * theta.sin();
                 let ry = 0.0;
-                let x1 = rx * cos_y - rz * sin_y;
-                let z1 = rx * sin_y + rz * cos_y;
-                let y1 = ry * cos_p - z1 * sin_p;
-                let px = (center_x + x1 * 0.85) as i32;
-                let py = (center_y + y1 * 0.42) as i32;
-                if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
-                    if grid[py as usize][px as usize].0 == ' ' {
-                        grid[py as usize][px as usize] = ('·', Style::default().fg(Color::Rgb(40, 44, 60)));
+                let pt = mazzaroth::renderer::GalaxyRenderer::project_point([rx, ry, rz], &cam, width as u16, height as u16);
+                if pt.visible {
+                    let px = pt.screen_x as usize;
+                    let py = pt.screen_y as usize;
+                    if py < height && px < width && grid[py][px].0 == ' ' {
+                        grid[py][px] = ('·', Style::default().fg(Color::Rgb(40, 44, 60)));
                     }
                 }
             }
         }
 
-        // 3. Central Sun: The Biggest Memory (Core) anchored at the Center
-        let cpx = center_x as i32;
-        let cpy = center_y as i32;
+        // 3. Central Sun: Core Memory anchored at 3D origin
         let supermassive = self.graph.supermassive_node();
         let supermassive_id = supermassive.as_ref().map(|n| n.id.as_str());
 
-        if cpy >= 0 && cpy < height as i32 {
-            if cpx >= 1 && cpx + 1 < width as i32 {
-                grid[cpy as usize][(cpx - 1) as usize] = ('✦', Style::default().fg(Color::Yellow));
-                grid[cpy as usize][cpx as usize] = ('✸', Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD));
-                grid[cpy as usize][(cpx + 1) as usize] = ('✦', Style::default().fg(Color::Yellow));
-            } else if cpx >= 0 && cpx < width as i32 {
-                grid[cpy as usize][cpx as usize] = ('✸', Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD));
+        let sun_pt = mazzaroth::renderer::GalaxyRenderer::project_point([0.0, 0.0, 0.0], &cam, width as u16, height as u16);
+        if sun_pt.visible {
+            let cpx = sun_pt.screen_x as usize;
+            let cpy = sun_pt.screen_y as usize;
+            if cpy < height {
+                if cpx >= 1 && cpx + 1 < width {
+                    grid[cpy][cpx - 1] = ('✦', Style::default().fg(Color::Yellow));
+                    grid[cpy][cpx] = ('✸', Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD));
+                    grid[cpy][cpx + 1] = ('✦', Style::default().fg(Color::Yellow));
+                } else if cpx < width {
+                    grid[cpy][cpx] = ('✸', Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD));
+                }
             }
         }
 
         // 4. Planetary Category Systems Orbiting the Sun
-        // Each major category is a Planet with its own orbital distance, speed, and moons
         let planet_specs = [
             (cynapse_memory::graph::NodeCategory::Meta, 9.0f32, 0.045f32, 0.0f32, "Meta", Color::Green),
             (cynapse_memory::graph::NodeCategory::Engineering, 16.0f32, 0.032f32, 1.3f32, "Engineering", Color::Cyan),
@@ -3884,7 +3993,6 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             (cynapse_memory::graph::NodeCategory::Episodic, 37.0f32, 0.013f32, 5.2f32, "Episodic", Color::Rgb(140, 180, 255)),
         ];
 
-        // Group non-core nodes by category
         let mut category_nodes: std::collections::HashMap<cynapse_memory::graph::NodeCategory, Vec<&cynapse_memory::graph::Node>> = std::collections::HashMap::new();
         for node in &nodes {
             if Some(node.id.as_str()) != supermassive_id {
@@ -3893,25 +4001,21 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         }
 
         for (cat, orbit_r, speed, angle_offset, _planet_name, planet_color) in planet_specs {
-            // Planet orbital rotation around the Sun
-            let current_angle = angle_offset + yaw + self.galaxy_anim_spin * speed;
+            let current_angle = angle_offset + self.galaxy_anim_spin * speed;
             let px_3d = orbit_r * current_angle.cos();
             let pz_3d = orbit_r * current_angle.sin();
             let py_3d = 0.6 * (current_angle * 1.5).sin();
 
-            let x1 = px_3d * cos_y - pz_3d * sin_y;
-            let z1 = px_3d * sin_y + pz_3d * cos_y;
-            let y1 = py_3d * cos_p - z1 * sin_p;
-
-            let planet_px = (center_x + x1 * 0.85) as i32;
-            let planet_py = (center_y + y1 * 0.42) as i32;
-
-            // Draw Planet Glyph (Pure dot representation without overlapping text labels)
-            if planet_px >= 0 && planet_px < width as i32 && planet_py >= 0 && planet_py < height as i32 {
-                grid[planet_py as usize][planet_px as usize] = ('●', Style::default().fg(planet_color).add_modifier(Modifier::BOLD));
+            let planet_pt = mazzaroth::renderer::GalaxyRenderer::project_point([px_3d, py_3d, pz_3d], &cam, width as u16, height as u16);
+            if planet_pt.visible {
+                let px = planet_pt.screen_x as usize;
+                let py = planet_pt.screen_y as usize;
+                if py < height && px < width {
+                    grid[py][px] = ('●', Style::default().fg(planet_color).add_modifier(Modifier::BOLD));
+                }
             }
 
-            // Draw Moons (Memories belonging to this category) revolving around the Planet
+            // Draw Moons revolving around the Planet
             if let Some(nodes_in_cat) = category_nodes.get(&cat) {
                 for (idx, node) in nodes_in_cat.iter().enumerate() {
                     let moon_r = 2.2f32 + (idx as f32 % 3.0) * 1.2f32;
@@ -3922,18 +4026,15 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     let mz_3d = pz_3d + moon_r * moon_angle.sin();
                     let my_3d = py_3d + moon_r * 0.3 * moon_angle.sin();
 
-                    let mx1 = mx_3d * cos_y - mz_3d * sin_y;
-                    let mz1 = mx_3d * sin_y + mz_3d * cos_y;
-                    let my1 = my_3d * cos_p - mz1 * sin_p;
-
-                    let moon_px = (center_x + mx1 * 0.85) as i32;
-                    let moon_py = (center_y + my1 * 0.42) as i32;
-
-                    if moon_px >= 0 && moon_px < width as i32 && moon_py >= 0 && moon_py < height as i32 {
-                        // Don't overwrite the planet or sun
-                        if grid[moon_py as usize][moon_px as usize].0 == ' ' || grid[moon_py as usize][moon_px as usize].0 == '·' || grid[moon_py as usize][moon_px as usize].0 == '.' {
-                            let moon_glyph = if node.mass >= 2.0 { '✦' } else { '•' };
-                            grid[moon_py as usize][moon_px as usize] = (moon_glyph, Style::default().fg(planet_color));
+                    let moon_pt = mazzaroth::renderer::GalaxyRenderer::project_point([mx_3d, my_3d, mz_3d], &cam, width as u16, height as u16);
+                    if moon_pt.visible {
+                        let mx = moon_pt.screen_x as usize;
+                        let my = moon_pt.screen_y as usize;
+                        if my < height && mx < width {
+                            if grid[my][mx].0 == ' ' || grid[my][mx].0 == '·' || grid[my][mx].0 == '.' {
+                                let moon_glyph = if node.mass >= 2.0 { '✦' } else { '•' };
+                                grid[my][mx] = (moon_glyph, Style::default().fg(planet_color));
+                            }
                         }
                     }
                 }
@@ -4346,14 +4447,14 @@ mod tests {
         );
 
         // 1. Set pending approval
-        app.pending_approval = Some(PendingToolApproval {
-            task_id: 1,
-            bot_slug: "auditor".into(),
-            tool_name: "execute_command".into(),
-            arg1: "echo 'approved by user'".into(),
-            arg2: None,
-            response_tx: None,
-        });
+        app.pending_approval = Some(PendingToolApproval::new(
+            1,
+            "auditor".into(),
+            "execute_command".into(),
+            "echo 'approved by user'".into(),
+            None,
+            None,
+        ));
         app.modal = ActiveModal::ToolApproval;
 
         // 2. Approve via decision handler
@@ -4364,14 +4465,14 @@ mod tests {
         assert!(app.messages.iter().any(|m| m.content.contains("approved `execute_command`")));
 
         // 3. Set another pending approval and deny via decision handler
-        app.pending_approval = Some(PendingToolApproval {
-            task_id: 1,
-            bot_slug: "auditor".into(),
-            tool_name: "execute_command".into(),
-            arg1: "rm -rf /tmp/dangerous".into(),
-            arg2: None,
-            response_tx: None,
-        });
+        app.pending_approval = Some(PendingToolApproval::new(
+            1,
+            "auditor".into(),
+            "execute_command".into(),
+            "rm -rf /tmp/dangerous".into(),
+            None,
+            None,
+        ));
         app.modal = ActiveModal::ToolApproval;
 
         app.handle_approval_decision(false);
@@ -4379,6 +4480,32 @@ mod tests {
         assert_eq!(app.modal, ActiveModal::None);
         assert!(app.pending_approval.is_none());
         assert!(app.messages.iter().any(|m| m.content.contains("denied `execute_command`")));
+
+        // 4. Test interactive editing of parameters
+        let mut pending = PendingToolApproval::new(
+            2,
+            "coder".into(),
+            "write_file".into(),
+            "temp.rs".into(),
+            Some("fn main() {}".into()),
+            None,
+        );
+        pending.edit_mode = true;
+        pending.editing_arg = 0;
+        pending.edit_buffer = "src/main.rs".into();
+        pending.arg1 = pending.edit_buffer.clone();
+        pending.editing_arg = 1;
+        pending.edit_buffer = "fn main() { println!(\"edited\"); }".into();
+        pending.arg2 = Some(pending.edit_buffer.clone());
+        pending.edit_mode = false;
+
+        app.pending_approval = Some(pending);
+        app.modal = ActiveModal::ToolApproval;
+        app.handle_approval_decision(true);
+
+        assert_eq!(app.modal, ActiveModal::None);
+        assert!(app.pending_approval.is_none());
+        assert!(app.messages.iter().any(|m| m.content.contains("src/main.rs")));
     }
 
     #[test]

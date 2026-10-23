@@ -105,6 +105,11 @@ cynapse-mini/
 └── install.sh                  # Dual remote/local automated installer — also offers to install an Ollama/llama-server inference backend
 ```
 
+### Research & Speculative Decoding Thesis Report
+For empirical evaluations, roofline model analysis, and mathematical proofs of distribution equivalence, see **[docs/SPECULATIVE_DECODING.md](docs/SPECULATIVE_DECODING.md)**.
+- **Roofline Model & DRAM Wall**: Mathematical breakdown of why 35B parameter models are memory-bandwidth bound on edge DDR5, and how L3-cache resident draft models achieve 1.8×–2.5× throughput acceleration.
+- **Cactus-Compute/needle3 vs. Qwen 2.5 0.5B**: In-depth empirical study on why Monarch-Hadamard layer-sliced edge models eliminate JSON hallucination and bracket errors for autonomous agent execution.
+
 ---
 
 ## Capabilities

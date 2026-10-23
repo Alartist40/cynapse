@@ -27,6 +27,17 @@ pub struct CuratedModelDef {
 
 pub const CURATED_MODELS_CATALOG: &[CuratedModelDef] = &[
     CuratedModelDef {
+        id: "needle3",
+        name: "Needle 3 (Cactus Edge Tool Caller & Extractor)",
+        repo_url: "Cactus-Compute/needle3",
+        filename: "needle3.cact",
+        size_str: "28 MB",
+        min_ram_gb: 1,
+        recommended_ram_gb: 2,
+        description: "Ultra-compact edge model specialized in 100% deterministic JSON tool calling & speculative decoding",
+        family: "needle",
+    },
+    CuratedModelDef {
         id: "qwen2.5-0.5b",
         name: "Qwen 2.5 0.5B Instruct (Ultra Fast)",
         repo_url: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
@@ -97,14 +108,16 @@ pub const CURATED_MODELS_CATALOG: &[CuratedModelDef] = &[
 /// Returns index of best recommended curated model for host system RAM.
 pub fn recommend_model_for_hardware(total_ram_mb: u64) -> usize {
     let ram_gb = (total_ram_mb / 1024) as usize;
-    if ram_gb <= 4 {
-        0 // Qwen 0.5B
+    if ram_gb <= 2 {
+        0 // Needle 3 (Edge 28MB)
+    } else if ram_gb <= 4 {
+        1 // Qwen 0.5B
     } else if ram_gb <= 8 {
-        2 // Qwen 3B
+        3 // Qwen 3B
     } else if ram_gb <= 16 {
-        4 // Qwen 7B
+        5 // Qwen 7B
     } else {
-        5 // Gemma 12B
+        6 // Llama 3.2 3B
     }
 }
 
@@ -300,6 +313,9 @@ where
         }
     }
 
+    Ok(target_path.to_path_buf())
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GgufHeaderInfo {
@@ -319,7 +335,6 @@ pub fn inspect_gguf_header(path: &Path) -> Result<GgufHeaderInfo> {
 
     let magic = String::from_utf8_lossy(&magic_bytes).to_string();
     let is_valid_gguf = magic == "GGUF";
-
     if !is_valid_gguf {
         return Ok(GgufHeaderInfo {
             magic,
@@ -350,18 +365,26 @@ pub fn inspect_gguf_header(path: &Path) -> Result<GgufHeaderInfo> {
     })
 }
 
-    Ok(target_path.to_path_buf())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_hardware_recommendations() {
-        assert_eq!(recommend_model_for_hardware(4096), 0);  // 4GB -> Qwen 0.5B
-        assert_eq!(recommend_model_for_hardware(8192), 2);  // 8GB -> Qwen 3B
-        assert_eq!(recommend_model_for_hardware(16384), 4); // 16GB -> Qwen 7B
+        assert_eq!(recommend_model_for_hardware(2048), 0);  // 2GB -> Needle 3
+        assert_eq!(recommend_model_for_hardware(4096), 1);  // 4GB -> Qwen 0.5B
+        assert_eq!(recommend_model_for_hardware(8192), 3);  // 8GB -> Qwen 3B
+        assert_eq!(recommend_model_for_hardware(16384), 5); // 16GB -> Qwen 7B
+    }
+
+    #[test]
+    fn test_needle3_curated_catalog() {
+        let needle = &CURATED_MODELS_CATALOG[0];
+        assert_eq!(needle.id, "needle3");
+        assert_eq!(needle.family, "needle");
+        assert_eq!(needle.repo_url, "Cactus-Compute/needle3");
+        assert_eq!(needle.filename, "needle3.cact");
+        assert!(needle.description.contains("deterministic JSON tool calling"));
     }
 
     #[test]

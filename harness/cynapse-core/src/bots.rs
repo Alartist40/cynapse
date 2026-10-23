@@ -264,6 +264,42 @@ impl BotRegistry {
             fs::write(&auditor_path, content)?;
         }
 
+        let needle_path = self.base_dir.join("needle.toml");
+        if !needle_path.exists() {
+            let needle = BotProfile {
+                slug: "needle".into(),
+                display_name: "Needle Edge Specialist".into(),
+                description: "Ultra-fast deterministic tool caller and JSON extractor with zero hallucination.".into(),
+                persona_file: None,
+                model_preset: Some("needle3".into()),
+                tools_allow: vec!["read_file".into(), "grep".into(), "write_file".into()],
+                tools_deny: vec!["execute_command".into()],
+                tools_ask: Vec::new(),
+                workspace_restrict: None,
+                max_concurrent: Some(4),
+            };
+            let content = toml::to_string_pretty(&needle)?;
+            fs::write(&needle_path, content)?;
+        }
+
+        let fast_path = self.base_dir.join("fast.toml");
+        if !fast_path.exists() {
+            let fast = BotProfile {
+                slug: "fast".into(),
+                display_name: "Fast Dispatcher".into(),
+                description: "High-throughput subagent for rapid parallel read and indexing tasks.".into(),
+                persona_file: None,
+                model_preset: Some("needle3".into()),
+                tools_allow: vec!["read_file".into(), "grep".into()],
+                tools_deny: vec!["execute_command".into(), "write_file".into()],
+                tools_ask: Vec::new(),
+                workspace_restrict: None,
+                max_concurrent: Some(4),
+            };
+            let content = toml::to_string_pretty(&fast)?;
+            fs::write(&fast_path, content)?;
+        }
+
         Ok(())
     }
 
@@ -389,10 +425,12 @@ mod tests {
         let mut registry = BotRegistry::new(temp_dir.path()).unwrap();
 
         let list = registry.list();
-        assert_eq!(list.len(), 3);
+        assert_eq!(list.len(), 5);
         assert!(registry.get("coder").is_some());
         assert!(registry.get("researcher").is_some());
         assert!(registry.get("auditor").is_some());
+        assert!(registry.get("needle").is_some());
+        assert!(registry.get("fast").is_some());
 
         // Test save new custom profile
         let custom = BotProfile {
@@ -409,7 +447,7 @@ mod tests {
         };
 
         registry.save_profile(custom).unwrap();
-        assert_eq!(registry.list().len(), 4);
+        assert_eq!(registry.list().len(), 6);
         assert_eq!(registry.get("reviewer").unwrap().display_name, "Code Reviewer");
     }
 
