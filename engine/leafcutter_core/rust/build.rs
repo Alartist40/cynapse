@@ -1,3 +1,4 @@
+#[cfg(feature = "llama-ffi")]
 use std::path::Path;
 
 fn main() {

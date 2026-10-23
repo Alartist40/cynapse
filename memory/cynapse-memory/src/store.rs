@@ -298,10 +298,8 @@ impl DendriteStore {
                 row.get(0)
             })?;
         let mut ids = Vec::new();
-        for row in rows {
-            if let Ok(id) = row {
-                ids.push(id);
-            }
+        for id in rows.flatten() {
+            ids.push(id);
         }
         Ok(ids)
     }

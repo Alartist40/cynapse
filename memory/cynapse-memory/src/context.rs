@@ -208,7 +208,7 @@ fn assemble(
         .into_iter()
         .filter(|n| n.node_type == NodeType::TurnLog)
         .collect();
-    turn_nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    turn_nodes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
 
     for node in turn_nodes.iter().take(8) {
         let cleaned = clean_node_content(&node.content);
@@ -275,7 +275,7 @@ fn assemble(
         }
     } else {
         let mut all_nodes = graph.all();
-        all_nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        all_nodes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         for node in all_nodes {
             if CORE_IDS.contains(&node.id.as_str()) || node.node_type == NodeType::TurnLog {
                 continue;
@@ -306,7 +306,7 @@ fn assemble(
     let mut index_used: usize = 0;
     let index_budget = 300.min(max_tokens / 4).max(50);
     let mut remaining_nodes = graph.all();
-    remaining_nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    remaining_nodes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
 
     for node in remaining_nodes {
         if CORE_IDS.contains(&node.id.as_str())

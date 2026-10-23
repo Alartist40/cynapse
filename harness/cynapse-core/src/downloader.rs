@@ -183,7 +183,7 @@ pub async fn resolve_hf_download_url_async(input: &str, quant: &str) -> (String,
     }
 
     // 4. Standard fallback guess
-    let repo_name = repo_path.split('/').last().unwrap_or("model");
+    let repo_name = repo_path.split('/').next_back().unwrap_or("model");
     let filename = format!("{}-{}.gguf", repo_name, clean_quant);
     let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_path, filename);
     (url, filename)
@@ -217,7 +217,7 @@ pub fn resolve_hf_download_url(input: &str, quant: &str) -> (String, String) {
             .trim_start_matches("https://huggingface.co/")
             .trim_start_matches("http://huggingface.co/");
         
-        let repo_name = repo_path.split('/').last().unwrap_or("model");
+        let repo_name = repo_path.split('/').next_back().unwrap_or("model");
         let filename = format!("{}-{}.gguf", repo_name, clean_quant.to_lowercase());
         let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_path, filename);
         (url, filename)

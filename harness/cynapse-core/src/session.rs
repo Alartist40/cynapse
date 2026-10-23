@@ -30,6 +30,12 @@ pub struct SessionManager {
     pub storage_dir: PathBuf,
 }
 
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         let storage_dir = if let Some(home) = dirs::home_dir() {
@@ -98,7 +104,7 @@ impl SessionManager {
                 }
             }
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         out
     }
 

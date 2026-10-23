@@ -132,10 +132,8 @@ fn validate_safe_path(p_str: &str, for_write: bool) -> Result<PathBuf> {
         }
     }
 
-    if for_write {
-        if resolved_str == "/" || resolved_str == "/etc" || resolved_str == "/usr" || resolved_str == "/bin" || resolved_str == "/sbin" {
-            bail!("Access denied: cannot write to system directory '{}'.", p_str);
-        }
+    if for_write && (resolved_str == "/" || resolved_str == "/etc" || resolved_str == "/usr" || resolved_str == "/bin" || resolved_str == "/sbin") {
+        bail!("Access denied: cannot write to system directory '{}'.", p_str);
     }
 
     Ok(resolved)

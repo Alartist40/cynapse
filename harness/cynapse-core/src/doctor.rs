@@ -416,10 +416,8 @@ impl CynapseDoctor {
         let mut results = Vec::new();
 
         if let Some(parent) = self.dendrite_db_path.parent() {
-            if !parent.exists() {
-                if self.auto_fix {
-                    let _ = fs::create_dir_all(parent);
-                }
+            if !parent.exists() && self.auto_fix {
+                let _ = fs::create_dir_all(parent);
             }
         }
 

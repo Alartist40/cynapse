@@ -97,8 +97,17 @@ impl NodeType {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> NodeType {
-        match s {
+        s.parse().unwrap_or(NodeType::Custom)
+    }
+}
+
+impl std::str::FromStr for NodeType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "identity" => NodeType::Identity,
             "person" => NodeType::Person,
             "concept" => NodeType::Concept,
@@ -110,7 +119,7 @@ impl NodeType {
             "turn_log" => NodeType::TurnLog,
             "memory" => NodeType::Memory,
             _ => NodeType::Custom,
-        }
+        })
     }
 }
 
@@ -627,8 +636,7 @@ fn simulate_forces_inner(inner: &mut DendriteInner, iterations: usize) {
                 None => continue,
             };
 
-            for j in (i + 1)..count {
-                let id2 = &node_ids[j];
+            for id2 in &node_ids[(i + 1)..] {
                 if Some(id2) == supermassive_id.as_ref() {
                     continue;
                 }
@@ -701,8 +709,7 @@ fn simulate_forces_inner(inner: &mut DendriteInner, iterations: usize) {
                 None => continue,
             };
 
-            for j in (i + 1)..count {
-                let id2 = &node_ids[j];
+            for id2 in &node_ids[(i + 1)..] {
                 if Some(id2) == supermassive_id.as_ref() {
                     continue;
                 }
@@ -787,7 +794,7 @@ fn simulate_forces_inner(inner: &mut DendriteInner, iterations: usize) {
     pub fn all(&self) -> Vec<Node> {
         let inner = lock_inner(&self.inner);
         let mut nodes: Vec<Node> = inner.nodes.values().cloned().collect();
-        nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        nodes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         nodes
     }
 
@@ -800,7 +807,7 @@ fn simulate_forces_inner(inner: &mut DendriteInner, iterations: usize) {
             .filter(|n| n.node_type.tier() == tier)
             .cloned()
             .collect();
-        nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        nodes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         nodes
     }
 
@@ -808,7 +815,7 @@ fn simulate_forces_inner(inner: &mut DendriteInner, iterations: usize) {
     pub fn topology(&self) -> (Vec<Node>, Vec<(String, String)>) {
         let inner = lock_inner(&self.inner);
         let mut nodes: Vec<Node> = inner.nodes.values().cloned().collect();
-        nodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        nodes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
 
         let mut edges = Vec::new();
         for node in &nodes {
