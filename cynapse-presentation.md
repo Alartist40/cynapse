@@ -131,9 +131,9 @@ Cynapse ships with a **Ratatui-powered TUI** that makes local AI feel premium:
 - Amber CRT — retro terminal warmth
 - Emerald Matrix — green-on-black hacker aesthetic
 
-#### 5. The Self-Healing Doctor — 13-Subsystem Diagnostics
+#### 5. The Self-Healing Doctor — 22-Subsystem Diagnostics & Maintenance
 
-Cynapse does not just run — it **verifies its own health** across 13 subsystems:
+Cynapse does not just run — it **audits, maintains, and self-heals its entire system** across 22 subsystems:
 
 1. **Host RAM Headroom** — Ensures sufficient memory for model + KV cache
 2. **GPU & Hardware Acceleration** — Detects AMD/NVIDIA/Intel via lspci and sysfs DRM
@@ -145,11 +145,20 @@ Cynapse does not just run — it **verifies its own health** across 13 subsystem
 8. **GBNF Grammar Parser** — Verifies grammar constraint engine
 9. **Local Host Tools** — Checks for `bash`, `git` availability
 10. **Async Tokio Runtimes** — Validates async execution infrastructure
-11. **Native Engine & Model Catalog** — Confirms the Leafcutter catalog and reachable inference endpoint
-12. **Markdown Persona Subsystem** — Verifies persona files exist and are readable
-13. **Bot Registry & Agency Profiles** — Parses bot profile manifests and reports seeded specialists
+11. **Native Engine & Model Catalog** — Confirms the Leafcutter catalog
+12. **Inference Backend Reachability** — Probes active port and fails loud on disconnect
+13. **Markdown Persona Subsystem** — Verifies persona files exist and are readable
+14. **Bot Registry & Agency Profiles** — Parses bot profile manifests and reports seeded specialists
+15. **AutoHarness Lifecycle** — Audits opportunity-relative usage rates, active skill capacity, and probation shields
+16. **Acceptance Gates Engine** — Validates `GATES.md` runnable checks (`CHECK:`, `EXPECT:`, `EVIDENCE:`)
+17. **Dynamic Micro-Skill Intent Slicer** — Verifies discipline keyword triggers and $\le 35$ token bounds
+18. **Disk Output Spillover Hygiene** — Monitors `~/.cynapse/spill/` and auto-prunes stale logs
+19. **Autonomous Security Guard** — Verifies path traversal blocks, credential locks, and destructive command interception
+20. **Surgical File Patching Engine** — Executes live in-memory exact-anchor replacement tests
+21. **Verified Read Receipts Registry** — Verifies content hashing and context-window anchor deduplication
+22. **SlotManager & Cache Pinning** — Verifies multi-slot concurrency and `cache_prompt: true` slot locking
 
-**Auto-Fix Mode (`--fix`)** automatically recreates missing directories, repairs database indexes, clears stale scratch files, and updates configuration paths.
+**Auto-Fix Mode (`--fix`)** automatically recreates missing directories, scaffolds acceptance gates, repairs database schemas, clears stale spillover logs, and restores corrupted configurations.
 
 #### 6. The Persona System — Adaptive Character Through Markdown
 
@@ -1074,7 +1083,7 @@ Cynapse maintains **334 passing tests** across all workspace crates:
 - ✅ Pure Rust SlotManager with cache_prompt
 - ✅ Procedural memory (NodeType::Lesson, NodeType::Procedure)
 - ✅ Async background reflection worker (verified-turn admission)
-- ✅ Self-healing Doctor (13 subsystems)
+- ✅ Self-healing Doctor & Autonomous System Maintenance (22 subsystems with auto-fix)
 - ✅ Bot profiles, scoped subagent loop & interactive approval gates
 - ✅ `@mention` delegation, `/bots` orchestration & stall auto-cancel
 - ✅ Persona system with markdown files
