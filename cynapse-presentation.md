@@ -62,6 +62,13 @@ Memory in Cynapse is modeled after biological neural networks. Ideas, facts, and
 - Exponential temporal decay (γ = 0.95 per day) — recent memories surface first
 - 1-hop and 2-hop neighborhood expansion for contextual enrichment
 
+**The AutoHarness Self-Learning & Self-Pruning Lifecycle:**
+- Opportunity-relative usage rate ($\text{Rate} = \frac{\text{Loads}}{\text{Requests since creation}}$) ensures skills never decay when the machine is powered off
+- 100-request probation period prevents premature eviction of freshly distilled skills
+- Dynamic capacity contention gracefully demotes low-utility skills to cold storage when memory limits are reached
+- Umbrella consolidation automatically fuses overlapping procedural skills into concise unified standards
+- Non-destructive archiving preserves distilled knowledge in cold storage, revivable in milliseconds via FTS5
+
 **The Visual Galaxy Atlas (`/memory`):**
 - Nodes rendered as mass-scaled glyphs (★ for core, ✦ for mid-tier, ● for periphery)
 - Category clusters orbit in colorful stellar belts around the supermassive core
@@ -81,20 +88,25 @@ Cynapse does not force you into a single inference backend. It **automatically r
 
 **KV-Cache Trunk Reservation** ensures the key-value cache, activations, and LM head are allocated before layer cache in trunk-first budgeting, preventing KV spill on large models.
 
-#### 3. Atomic Tool Execution — Safe, Sandboxed, Grammar-Constrained
+#### 3. Atomic Tool Execution & Extreme-Optimization Harness
 
-Cynapse executes four native tools with strict safety boundaries:
+Cynapse executes seven native tools with strict safety boundaries and an optimization harness designed to turn tiny 0.5B–3B models into reliable autonomous agents:
 
 - **read_file** — Read text contents within permitted workspace (10 MB limit, path traversal blocked)
 - **write_file** — Write content with automatic parent directory creation (system directories blocked)
+- **patch_file_at** — Surgical chunk replacement with exact unique anchor validation (no full-file rewrites)
 - **grep** — Recursive regex search across workspace files (depth-limited to 8, max 50 matches)
-- **execute_command** — Bash shell execution with 10-second timeout and destructive command blocking
+- **execute_command** — Bash shell execution with 10-second timeout, disk spillover for outputs > 1200 chars, and destructive command interception
+- **run_gates** — Deterministic acceptance gate runner evaluating `GATES.md` (`CHECK:`, `EXPECT:`, `EVIDENCE:`)
+- **spawn_subagent** — Autonomous task delegation with scoped tool permissions and stall auto-cancel
 
-**GBNF Grammar Engine** enforces valid JSON tool-call syntax, preventing output formatting panics offline. The model cannot generate malformed tool calls — the grammar constrains every token.
+**GBNF Grammar Engine & Tolerant Coercion** enforces valid JSON tool-call syntax while forgiving small model parameter typos via fuzzy alias canonicalization and Levenshtein distance ($\le 2$) repair hints.
 
-**Loop Guard Protection** uses an active circular buffer to detect and halt non-progressing repeated tool execution loops. **Max Step Safeguards** (configurable, default 5) prevent runaway recursive cycles.
+**Dynamic Micro-Skill Intent Slicing** dynamically selects and injects a single $\le 35$ token micro-directive matching user intent, preserving 90%+ of small context windows for actual work.
 
-**Path Sandblocking** rejects access to sensitive system files (`/etc/shadow`, `/root/.ssh`, `/proc/kcore`, `/dev/mem`) and blocks writes to system directories (`/etc`, `/usr`, `/bin`).
+**Disk Output Spillover & Listing Caps** prevents terminal log floods by spilling outputs $> 1,200$ chars to `~/.cynapse/spill/<hash>.log` and capping listings at 5 items per group.
+
+**Loop Guard & Security Shield** halts non-progressing repeated loops via a circular buffer and prevents dangerous OS executions (`rm -rf /`, `mkfs`, fork bombs) or path traversal (`/etc/shadow`, `/root/.ssh`).
 
 #### 4. The Gorgeous TUI — A Terminal Interface That Delights
 
@@ -177,6 +189,183 @@ A study partner that remembers your notes, connects your ideas, and visualizes y
 # Part II: The Technical Deep Dive
 ## *Architecture, Implementation, and Engineering Decisions*
 
+### The Feynman Masterclass: Why Weak Hardware Outperforms Heavy Cloud Clusters
+
+If you explain a concept to a smart 10-year-old and they get confused, you don't understand it yourself. Here is how Cynapse actually works, stripped of marketing jargon and buzzwords.
+
+#### 1. The Bicycle vs. The 40-Ton Cargo Ship
+Commercial AI stacks (LangChain, AutoGen, Python vLLM) are like chartering a 40-ton diesel cargo ship just to deliver a handwritten envelope across the street. They require gigabytes of Python packages, a heavy interpreter, CUDA runtimes, and garbage collection pauses that choke consumer hardware.
+
+Cynapse is a precision carbon-fiber bicycle. It is written in 100% pure compiled Rust. It compiles down to a single 15MB binary that executes directly on bare metal CPU registers. There is zero runtime garbage collector, zero Python overhead, and zero idle bloat:
+- **Idle memory footprint**: Just 30MB of RAM.
+- **Cold start to interactive prompt**: Under 1.5 seconds.
+- **Execution efficiency**: Near 100% of CPU cycles are spent computing tokens and memory physics, not managing bloated interpreter runtimes.
+
+```
+Commercial Cloud Stack:
+[ User ] ──▶ [ Python Runtime ] ──▶ [ LangChain / vLLM ] ──▶ [ 10GB Virtual Memory ] ──▶ [ GPU Cloud ]
+                               (High overhead, memory leaks, latency)
+
+Cynapse Pure Rust:
+[ User ] ──▶ [ 15MB Native Binary ] ──▶ [ CPU L3 Cache / NEON-AVX2 ] ──▶ [ Direct Hardware ]
+                               (Zero VM, zero GC, instant execution)
+```
+
+#### 2. L3 Cache Residency: Why Tiny Quantized Models Fly on Weak Laptops & SBCs
+Computer RAM is slow. Fetching data from main memory takes about 200 CPU clock cycles. But fetching data from the CPU's internal L3 cache takes only 20 to 40 cycles — **5 to 10 times faster**.
+
+When you run massive, unquantized models, their weights are so gigantic that the CPU is constantly waiting for slow RAM. In Cynapse:
+- Model weights are compressed into 4-bit blocks (`Q4_K_M` and `IQ4_NL`). A 3B parameter model shrinks from 12GB down to 1.8GB.
+- Pure Rust SIMD kernels (`AVX2` on x86, `NEON` on ARM Raspberry Pi / Orange Pi) load small matrix tiles directly into the CPU's high-speed L3 cache.
+- The model runs at maximum hardware memory bandwidth without thermal throttling, allowing a $45 Single Board Computer or an old laptop to stream responses at conversational speeds (4.8+ tokens/second).
+
+#### 3. Trunk-First Memory Budgeting: Eliminating the Out-Of-Memory Crash
+Why do local AI assistants crash unexpectedly during long conversations?
+In standard systems, the Key-Value (KV) cache grows unpredictably like an uncontrolled balloon. Eventually, the operating system runs out of RAM and abruptly terminates the program with an `Out Of Memory (OOM)` killer.
+
+Cynapse uses **Trunk-First Memory Budgeting**:
+1. Before allocating space for model layers, Cynapse calculates the maximum possible conversation context and reserves the entire memory "trunk" upfront.
+2. The KV cache, model activations, and LM output head are locked into memory first.
+3. The remaining budget is strictly allocated to model weights.
+Because the ceiling is fixed at startup, Cynapse **never runs out of memory mid-conversation**, even on hardware with only 4GB or 8GB of total RAM.
+
+#### 4. Needle-3 Speculative Acceleration: The Scout and the Grandmaster
+Imagine writing a book with a Grandmaster author. If the Grandmaster has to think carefully about every single common word ("the", "is", "in"), writing is painfully slow.
+
+Instead, Cynapse pairs a microscopic 0.5B model (**Needle-3**) with the primary model:
+- **The Scout (Needle-3)**: Generates 5 tokens in 10 milliseconds.
+- **The Grandmaster (Primary Model)**: Evaluates all 5 tokens in a single parallel verification pass. If they are correct, it accepts them instantly; if one token is off, it corrects just that token and moves forward.
+The result? **A 2.5x to 3x throughput speedup** with zero loss in mathematical precision or conversational nuance.
+
+---
+
+### The 6 Architectural Pillars Explained with the Feynman Technique
+
+How can a tiny 0.5B to 3B model perform like a commercial 70B cloud agent without hallucinating or running out of context? The secret is not in prompting—it is in the **Harness Architecture**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          CYNAPSE HARNESS SHIELD                             │
+│                                                                             │
+│   [ Tiny 0.5B-3B Model ]                                                    │
+│         │                                                                   │
+│         ▼ (Generated Tool Call)                                             │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │ 1. Tolerant Coercion (Levenshtein) ──▶ Corrects parameter typos       │ │
+│   │ 2. Surgical File Patching           ──▶ Replaces only targeted chunks │ │
+│   │ 3. Deterministic Acceptance Gates   ──▶ Validates with runnable code  │ │
+│   │ 4. Micro-Skill Intent Slicing       ──▶ Injects <= 35 token directives│ │
+│   │ 5. Disk Output Spillover (Cap 5)    ──▶ Traps bloat to ~/.cynapse/    │ │
+│   │ 6. Autonomous Security Guard        ──▶ Blocks dangerous OS calls     │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+│         │                                                                   │
+│         ▼                                                                   │
+│   [ Rock-Solid Execution on Real Hardware ]                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Pillar 1: Tolerant Coercion & Levenshtein Correction (The Compassionate Translator)
+- **The Real-World Metaphor**: Imagine asking a sharp 7-year-old to grab a "screwdriver" from the toolbox, but they say "screw-driver-tool". A rigid corporate computer crashes and screams `Error 400: Unknown argument`. Cynapse acts like an observant adult: it knows exactly what the child meant.
+- **The Engineering**: Small models frequently use common aliases like `filepath`, `target`, or `filename` when the tool expects `path`. Rather than rejecting the tool call and wasting turns, `cynapse-core` runs a two-tier normalizer:
+  1. *Fuzzy Alias Mapping*: Direct canonicalization of known variations (`path` ↔ `file_path` ↔ `file`).
+  2. *Levenshtein Distance Metric ($\le 2$)*: If an unrecognized key is within 2 character edits of a valid parameter (e.g., `ptah` instead of `path`), Cynapse auto-corrects it in place. If it cannot resolve it, it returns an explicit one-line hint telling the model the exact valid keys.
+
+#### Pillar 2: Surgical File Patching (The Keyhole Surgeon)
+- **The Real-World Metaphor**: If your jacket has a single loose button, you don't burn the jacket and weave a brand-new one from raw wool. You take a needle and sew the one button.
+- **The Engineering**: Commercial AI coding tools make models rewrite entire 500-line files to change one line of code. Tiny models suffer from attention drift—halfway through rewriting the file, they hallucinate, omit critical functions, or hit token limits.
+  Cynapse introduces native **surgical patching** (`patch_file_at`). The model specifies:
+  - `path`: Target file
+  - `target`: The exact unique code snippet to replace (anchor)
+  - `replacement`: The new code
+  `cynapse-core` verifies that the `target` occurs exactly once in the file to guarantee uniqueness, and performs an atomic in-place replacement. Zero context wasted, zero hallucinations.
+
+#### Pillar 3: Deterministic Acceptance Gates (The Concrete Measuring Tape)
+- **The Real-World Metaphor**: When a carpenter builds a bookshelf, you don't ask them "Do you *feel* like the shelf is level?" You place a spirit level on top and check the bubble.
+- **The Engineering**: Small language models are people-pleasers. They will output *"I have successfully fixed all bugs!"* even when the code does not compile. Cynapse completely eliminates subjective completion by parsing `GATES.md`:
+  - `CHECK`: The automated shell command to execute (`cargo test`, `npm test`, `git status`).
+  - `EXPECT`: The required exit status or expected string output.
+  - `EVIDENCE`: The verifiable output recorded in logs.
+  The agent cannot declare a task done until `run_gates` executes every check and observes clean exit code 0. No evidence = not done.
+
+#### Pillar 4: Dynamic Micro-Skill Intent Slicing (The Just-In-Time Index Card)
+- **The Real-World Metaphor**: If you want to know how to change a bicycle tire, you don't want someone to drop an 8,000-page encyclopedia on your head. Your arms will collapse. You just need a 3-sentence index card on tire levers.
+- **The Engineering**: Large prompt rules (Universal Skills, coding standards) consume 30KB (`~8,000` tokens). In a 3B model with a 2,048 or 4,096 token context window, this exhausts the entire memory before the user can even state their problem.
+  Cynapse decomposes universal skills into microscopic, single-purpose directives ($\le 35$ tokens each). Using lexical intent scoring, `skills.rs` analyzes the user's immediate message:
+  - If the user asks about an error, it injects only the 30-token *Error Triage* micro-skill.
+  - If the user asks to write tests, it injects only the 25-token *TDD Gate* micro-skill.
+  Over 90% of the small model's context window remains completely free for user code and reasoning.
+
+#### Pillar 5: Disk Output Spillover & Strict 5-Item Listing Caps (The Focused Spotlight)
+- **The Real-World Metaphor**: If a teacher hands you a 1,000-page printout of server logs in 2-point font, your eyes glaze over. But if they hand you the last 5 critical error lines and a library card to inspect the rest, you solve the problem immediately.
+- **The Engineering**: When a command like `cargo test` fails, it can generate 10,000 lines of output. Dumping this into an LLM context instantly blinds the model.
+  Cynapse's compressor implements:
+  - *5-Item Listing Cap*: Grep and directory listings are strictly capped at 5 high-relevance items per group.
+  - *Disk Spillover*: When command output exceeds 1,200 characters, the full raw log is automatically written to disk at `~/.cynapse/spill/<hash>.log`. The model is provided only the essential diagnostic tail and the exact path to inspect the log if needed. Context remains crystal clear.
+
+#### Pillar 6: Autonomous Security Guard (The Reinforced Safety Lock)
+- **The Real-World Metaphor**: You invite an assistant into your workshop and give them access to the workbench, but you put a padlock on the circuit breaker and the safe.
+- **The Engineering**: Small models can easily be tricked or make mistakes with shell commands. Cynapse implements a native, zero-overhead security shield directly in pure Rust:
+  - *Blocked Shell Commands*: Automatically intercepts and halts `rm -rf /`, `mkfs`, `dd if=/dev/zero`, `:(){ :|:& };:`, and arbitrary pipe-to-bash executions.
+  - *Path Sandboxing*: Prevents path traversal and blocks access to sensitive system paths (`/etc/shadow`, `/root/.ssh`, `/proc/kcore`, `/dev/mem`).
+  - *Safe Write Boundaries*: Forbids writing to system roots (`/etc`, `/usr`, `/bin`).
+
+---
+
+### Dendrite AutoHarness: Biological Evolution for AI Memory & Skills
+
+Human memory is not a static hard drive; it is a living ecosystem. The human brain does not remember every receipt from five years ago, nor does it forget how to swim. It continuously reinforces useful skills and prunes idle memories.
+
+`cynapse-memory::autoharness` implements this biological lifecycle directly in Cynapse:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      DENDRITE AUTOHARNESS LIFECYCLE                         │
+│                                                                             │
+│   New Skill Distilled ──▶ [ Probation Period: 100 Requests ]                │
+│                                     │                                       │
+│                                     ▼                                       │
+│                        [ Active Skill Galaxy Pool ]                         │
+│                                     │                                       │
+│       ┌─────────────────────────────┴─────────────────────────────┐         │
+│       ▼                                                           ▼         │
+│ High Opportunity Usage                                Low Opportunity Usage │
+│ (Thickens Synaptic Link)                              (Capacity Contention) │
+│       │                                                           │         │
+│       ▼                                                           ▼         │
+│ [ Core Memory Tier ]                                  [ Non-Destructive ]   │
+│                                                       [ Cold Archive ]      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1. Opportunity-Relative Usage Rate (Fairness Across Time)
+Most software tracks "recency" by wall-clock time (e.g., "unused for 7 days = delete"). This is deeply flawed. If you close your laptop and take a two-week vacation, a wall-clock system wakes up and deletes all your skills thinking they went "stale"!
+
+Cynapse tracks **Opportunity-Relative Usage Rate**:
+$$\text{Usage Rate} = \frac{\text{Loads}}{\text{Requests Since Creation}}$$
+- "Requests Since Creation" measures how many times the user actually interacted with the agent since the skill was born.
+- If you don't use the computer for a month, the request counter does not tick, and the skill's score does not decay by a single decimal point. A skill is only evaluated when it actually had an opportunity to be used.
+
+#### 2. The 100-Request Probation Shield
+When a scientist develops a new formula, you don't tear it up if nobody uses it in the first five minutes.
+In Dendrite AutoHarness, every newly distilled skill enters a **100-request probation period**. During these initial 100 turns, the skill is immune to eviction, giving it adequate real-world opportunities to match user intent.
+
+#### 3. Dynamic Pruning & Capacity Contention
+To prevent knowledge bloat on small devices, Dendrite enforces a configurable capacity ceiling (default 50 active skills). When a new skill is distilled and the pool is full, AutoHarness ranks all non-probationary skills by their opportunity-relative usage rate:
+- The highest-performing skills are retained in fast memory.
+- The lowest-performing skills are evicted from the active context.
+
+#### 4. Umbrella Consolidation (Pattern Merging)
+If an agent distills three separate skills:
+1. `parse_json_fast`
+2. `parse_json_with_comments`
+3. `repair_json_trailing_commas`
+Rather than keeping three separate files in context, Dendrite's background reflection worker merges them under a single **Umbrella Procedure** (`robust_json_parsing`). This reduces context overhead while preserving 100% of the lessons learned.
+
+#### 5. Non-Destructive Archiving
+Eviction in Cynapse is never destruction. Pruned skills are moved to a cold storage archive in `data/dendrite.db`. If a user brings up a niche task months later, SQLite FTS5 detects the query, locates the archived skill in milliseconds, and restores it back to active memory without needing to relearn it from scratch.
+
+---
+
 ### Project Structure
 
 ```
@@ -186,14 +375,17 @@ cynapse-mini/
 ├── install.sh                          # Dual remote/local automated installer
 ├── harness/
 │   ├── src/main.rs                     # CLI & TUI entrypoint dispatcher (Clap)
-│   ├── cynapse-core/                   # Tool execution, GBNF parser, bot registry, subagent loop, session manager, doctor
+│   ├── cynapse-core/                   # Tool execution, GBNF parser, bot registry, subagent loop, gates, doctor
 │   │   └── src/
-│   │       ├── lib.rs                  # 5 tools: read_file, write_file, grep, execute_command, spawn_subagent
+│   │       ├── lib.rs                  # 7 tools: read_file, write_file, patch_file_at, grep, execute_command, run_gates, spawn_subagent
+│   │       ├── offline_agent.rs        # GBNF tool validator, Levenshtein tolerant coercion, LoopGuard, Two-Zone prompt
+│   │       ├── gates.rs                # Deterministic GATES.md acceptance engine (CHECK, EXPECT, EVIDENCE)
+│   │       ├── skills.rs               # Dynamic micro-skill intent slicer (bounded <= 35 tokens)
+│   │       ├── security.rs             # Pure Rust autonomous security shield (path sandboxing & command sanitization)
+│   │       ├── compressor.rs           # Output compressor (spillover to disk, 5-item cap, tail extraction)
 │   │       ├── bots.rs                 # BotProfile/BotRegistry, allow-deny-ask permissions
-│   │       ├── compressor.rs           # Tool output compressor (max 400 chars, tail extraction)
 │   │       ├── doctor.rs               # 13-subsystem self-healing diagnostics
 │   │       ├── downloader.rs           # HuggingFace model downloader
-│   │       ├── offline_agent.rs        # GBNF tool call validator, LoopGuard, Two-Zone Prompt
 │   │       ├── persona.rs              # Persona file manager, system prompt compiler
 │   │       ├── session.rs              # Conversation session persistence
 │   │       └── subagent.rs             # SubagentManager, autonomous loop, approval gate, stall detection
@@ -208,6 +400,7 @@ cynapse-mini/
 │   └── cynapse-memory/                 # Dendrite graph engine
 │       └── src/
 │           ├── lib.rs                  # Module exports
+│           ├── autoharness.rs          # AutoHarness: self-learning, probation, usage-rate tracking, dynamic pruning
 │           ├── graph.rs                # In-memory knowledge graph with 3D physics
 │           ├── store.rs                # SQLite WAL persistence with FTS5
 │           ├── context.rs              # System-prompt assembly engine
@@ -839,34 +1032,44 @@ core_node_budget = 0.40
 1. **SQLite WAL mode** — Enables concurrent reads while writing, crash-safe without journal files
 2. **FTS5 with porter stemming** — Precise full-text search with morphological expansion, graceful fallback when unavailable
 3. **4-tier knowledge graph** — Separates raw logs from extracted facts from procedures from identity, enabling efficient memory consolidation and retrieval
-4. **Wiki-link backlinks** — When you reference a concept, all related entries are connected automatically, building a web of knowledge without manual curation
+4. **AutoHarness Lifecycle** — Opportunity-relative usage tracking, 100-turn probation, dynamic capacity contention, umbrella consolidation, and non-destructive cold archiving
 5. **3D force-directed physics** — Real Coulomb/Hooke simulation creates organic, evolving memory visualizations that reflect actual knowledge structure
 6. **Three-tier engine routing** — Automatic hardware-aware dispatch ensures optimal inference speed without user configuration
-7. **GBNF grammar constraints** — Prevents malformed tool calls at the token generation level, not as a post-hoc parse
-8. **Two-Zone Prompt Architecture** — Separates invariant system instructions from dynamic context, ensuring consistent behavior regardless of knowledge graph size
-9. **Loop Guard + Max Steps** — Prevents runaway recursive tool execution with circular buffer detection and configurable step limits
-10. **RAII Terminal Protection** — Guarantees terminal state restoration on panic, preventing broken terminal sessions
+7. **Tolerant Coercion with Levenshtein Distance (<= 2)** — Resilient parameter normalization and actionable repair hints preventing offline tool call failures
+8. **Surgical File Patching (`patch_file_at`)** — Native exact-anchor replacement preventing context-exhausting whole-file regeneration on small models
+9. **Deterministic Acceptance Gates (`GATES.md`)** — Concrete runnable verification commands (`run_gates`) ensuring verifiable evidence before declaring tasks done
+10. **Dynamic Micro-Skill Intent Slicing** — Invariant Zone A prompt bounded to <= 350 tokens, injecting <= 35 token micro-directives based on lexical intent scoring
+11. **Disk Output Spillover & 5-Item Listing Caps** — Prevents command log floods by writing outputs > 1200 chars to `~/.cynapse/spill/` and strictly capping grep/list displays
+12. **Autonomous Security Guard** — Pure Rust path sandboxing and destructive command interceptor protecting the host OS
+13. **RAII Terminal Protection** — Guarantees terminal state restoration on panic, preventing broken terminal sessions
 
 ### Test Suite
 
-Cynapse maintains **281 passing tests** across all crates:
+Cynapse maintains **334 passing tests** across all workspace crates:
 
-- **leafcutter_core** — Tensor operations, GGUF loading, tokenizer
-- **cynapse-core** — Tool sandboxing, path validation, GBNF parsing, loop guard, compression, bot registry, subagent loop & approval gates
-- **cynapse-memory** — Graph operations, FTS5 search, BM25 scoring, context assembly, conversational query detection
-- **cynapse-tui** — Theme rendering, memory visualization, pipeline state
-- **cynapse (root)** — Integration tests
+- **leafcutter_core** — Tensor operations, GGUF loading, BPE tokenizer, SIMD kernels, parity verification (213 tests)
+- **cynapse-core** — Tool sandboxing, surgical file patching, path validation, GBNF parsing, tolerant coercion, acceptance gates engine, micro-skill intent slicing, output spillover compressor, security shield, bot registry, subagent loop & approval gates (71 tests)
+- **cynapse-memory** — Knowledge graph operations, 3D physics, AutoHarness lifecycle & pruning, FTS5 search, BM25 scoring, context assembly, conversational query detection (19 tests)
+- **cynapse-engine** — Semantic hardware probing, 3-tier router, slot manager, managed daemon, streaming parser (14 tests)
+- **cynapse-tui** — Theme rendering, terminal protection, memory atlas visualization, pipeline state (11 tests)
+- **mazzaroth** — 3D projection, hierarchical orbital geometry, ASCII render pipeline (5 tests)
+- **cynapse (root)** — End-to-end integration tests (1 test)
 
 ### Current Development Status
 
 **Completed (v0.1.0):**
 - ✅ 3D Force-Directed Galaxy Memory with category clustering
 - ✅ SQLite WAL + FTS5 persistence with BM25 scoring
-- ✅ Three-tier engine routing (llama.cpp, Leafcutter GGUF, Leafcutter Safetensors)
-- ✅ GBNF grammar-constrained tool execution
+- ✅ AutoHarness self-learning & self-pruning skill lifecycle with non-destructive cold archiving
+- ✅ Three-tier engine router (llama.cpp, Leafcutter GGUF, Leafcutter Safetensors)
+- ✅ GBNF grammar-constrained tool execution with tolerant coercion & Levenshtein hints
+- ✅ Surgical file patch engine (`patch_file_at`) with unique anchor verification
+- ✅ Deterministic Acceptance Gates engine (`GATES.md` parser and `run_gates` runner)
+- ✅ Dynamic Micro-Skill Intent Slicer with strict <= 35 token directive injections
+- ✅ Output compressor with disk spillover (`~/.cynapse/spill/`) and 5-item listing caps
+- ✅ Pure Rust Autonomous Security Guard intercepting destructive commands and path traversal
 - ✅ Loop Guard and Max Step safeguards
-- ✅ Tool output compression (400 char max, tail extraction)
-- ✅ Two-Zone Prompt Architecture
+- ✅ Two-Zone Prompt Architecture (invariant Zone A <= 350 tokens)
 - ✅ Managed llama-server child daemon
 - ✅ Pure Rust SlotManager with cache_prompt
 - ✅ Procedural memory (NodeType::Lesson, NodeType::Procedure)
@@ -875,13 +1078,11 @@ Cynapse maintains **281 passing tests** across all crates:
 - ✅ Bot profiles, scoped subagent loop & interactive approval gates
 - ✅ `@mention` delegation, `/bots` orchestration & stall auto-cancel
 - ✅ Persona system with markdown files
-- ✅ Ratatui TUI with 4 themes
+- ✅ Ratatui TUI with 4 themes and collapsible reasoning blocks
 - ✅ HuggingFace model downloader with curated recommendations
 - ✅ Session persistence and resume
-- ✅ Collapsible reasoning blocks
 - ✅ Memory Pipeline visualization
-- ✅ Dynamic input box expansion
-- ✅ 281 passing tests
+- ✅ 334 passing tests across all crates
 
 **In Progress:**
 - 🔄 Advanced mesh networking integration

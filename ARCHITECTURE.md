@@ -157,6 +157,15 @@ Fire-and-forget reflection worker:
 - Persists to Dendrite graph and SQLite store
 - Never blocks the TUI event loop
 
+### Dendrite AutoHarness Lifecycle
+
+Self-learning and dynamic skill pruning engine (`cynapse-memory::autoharness`):
+- **Opportunity-Relative Usage Rate**: Tracks $\frac{\text{Loads}}{\text{Requests since creation}}$ rather than wall-clock time, preventing unfair decay during downtime or power-off.
+- **Probation Shield**: Configurable grace period (default 100 turns) during which new skills cannot be evicted.
+- **Dynamic Capacity Contention**: Enforces maximum active skill capacity (default 50); evicts lowest-performing mature skills when pool saturates.
+- **Umbrella Consolidation**: Fuses overlapping procedures sharing common prefixes/tags into cohesive procedural units.
+- **Non-Destructive Archiving**: Moves demoted skills to SQLite cold storage for instant FTS5 revival if identical problems recur.
+
 ### Verified Read Receipts
 
 Token-saving mechanism for repeated file reads within a turn:
