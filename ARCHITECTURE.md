@@ -18,12 +18,15 @@ cynapse-mini/
 │   │       └── theme.rs            # Color theme definitions
 │   └── cynapse-core/                # Core agent logic
 │       └── src/
-│           ├── lib.rs               # Tool definitions (with concurrency_safe), path validation, execute_command, partition_tool_calls
-│           ├── offline_agent.rs     # GBNF tool call validation, Zone A/B prefix compilation, LoopGuard, ToolLoopTracker
+│           ├── lib.rs               # Tool definitions (patch_file, run_gates), path validation, execute_tool_call, partition_tool_calls
+│           ├── offline_agent.rs     # GBNF tool call validation, argument coercion, Levenshtein hints, Zone A/B compilation, LoopGuard
+│           ├── gates.rs             # Acceptance gate parser & runner (GATES.md CHECK/EXPECT/EVIDENCE verification)
+│           ├── skills.rs            # Universal Skill in-memory synthesis & dynamic micro-directive intent slicer
+│           ├── security.rs          # Autonomous Security Shield (pre-flight AST/heuristic vulnerability linter)
 │           ├── receipts.rs          # ReadReceiptRegistry, receipt_checked_read (verified read receipts)
 │           ├── bots.rs              # BotProfile/BotRegistry, allow-deny-ask permissions, workspace confinement
 │           ├── subagent.rs          # SubagentManager, run_subagent_loop, approval_fn channel, stall detection
-│           ├── compressor.rs        # Tool output compression (max 400 chars)
+│           ├── compressor.rs        # Tool output compression, 5-item listing caps, disk spillover
 │           ├── persona.rs           # Persona file management
 │           ├── session.rs           # Session persistence
 │           └── doctor.rs            # System health diagnostics

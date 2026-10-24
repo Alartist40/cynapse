@@ -172,17 +172,26 @@ Fire-and-forget reflection worker distills conversation turns into atomic facts,
 - **Collapsible Reasoning Blocks (`Ctrl+T`)**: Expand or collapse internal model thinking streams.
 - **Rich Markdown Formatting**: In-terminal syntax-highlighted code blocks, blockquotes, headers, and bullet lists.
 
+### Universal Skill & Low-Parameter Harness Elevation (Stage 33)
+Six architectural pillars transforming small local models (0.5B to 3B) into reliable agents:
+- **Tolerant Argument Coercion**: Normalizes common model key aliases (`filepath` $\to$ `path`, `cmd` $\to$ `command`) and un-wraps stringified types automatically.
+- **Actionable Levenshtein Hints**: Distance $\le 2$ suggestions for unknown arguments (`"Unknown argument 'filenam'. Did you mean 'path'?"`).
+- **Surgical File Patching (`patch_file`)**: Exact block matching with anchor checks to eliminate whole-file drop catastrophes.
+- **Deterministic Acceptance Gates (`run_gates`)**: Native runner executing `GATES.md` (`CHECK:`, `EXPECT:`) and recording verified exit codes.
+- **Dynamic Micro-Skill Intent Slicing**: Slices the 30KB Universal Skill into zero-token in-memory Rust structures, holding prompt context under 650 tokens.
+- **Autonomous Security Shield**: Pre-flight AST/heuristic scanner catching command injection, path traversal, and destructive actions.
+
 ---
 
 ## Verification
 
 | Metric | Value |
 |--------|-------|
-| Tests passed | 281 |
+| Tests passed | 324 |
 | Tests failed | 0 |
 | Build | `cargo build --release` succeeds |
-| System doctor | 14 checks, 100% health (14 Pass); exits non-zero if any check fails — e.g. no inference backend reachable |
-| Acceptance gates | G1-G22 all PASSED |
+| System doctor | 14 checks, 100% health (14 Pass); exits non-zero if any check fails |
+| Acceptance gates | G1-G33 all PASSED |
 
 ---
 

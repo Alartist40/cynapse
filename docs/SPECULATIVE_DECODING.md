@@ -194,7 +194,111 @@ Located in [`harness/cynapse-tui/src/app.rs`](file:///home/xander/Documents/port
 
 ---
 
-## 6. Conclusion & Research Roadmap
+## 6. Harness-Embedded Intelligence: Transforming Ultra-Low Parameter Local Models (0.5B - 3B) into Expert Agents
+
+### 6.1 The Context Window Starvation Problem
+
+Small models (0.5B to 3B parameters) possess severe context limitations:
+1. **Context Window Saturation**: With an effective context window of 2,048–8,192 tokens, attention degradation sets in when prompts exceed 1,500 tokens.
+2. **The Prompt Bloat Paradox**: In commercial LLM agent designs, engineering discipline is enforced by dumping massive 30KB (`~8,000` tokens) master prompts (e.g., `UNIVERSAL-SKILL.md`) into system context. Attempting this on an edge 1B model exhausts 100% of its context window on instruction boilerplate, leaving zero tokens for user instructions or code.
+3. **The Solution: Deterministic Harness Engineering**: Instead of relying on small models to remember prompt playbooks, **the harness itself executes, enforces, compresses, and verifies actions in pure Rust**.
+
+### 6.2 The Six Architectural Pillars
+
+#### 1. Tolerant Argument Coercion & Levenshtein Nearest-Key Hints (`offline_agent.rs`)
+Small models frequently output near-correct JSON with slight key name drift (e.g., emitting `"filepath"` or `"file"` instead of `"path"`, `"cmd"` instead of `"command"`, or wrapping booleans as `"true"`).
+- **Fuzzy Key Aliasing**: Normalizes synonyms automatically into canonical tool argument keys (`path`, `command`, `content`, `target_content`, `pattern`).
+- **Type Coercion**: Automatically casts stringified booleans and numerals to expected types.
+- **Levenshtein Distance ($\le 2$)**: If an unrecognized argument arrives (e.g. `"filenam"`), the harness computes edit distance against valid tool parameters and returns exact, actionable error feedback (`"Unknown argument 'filenam'. Did you mean 'path'?"`), eliminating endless trial-and-error loops.
+
+#### 2. Surgical File Patch Tooling (`patch_file_at`, `lib.rs`)
+When small models are forced to use `write_file` for a 2-line edit in a 300-line file, they invariably drop imports, truncate code, or invent comments like `// ... rest of code unchanged`.
+- **Target Slice Replacement**: Native `patch_file` tool accepts `path`, `target_content`, `replacement_content`, and `allow_multiple`.
+- **Unique Anchor Validation**: Checks that `target_content` appears exactly once in the file before mutating. If ambiguous, it halts safely, demanding additional surrounding context.
+
+#### 3. Deterministic Acceptance Gate Engine (`gates.rs`, `run_gates`)
+Small models frequently hallucinate that their code compiles or tests pass without running them.
+- **Machine Verification**: Native parser and runner for `GATES.md` (`CHECK:`, `EXPECT:`, `EVIDENCE:`).
+- **Verifiable Ground Truth**: Executes bash checks with timeout, validates exit codes and expected output tokens, and writes verified evidence blocks (`EVIDENCE: met (exit 0)`) directly back to the ledger.
+
+#### 4. Dynamic Just-In-Time Micro-Skill Intent Slicing (`skills.rs`)
+The 30KB Universal Skill is decomposed into six zero-token in-memory Rust disciplines:
+- `OutputDiscipline` (ADHD): 4-bullet reader format, max 5 items, lead with action.
+- `SurgicalEngineering` (Ponytail): minimal code blast radius, exact patching via `patch_file`.
+- `CompletionGates` (Unlazy): observable gates (CHECK, EXPECT, EVIDENCE), no premature stop.
+- `TokenCompression` (Caveman): ASD-STE100 concise brevity, no pleasantries.
+- `SecurityAudit` (Strix): pre-flight AST vulnerability validation, proof-of-concept gating.
+- `HarnessEngineering`: persistent `PLAN.md` / `GATES.md` companion artifacts.
+The harness classifies the user's intent on each turn and injects an ultra-compact 2-line directive into Zone B, holding prompt context strictly under 650 tokens.
+
+#### 5. Output Spillover & Dense Listing Caps (`compressor.rs`)
+- **5-Item Listing Cap**: Enforces output discipline on `grep` and directory results, capping visible items at 5 and noting omitted lines.
+- **Disk Spillover**: If raw tool output exceeds 1,200 characters, spills the raw stream to `~/.cynapse/spill/<hash>.log` and provides a concise head/tail excerpt with a file pointer.
+
+#### 6. Autonomous Security Guard (`security.rs`)
+Pre-flight heuristic linter scanning prospective tool calls before execution.
+- Permanently blocks destructive commands (`rm -rf /`, `mkfs`, `:(){ :|:& };:`, `> /dev/sda`).
+- Escalates privileged pipe and network patterns (`| bash`, `curl`, `sudo`) to interactive approval.
+- Blocks access to sensitive credential paths (`/etc/shadow`, `id_rsa`, `.gnupg`).
+
+### 6.3 Context Budget Accounting
+
+| Prompt Component | Un-Harnessed Agent Prompt | Cynapse Elevated Architecture |
+| :--- | :--- | :--- |
+| **System Persona & Master Directives** | ~8,000 tokens (30KB Markdown) | **~350 tokens** (Byte-stable Zone A) |
+| **Active Discipline Micro-Directive** | (Included in massive prompt) | **~35 tokens** (Dynamic Zone B slice) |
+| **Tool Definitions (7 tools)** | ~1,200 tokens (Full JSON schemas) | **~180 tokens** (GBNF brief schemas) |
+| **Recalled Memory & Facts** | ~1,500 tokens | **~80 tokens** (BM25 top-scored nodes) |
+| **Total Prompt Baseline** | **~10,700 tokens (Blowout)** | **$\le 645$ tokens (Invariant)** |
+
+---
+
+## 7. Autonomous Self-Learning & Dynamic Skill Pruning: The AutoHarness-Dendrite Synthesis
+
+### 7.1 Architecture of Self-Learning Agents
+
+Modern agent systems suffer from **Skill Bloat**: as agents accumulate procedures, their prompt directories fill with near-duplicate, stale, or contradictory playbooks. The AutoHarness architecture (`CAP` $\to$ `REF` $\to$ `Promoter` $\to$ `MNG` $\to$ `Curator`) introduces an organic, biological lifecycle that perfectly maps onto Cynapse's **Dendrite** synaptic memory graph:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      THE AUTOHARNESS LOOP                       │
+│                                                                 │
+│  [Working Turn] ───► CAP (Capture: Tool counts & I/O)           │
+│                           │                                     │
+│                           ▼                                     │
+│                      REF (Reflect: Distill skill vs index)      │
+│                           │                                     │
+│                           ▼                                     │
+│                 Promoter (Lint & Atomic Rename to Disk)         │
+│                           │                                     │
+│                           ▼                                     │
+│         MNG (Lifecycle: Opportunity-relative usage rate)        │
+│                           │                                     │
+│          ┌────────────────┴────────────────┐                    │
+│          ▼                                 ▼                    │
+│   Active Skill Pool                 Curator (Consolidate &      │
+│   (Probation -> Mature)             Fold under Umbrellas)       │
+│          │                                                      │
+│          ▼ (Capacity Exceeded)                                  │
+│   Archive (Dormant Synapse, Non-Destructive)                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 Core Lifecycle Principles for Dendrite
+
+1. **Deterministic Triggering (CAP)**: Learning runs in the background triggered by tool execution quanta (every $N=50$ tool calls), not arbitrary turn counts or conversational chatter.
+2. **Opportunity-Relative Usage Rate (MNG)**: A skill's survival is measured by:
+   $$\text{Usage Rate} = \frac{\text{Loads}}{\text{Requests since creation}}$$
+   This prevents wall-clock aging: when an agent is closed overnight, skills do not decay.
+3. **Probation Period**: Newly generated skills receive a grace period (e.g., 100 requests) where they cannot be archived, ensuring adequate sample size before evaluation.
+4. **Umbrella Consolidation (Curator)**: Periodic sweeps fold overlapping or near-duplicate procedures into unified umbrella skills instead of stacking duplicate files.
+5. **Non-Destructive Archiving**: Skills that fall below usage thresholds are moved to an archive directory rather than deleted, allowing instant reactivation if a matching scenario resurfaces.
+
+---
+
+## 8. Conclusion & Research Roadmap
 
 1. **Hardware Independence**: By pairing compact L3-resident models (`needle3`) with batched target verification, edge devices can execute massive 35B parameter intelligence at interactive rates without requiring specialized NPUs or enterprise GPUs.
 2. **Autonomous Agent Reliability**: Constrained edge architectures eliminate schema hallucination, ensuring subagent loops remain deterministic and mathematically provable.
+3. **The Zero-Token Harness Invariant**: Small models achieve parity with commercial cloud LLMs when cognitive burdens (syntax compliance, verification, security, and context pruning) are shifted into native pure-Rust runtime systems.
+

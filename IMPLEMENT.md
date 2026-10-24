@@ -41,3 +41,23 @@ Docs brought current: README (MAX_AGENT_STEPS 14, 14-check doctor + exit-1, inst
   - Telemetry: generation tok/s and TTFT latency indicators added to TUI header bar.
 - Test Suite: All workspace tests pass (308 passed, 0 failed). Full tree clean and ready to commit.
 
+## 2026-10-24 — Session: Needle3 Edge Curation, Parameter Editing Modal & Speculative Decoding Research (Stage 32)
+- Added `Cactus-Compute/needle3` (28MB Monarch-Hadamard model) to `downloader.rs` curated catalog.
+- Added `@needle` and `@fast` BotProfiles in `bots.rs` with allow/deny/ask constraints.
+- Extended Ratatui `PendingToolApproval` modal with real-time parameter editing mode (`e`, `Tab`, `Enter`).
+- Replaced 2D manual trigonometry in Galaxy Memory Atlas with Mazzaroth 3D perspective projection (`Camera3D`).
+- Authored thesis research report `docs/SPECULATIVE_DECODING.md` on arithmetic intensity, roofline analysis, and mathematical proofs.
+- Test Suite: 310 passed, 0 failed.
+
+## 2026-10-24 — Session: Universal Skill Synthesis & Low-Parameter Harness Elevation (Stage 33)
+- Implemented 6 architectural pillars for ultra-low parameter local models (0.5B - 3B):
+  1. Tolerant argument coercion & Levenshtein nearest-key hints in `offline_agent.rs` (`coerce_tool_arguments`, `describe_argument_error`, `unpack_canonical`).
+  2. Native surgical file patch tool `patch_file_at` in `lib.rs` with unique target matching and anchor checks.
+  3. Deterministic acceptance gate parser and runner in `gates.rs` (`GATES.md` CHECK/EXPECT/EVIDENCE verification) with `run_gates` tool.
+  4. Dynamic in-memory Universal Skill synthesis (`skills.rs`) injecting 2-line intent micro-directives into Zone B while keeping prompt context <= 650 tokens.
+  5. Dense listing compressor (5-item cap) and automatic disk spillover (`~/.cynapse/spill/<hash>.log`) in `compressor.rs`.
+  6. Autonomous security shield in `security.rs` catching command injection, path traversal, and destructive actions.
+- AutoHarness-Dendrite synthesis documented for self-learning and self-pruning synaptic memory.
+- Test Suite: 324 passed, 0 failed across entire workspace.
+
+

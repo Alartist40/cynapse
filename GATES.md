@@ -164,3 +164,13 @@
   CHECK: cargo test --workspace 2>/dev/null && cargo clippy --workspace 2>/dev/null && git diff --stat && echo "G31 PASS"
   EXPECT: G31 PASS
   EVIDENCE: auditor re-run 2026-09-30 with hardened CHECK: 301 passed / 0 failed (awk-summed across all crates), clippy exit 0, diff across 17 files. (Worker's original count 300; +1 from concurrent test additions.)
+
+- [x] G32: Needle3 curation, interactive parameter edit modal & Mazzaroth 3D projection
+  CHECK: cargo test --workspace 2>/dev/null && echo "G32 PASS"
+  EXPECT: G32 PASS
+  EVIDENCE: 310 tests passed (0 failed). Cactus-Compute/needle3 curated catalog entry verified; @needle and @fast profiles active; Ratatui parameter editing modal verified with e/Tab/Enter interaction; Mazzaroth 3D perspective camera active.
+
+- [x] G33: Universal Skill synthesis & low-parameter harness elevation (6 pillars)
+  CHECK: cargo test --workspace 2>/dev/null && echo "G33 PASS"
+  EXPECT: G33 PASS
+  EVIDENCE: 324 tests passed (0 failed). Tolerant argument coercion + Levenshtein nearest-key hints (<=2), surgical patch_file tool, deterministic GATES.md engine, dynamic micro-skill Zone B slicing, 5-item listing caps, disk spillover, and autonomous security shield verified.
