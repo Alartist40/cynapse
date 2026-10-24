@@ -572,75 +572,8 @@ impl TuiApp {
 
     fn execute_tool_and_format(&mut self, call: &cynapse_core::offline_agent::ToolCall) -> (String, bool) {
         let name = call.name.as_str();
+        let (arg1, arg2) = call.to_arg_pair();
         let args = &call.arguments;
-
-        let (arg1, arg2): (String, Option<String>) = match name {
-            "write_file" => {
-                let path = args.get("path")
-                    .or_else(|| args.get("file"))
-                    .or_else(|| args.get("filename"))
-                    .or_else(|| args.get("filepath"))
-                    .or_else(|| args.get("arg1"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let content = args.get("content")
-                    .or_else(|| args.get("text"))
-                    .or_else(|| args.get("body"))
-                    .or_else(|| args.get("data"))
-                    .or_else(|| args.get("arg2"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (path.to_string(), content)
-            }
-            "read_file" => {
-                let path = args.get("path")
-                    .or_else(|| args.get("file"))
-                    .or_else(|| args.get("filename"))
-                    .or_else(|| args.get("filepath"))
-                    .or_else(|| args.get("arg1"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                (path.to_string(), None)
-            }
-            "grep" => {
-                let pattern = args.get("pattern")
-                    .or_else(|| args.get("query"))
-                    .or_else(|| args.get("regex"))
-                    .or_else(|| args.get("arg1"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let dir = args.get("dir")
-                    .or_else(|| args.get("path"))
-                    .or_else(|| args.get("directory"))
-                    .or_else(|| args.get("arg2"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (pattern.to_string(), dir)
-            }
-            "execute_command" => {
-                let cmd = args.get("command")
-                    .or_else(|| args.get("cmd"))
-                    .or_else(|| args.get("script"))
-                    .or_else(|| args.get("arg1"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                (cmd.to_string(), None)
-            }
-            _ => {
-                let a1 = args.get("path")
-                    .or_else(|| args.get("query"))
-                    .or_else(|| args.get("command"))
-                    .or_else(|| args.get("arg1"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let a2 = args.get("content")
-                    .or_else(|| args.get("dir"))
-                    .or_else(|| args.get("arg2"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (a1.to_string(), a2)
-            }
-        };
 
         if name == "read_file" {
             let Self { read_receipts, messages, .. } = self;
@@ -916,7 +849,12 @@ impl TuiApp {
 
         match cynapse_core::execute_tool(name, &arg1, arg2.as_deref()) {
             Ok(output) => {
-                let compressed = cynapse_core::compressor::compress_tool_result(&output, false, None);
+                let formatted = if name == "grep" {
+                    cynapse_core::compressor::cap_list_items(&output, 5)
+                } else {
+                    output
+                };
+                let compressed = cynapse_core::compressor::compress_tool_result(&formatted, false, None);
                 (compressed.summary, true)
             }
             Err(e) => {

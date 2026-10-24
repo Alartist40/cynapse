@@ -11,10 +11,13 @@ pub mod bots;
 pub mod compressor;
 pub mod doctor;
 pub mod downloader;
+pub mod gates;
 pub mod offline_agent;
 pub mod persona;
 pub mod receipts;
+pub mod security;
 pub mod session;
+pub mod skills;
 pub mod subagent;
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +38,16 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "write_file",
             description: "Write content to a file within permitted workspace",
+            concurrency_safe: false,
+        },
+        ToolDefinition {
+            name: "patch_file",
+            description: "Surgically patch a specific section of a file using exact target matching",
+            concurrency_safe: false,
+        },
+        ToolDefinition {
+            name: "run_gates",
+            description: "Deterministically execute acceptance gates defined in GATES.md and record verifiable machine evidence",
             concurrency_safe: false,
         },
         ToolDefinition {
@@ -157,6 +170,57 @@ pub(crate) fn read_file_at(path: &str) -> Result<(PathBuf, String)> {
     Ok((safe_path, content))
 }
 
+/// Surgically patches a file by replacing a unique target slice with replacement content.
+pub fn patch_file_at(
+    path_str: &str,
+    target_content: &str,
+    replacement_content: &str,
+    allow_multiple: bool,
+) -> Result<String> {
+    if target_content.is_empty() {
+        bail!("Cannot patch file: target_content is empty");
+    }
+    let safe_path = validate_safe_path(path_str, true)?;
+    if !safe_path.exists() {
+        bail!("File not found for patching: {}", safe_path.display());
+    }
+    if safe_path.is_dir() {
+        bail!("Target path is a directory, not a file: {}", safe_path.display());
+    }
+    let original = fs::read_to_string(&safe_path)
+        .with_context(|| format!("Failed to read {}", safe_path.display()))?;
+
+    let matches = original.matches(target_content).count();
+    if matches == 0 {
+        bail!(
+            "Target content not found in {}. Ensure exact indentation and content match.",
+            safe_path.display()
+        );
+    }
+    if matches > 1 && !allow_multiple {
+        bail!(
+            "Target content found {} times in {}. Set allow_multiple: true or provide more surrounding context as a unique anchor.",
+            matches,
+            safe_path.display()
+        );
+    }
+
+    let new_content = if allow_multiple {
+        original.replace(target_content, replacement_content)
+    } else {
+        original.replacen(target_content, replacement_content, 1)
+    };
+
+    fs::write(&safe_path, new_content)
+        .with_context(|| format!("Failed to write patched file {}", safe_path.display()))?;
+
+    Ok(format!(
+        "Successfully patched {} (replaced {} occurrence(s))",
+        safe_path.display(),
+        matches
+    ))
+}
+
 /// Native implementation of atomic-agent tools with sandboxing and execution timeout.
 pub fn execute_tool(name: &str, arg1: &str, arg2: Option<&str>) -> Result<String> {
     match name {
@@ -176,6 +240,29 @@ pub fn execute_tool(name: &str, arg1: &str, arg2: Option<&str>) -> Result<String
             fs::write(&safe_path, content)
                 .with_context(|| format!("Failed to write file {}", safe_path.display()))?;
             Ok(format!("Successfully wrote {} bytes to {}", content.len(), safe_path.display()))
+        }
+        "patch_file" => {
+            if let Some(json_str) = arg2 {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let target = val.get("target_content")
+                        .or_else(|| val.get("target"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let replacement = val.get("replacement_content")
+                        .or_else(|| val.get("replacement"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let allow_multiple = val.get("allow_multiple")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    return patch_file_at(arg1, target, replacement, allow_multiple);
+                }
+            }
+            bail!("Invalid arguments for patch_file: expected path as arg1 and JSON with target_content and replacement_content as arg2");
+        }
+        "run_gates" => {
+            let p = if arg1.trim().is_empty() { None } else { Some(arg1) };
+            gates::run_gates(p)
         }
         "grep" => {
             let pattern = arg1;
@@ -270,7 +357,7 @@ pub fn execute_tool(name: &str, arg1: &str, arg2: Option<&str>) -> Result<String
     }
 }
 
-/// Executes a tool enforcing a BotProfile's allow/deny rules and workspace confinement.
+/// Executes a tool enforcing a BotProfile's allow/deny rules, workspace confinement, and security shield.
 pub fn execute_tool_with_profile(
     name: &str,
     arg1: &str,
@@ -285,9 +372,31 @@ pub fn execute_tool_with_profile(
         bail!("Approval required: tool '{}' requires interactive confirmation (in tools_ask for '@{}')", name, profile.slug);
     }
 
+    // Security shield pre-flight audit
+    let tool_call = offline_agent::ToolCall {
+        name: name.to_string(),
+        arguments: if name == "write_file" || name == "patch_file" {
+            serde_json::json!({ "path": arg1, "content": arg2 })
+        } else if name == "execute_command" {
+            serde_json::json!({ "command": arg1 })
+        } else {
+            serde_json::json!({ "path": arg1 })
+        },
+    };
+
+    match security::audit_tool_call(&tool_call) {
+        security::SecurityVerdict::Blocked { reason } => {
+            bail!("Security shield violation: {}", reason);
+        }
+        security::SecurityVerdict::RequiresApproval { reason } => {
+            bail!("Approval required by security shield: {}", reason);
+        }
+        security::SecurityVerdict::Safe => {}
+    }
+
     // Path confinement check for file tools
     match name {
-        "read_file" | "write_file" => {
+        "read_file" | "write_file" | "patch_file" | "run_gates" => {
             if !profile.is_path_in_workspace(arg1) {
                 bail!(
                     "Workspace violation: path '{}' is outside the restricted workspace '{:?}' of bot profile '@{}'",
@@ -326,9 +435,24 @@ pub fn execute_tool_with_profile_approved(
         bail!("Permission denied: tool '{}' is not permitted by bot profile '@{}'", name, profile.slug);
     }
 
+    let tool_call = offline_agent::ToolCall {
+        name: name.to_string(),
+        arguments: if name == "write_file" || name == "patch_file" {
+            serde_json::json!({ "path": arg1, "content": arg2 })
+        } else if name == "execute_command" {
+            serde_json::json!({ "command": arg1 })
+        } else {
+            serde_json::json!({ "path": arg1 })
+        },
+    };
+
+    if let security::SecurityVerdict::Blocked { reason } = security::audit_tool_call(&tool_call) {
+        bail!("Security shield violation: {}", reason);
+    }
+
     // Path confinement check for file tools
     match name {
-        "read_file" | "write_file" => {
+        "read_file" | "write_file" | "patch_file" | "run_gates" => {
             if !profile.is_path_in_workspace(arg1) {
                 bail!(
                     "Workspace violation: path '{}' is outside the restricted workspace '{:?}' of bot profile '@{}'",
@@ -353,6 +477,55 @@ pub fn execute_tool_with_profile_approved(
     }
 
     execute_tool(name, arg1, arg2)
+}
+
+/// Executes a tool call directly using its canonical unpacked arguments.
+pub fn execute_tool_call(call: &offline_agent::ToolCall) -> Result<String> {
+    match call.unpack_canonical() {
+        offline_agent::CanonicalArgs::ReadFile { path } => {
+            let (_path, content) = read_file_at(&path)?;
+            Ok(content)
+        }
+        offline_agent::CanonicalArgs::WriteFile { path, content } => {
+            execute_tool("write_file", &path, Some(&content))
+        }
+        offline_agent::CanonicalArgs::PatchFile { path, target_content, replacement_content, allow_multiple } => {
+            patch_file_at(&path, &target_content, &replacement_content, allow_multiple)
+        }
+        offline_agent::CanonicalArgs::RunGates { path } => {
+            gates::run_gates(path.as_deref())
+        }
+        offline_agent::CanonicalArgs::Grep { pattern, path } => {
+            execute_tool("grep", &pattern, path.as_deref())
+        }
+        offline_agent::CanonicalArgs::ExecuteCommand { command } => {
+            execute_tool("execute_command", &command, None)
+        }
+        offline_agent::CanonicalArgs::SpawnSubagent { instruction, role } => {
+            execute_tool("spawn_subagent", &instruction, role.as_deref())
+        }
+        offline_agent::CanonicalArgs::Generic { arg1, arg2 } => {
+            execute_tool(&call.name, &arg1, arg2.as_deref())
+        }
+    }
+}
+
+/// Executes a tool call with profile validation using canonical unpacked arguments.
+pub fn execute_tool_call_with_profile(
+    call: &offline_agent::ToolCall,
+    profile: &bots::BotProfile,
+) -> Result<String> {
+    let (arg1, arg2) = call.to_arg_pair();
+    execute_tool_with_profile(&call.name, &arg1, arg2.as_deref(), profile)
+}
+
+/// Executes an approved tool call with profile validation using canonical unpacked arguments.
+pub fn execute_tool_call_with_profile_approved(
+    call: &offline_agent::ToolCall,
+    profile: &bots::BotProfile,
+) -> Result<String> {
+    let (arg1, arg2) = call.to_arg_pair();
+    execute_tool_with_profile_approved(&call.name, &arg1, arg2.as_deref(), profile)
 }
 
 /// Real HuggingFace model downloader streaming target .gguf or .safetensors files into models_dir.
@@ -535,5 +708,62 @@ mod tests {
         let res_ask = execute_tool_with_profile("execute_command", "ls", None, &ask_profile);
         assert!(res_ask.is_err());
         assert!(res_ask.unwrap_err().to_string().contains("Approval required"));
+    }
+
+    #[test]
+    fn test_patch_file_surgical_precision() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_file = temp.path().join("source.rs");
+        let initial_code = "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 2 }\nfn gamma() -> i32 { 3 }\n";
+        fs::write(&target_file, initial_code).unwrap();
+
+        // 1. Surgical patch of middle function
+        let patch_res = patch_file_at(
+            &target_file.to_string_lossy(),
+            "fn beta() -> i32 { 2 }",
+            "fn beta() -> i32 { 42 }",
+            false,
+        );
+        assert!(patch_res.is_ok());
+
+        let updated = fs::read_to_string(&target_file).unwrap();
+        assert_eq!(
+            updated,
+            "fn alpha() -> i32 { 1 }\nfn beta() -> i32 { 42 }\nfn gamma() -> i32 { 3 }\n"
+        );
+
+        // 2. Fails safely when target is ambiguous
+        fs::write(&target_file, "foo bar foo").unwrap();
+        let ambig = patch_file_at(&target_file.to_string_lossy(), "foo", "baz", false);
+        assert!(ambig.is_err());
+        assert!(ambig.unwrap_err().to_string().contains("found 2 times"));
+
+        // 3. allow_multiple replaces all
+        let multi = patch_file_at(&target_file.to_string_lossy(), "foo", "baz", true);
+        assert!(multi.is_ok());
+        let updated_multi = fs::read_to_string(&target_file).unwrap();
+        assert_eq!(updated_multi, "baz bar baz");
+    }
+
+    #[test]
+    fn test_execute_tool_call_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("canonical.txt");
+        fs::write(&file_path, "hello world").unwrap();
+
+        let call = offline_agent::ToolCall {
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": file_path.to_string_lossy() }),
+        };
+        let out = execute_tool_call(&call).unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn test_security_shield_blocking_in_profile_execution() {
+        let open_profile = bots::BotProfile::default();
+        let blocked_res = execute_tool_with_profile("execute_command", "rm -rf /", None, &open_profile);
+        assert!(blocked_res.is_err());
+        assert!(blocked_res.unwrap_err().to_string().contains("Security shield violation"));
     }
 }

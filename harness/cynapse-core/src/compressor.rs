@@ -7,17 +7,22 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::fs;
+use std::path::PathBuf;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompressedResult {
     pub summary: String,
     pub signature: Option<String>,
     pub truncated: bool,
     pub original_len: usize,
+    pub spill_path: Option<String>,
 }
 
 pub struct CompressorOptions {
     pub max_summary_length: usize,
     pub max_tail_lines: usize,
+    pub spill_threshold: usize,
 }
 
 impl Default for CompressorOptions {
@@ -25,8 +30,46 @@ impl Default for CompressorOptions {
         Self {
             max_summary_length: 1200,
             max_tail_lines: 20,
+            spill_threshold: 1200,
         }
     }
+}
+
+/// Spills large raw outputs to `~/.cynapse/spill/<hash>.log` to keep model context windows lean.
+pub fn spill_to_disk(raw: &str) -> Option<PathBuf> {
+    let spill_dir = if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".cynapse").join("spill")
+    } else {
+        PathBuf::from(".cynapse").join("spill")
+    };
+
+    if fs::create_dir_all(&spill_dir).is_err() {
+        return None;
+    }
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let hash_val = hasher.finish();
+
+    let file_path = spill_dir.join(format!("{:016x}.log", hash_val));
+    if fs::write(&file_path, raw).is_ok() {
+        Some(file_path)
+    } else {
+        None
+    }
+}
+
+/// Enforces the 5-item reader limit for lists and multi-line grep/directory search results.
+pub fn cap_list_items(text: &str, max_items: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_items {
+        return text.to_string();
+    }
+    let shown = &lines[..max_items];
+    let omitted = lines.len() - max_items;
+    format!("{}\n[{} items shown, {} more omitted]", shown.join("\n"), max_items, omitted)
 }
 
 const ERROR_MARKERS: &[&str] = &[
@@ -111,7 +154,13 @@ pub fn compress_tool_result(raw: &str, is_error: bool, options: Option<Compresso
     let joined = parts.join("\n");
     let over_length = joined.chars().count() > opts.max_summary_length;
 
-    let summary = if over_length {
+    let spill_path = if original_len > opts.spill_threshold {
+        spill_to_disk(raw).map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    let mut summary = if over_length {
         let mut truncated_text: String = joined.chars().take(opts.max_summary_length.saturating_sub(15)).collect();
         truncated_text.push_str("\n… [truncated]");
         truncated_text
@@ -119,11 +168,16 @@ pub fn compress_tool_result(raw: &str, is_error: bool, options: Option<Compresso
         joined
     };
 
+    if let Some(ref spill) = spill_path {
+        summary.push_str(&format!("\n[Full output ({} bytes) spilled to {}; use grep or read_file to inspect]", original_len, spill));
+    }
+
     CompressedResult {
         summary,
         signature,
-        truncated: tail_truncated || over_length,
+        truncated: tail_truncated || over_length || spill_path.is_some(),
         original_len,
+        spill_path,
     }
 }
 
@@ -165,9 +219,36 @@ mod tests {
             lines.push(format!("Log line {}", i));
         }
         let text = lines.join("\n");
-        let res = compress_tool_result(&text, false, Some(CompressorOptions { max_summary_length: 1000, max_tail_lines: 5 }));
+        let res = compress_tool_result(&text, false, Some(CompressorOptions {
+            max_summary_length: 1000,
+            max_tail_lines: 5,
+            spill_threshold: 1200,
+        }));
         assert!(res.truncated);
         assert!(res.summary.contains("… [omitted 45 lines]"));
         assert!(res.summary.contains("Log line 50"));
+    }
+
+    #[test]
+    fn test_cap_list_items() {
+        let items = "item 1\nitem 2\nitem 3\nitem 4\nitem 5\nitem 6\nitem 7";
+        let capped = cap_list_items(items, 5);
+        assert!(capped.contains("item 1"));
+        assert!(capped.contains("item 5"));
+        assert!(capped.contains("[5 items shown, 2 more omitted]"));
+        assert!(!capped.contains("item 6"));
+    }
+
+    #[test]
+    fn test_spill_to_disk() {
+        let massive = "a".repeat(2000);
+        let res = compress_tool_result(&massive, false, Some(CompressorOptions {
+            max_summary_length: 500,
+            max_tail_lines: 5,
+            spill_threshold: 500,
+        }));
+        assert!(res.spill_path.is_some());
+        assert!(res.summary.contains("spilled to"));
+        assert!(res.truncated);
     }
 }

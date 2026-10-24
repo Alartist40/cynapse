@@ -303,11 +303,257 @@ pub fn hash_tool_result(tool: &str, args: &serde_json::Value, result: &str) -> u
     hasher.finish()
 }
 
+/// Computes the Levenshtein edit distance between two strings.
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let len_a = a_chars.len();
+    let len_b = b_chars.len();
+
+    if len_a == 0 { return len_b; }
+    if len_b == 0 { return len_a; }
+
+    let mut dp = vec![vec![0; len_b + 1]; len_a + 1];
+    for i in 0..=len_a { dp[i][0] = i; }
+    for j in 0..=len_b { dp[0][j] = j; }
+
+    for i in 1..=len_a {
+        for j in 1..=len_b {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[len_a][len_b]
+}
+
+/// Canonical expected parameter names for standard tools.
+pub fn tool_canonical_params(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "read_file" => &["path"],
+        "write_file" => &["path", "content"],
+        "patch_file" => &["path", "target_content", "replacement_content", "allow_multiple"],
+        "run_gates" => &["path"],
+        "grep" => &["pattern", "path"],
+        "execute_command" => &["command"],
+        "spawn_subagent" => &["instruction", "role"],
+        _ => &["arg1", "arg2"],
+    }
+}
+
+/// Resolves common model parameter aliases into canonical names.
+pub fn canonicalize_param_key(tool_name: &str, raw_key: &str) -> String {
+    let k = raw_key.trim().to_lowercase();
+    match k.as_str() {
+        // Path aliases
+        "filepath" | "file" | "filename" | "target_file" | "file_path" | "p" => "path".to_string(),
+        "dir" | "directory" | "dir_path" | "folder" => {
+            if tool_name == "grep" { "path".to_string() } else { "path".to_string() }
+        }
+        // Content aliases
+        "text" | "body" | "code" | "data" | "file_content" | "c" => "content".to_string(),
+        // Command aliases
+        "cmd" | "exec" | "run" | "bash" | "script" => "command".to_string(),
+        // Pattern aliases
+        "query" | "regex" | "search" | "term" => "pattern".to_string(),
+        // Target content aliases (for surgical patching)
+        "target" | "find" | "search_content" | "match_text" | "old_content" | "old_text" => "target_content".to_string(),
+        // Replacement content aliases
+        "replacement" | "replace_with" | "new_content" | "new_text" | "replace" => "replacement_content".to_string(),
+        // Allow multiple aliases
+        "multiple" | "replace_all" | "all" => "allow_multiple".to_string(),
+        // Subagent aliases
+        "prompt" | "task" | "goal" => "instruction".to_string(),
+        "agent_role" | "bot" | "profile" => "role".to_string(),
+        _ => raw_key.to_string(),
+    }
+}
+
+/// Coerces loosely typed or aliased arguments into strict canonical schemas.
+pub fn coerce_tool_arguments(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    match args {
+        serde_json::Value::Object(map) => {
+            let mut coerced = serde_json::Map::new();
+            for (key, val) in map {
+                let canonical_key = canonicalize_param_key(tool_name, key);
+
+                // Type coercion for booleans
+                let coerced_val = if canonical_key == "allow_multiple" {
+                    match val {
+                        serde_json::Value::Bool(b) => serde_json::Value::Bool(*b),
+                        serde_json::Value::String(s) => {
+                            let s_low = s.trim().to_lowercase();
+                            serde_json::Value::Bool(s_low == "true" || s_low == "1" || s_low == "yes")
+                        }
+                        serde_json::Value::Number(n) => {
+                            serde_json::Value::Bool(n.as_i64().map(|v| v != 0).unwrap_or(false))
+                        }
+                        other => other.clone(),
+                    }
+                } else if let serde_json::Value::String(s) = val {
+                    // If string is an inner JSON object, attempt unwrapping
+                    if s.trim_start().starts_with('{') && s.trim_end().ends_with('}') {
+                        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+                            inner
+                        } else {
+                            val.clone()
+                        }
+                    } else {
+                        val.clone()
+                    }
+                } else if let serde_json::Value::Number(n) = val {
+                    // If a number was passed for path or pattern, convert to string
+                    serde_json::Value::String(n.to_string())
+                } else {
+                    val.clone()
+                };
+
+                coerced.insert(canonical_key.clone(), coerced_val.clone());
+                if canonical_key != *key {
+                    coerced.insert(key.clone(), coerced_val);
+                }
+            }
+            serde_json::Value::Object(coerced)
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return coerce_tool_arguments(tool_name, &val);
+                }
+            }
+            // Direct single string parameter mapping
+            let mut map = serde_json::Map::new();
+            match tool_name {
+                "read_file" | "run_gates" => {
+                    map.insert("path".to_string(), serde_json::Value::String(s.clone()));
+                }
+                "execute_command" => {
+                    map.insert("command".to_string(), serde_json::Value::String(s.clone()));
+                }
+                "grep" => {
+                    map.insert("pattern".to_string(), serde_json::Value::String(s.clone()));
+                }
+                _ => {
+                    map.insert("arg1".to_string(), serde_json::Value::String(s.clone()));
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Computes an actionable error message with Levenshtein nearest-key hints
+/// if unknown arguments are encountered.
+pub fn describe_argument_error(tool_name: &str, unknown_key: &str) -> Option<String> {
+    let canonical = tool_canonical_params(tool_name);
+    let mut best_match: Option<(&'static str, usize)> = None;
+
+    for &param in canonical {
+        let dist = levenshtein_distance(unknown_key, param);
+        if dist <= 2 {
+            if let Some((_, best_dist)) = best_match {
+                if dist < best_dist {
+                    best_match = Some((param, dist));
+                }
+            } else {
+                best_match = Some((param, dist));
+            }
+        }
+    }
+
+    best_match.map(|(suggested, _)| {
+        format!("Unknown argument '{}' for tool '{}'. Did you mean '{}'?", unknown_key, tool_name, suggested)
+    })
+}
+
+/// Canonical unpacked arguments for file and execution tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalArgs {
+    ReadFile { path: String },
+    WriteFile { path: String, content: String },
+    PatchFile { path: String, target_content: String, replacement_content: String, allow_multiple: bool },
+    RunGates { path: Option<String> },
+    Grep { pattern: String, path: Option<String> },
+    ExecuteCommand { command: String },
+    SpawnSubagent { instruction: String, role: Option<String> },
+    Generic { arg1: String, arg2: Option<String> },
+}
+
 /// Standard parsed tool invocation structure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
     pub name: String,
     pub arguments: serde_json::Value,
+}
+
+impl ToolCall {
+    pub fn unpack_canonical(&self) -> CanonicalArgs {
+        let args = &self.arguments;
+        match self.name.as_str() {
+            "read_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                CanonicalArgs::ReadFile { path }
+            }
+            "write_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                CanonicalArgs::WriteFile { path, content }
+            }
+            "patch_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let target_content = args.get("target_content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let replacement_content = args.get("replacement_content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let allow_multiple = args.get("allow_multiple").and_then(|v| v.as_bool()).unwrap_or(false);
+                CanonicalArgs::PatchFile { path, target_content, replacement_content, allow_multiple }
+            }
+            "run_gates" => {
+                let path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+                CanonicalArgs::RunGates { path }
+            }
+            "grep" => {
+                let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let path = args.get("path").or_else(|| args.get("dir")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                CanonicalArgs::Grep { pattern, path }
+            }
+            "execute_command" => {
+                let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                CanonicalArgs::ExecuteCommand { command }
+            }
+            "spawn_subagent" => {
+                let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let role = args.get("role").and_then(|v| v.as_str()).map(|s| s.to_string());
+                CanonicalArgs::SpawnSubagent { instruction, role }
+            }
+            _ => {
+                let a1 = args.get("arg1").or_else(|| args.get("path")).or_else(|| args.get("command")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let a2 = args.get("arg2").or_else(|| args.get("content")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                CanonicalArgs::Generic { arg1: a1, arg2: a2 }
+            }
+        }
+    }
+
+    pub fn to_arg_pair(&self) -> (String, Option<String>) {
+        match self.unpack_canonical() {
+            CanonicalArgs::ReadFile { path } => (path, None),
+            CanonicalArgs::WriteFile { path, content } => (path, Some(content)),
+            CanonicalArgs::PatchFile { path, target_content, replacement_content, allow_multiple } => {
+                let payload = serde_json::json!({
+                    "target_content": target_content,
+                    "replacement_content": replacement_content,
+                    "allow_multiple": allow_multiple,
+                }).to_string();
+                (path, Some(payload))
+            }
+            CanonicalArgs::RunGates { path } => (path.unwrap_or_else(|| "GATES.md".to_string()), None),
+            CanonicalArgs::Grep { pattern, path } => (pattern, path),
+            CanonicalArgs::ExecuteCommand { command } => (command, None),
+            CanonicalArgs::SpawnSubagent { instruction, role } => (instruction, role),
+            CanonicalArgs::Generic { arg1, arg2 } => (arg1, arg2),
+        }
+    }
 }
 
 /// Helper to parse a single JSON value into a ToolCall
@@ -341,9 +587,11 @@ fn parse_single_tool_call(v: &serde_json::Value) -> Option<ToolCall> {
         arguments
     };
 
+    let coerced_args = coerce_tool_arguments(name, &parsed_args);
+
     Some(ToolCall {
         name: name.to_string(),
-        arguments: parsed_args,
+        arguments: coerced_args,
     })
 }
 
@@ -503,6 +751,9 @@ pub fn compile_zone_b_tail(
     notice: Option<&str>,
 ) -> String {
     let mut tail = String::new();
+
+    let dynamic_directive = crate::skills::format_dynamic_directive(user_query);
+    tail.push_str(&dynamic_directive);
 
     if !recalled_knowledge.trim().is_empty() {
         if recalled_knowledge.trim().starts_with("===") {
@@ -804,6 +1055,7 @@ mod tests {
         assert!(zone_a.contains("read_file"));
 
         let zone_b = compile_zone_b_tail("## fact 1: Rust is fast", "USER: hello\nASSISTANT: hi", "Can you build it?", None);
+        assert!(zone_b.contains("=== OPERATING DIRECTIVE ==="));
         assert!(zone_b.contains("=== RECALLED KNOWLEDGE ==="));
         assert!(zone_b.contains("## fact 1: Rust is fast"));
         assert!(zone_b.contains("=== CONVERSATION LOG ==="));
@@ -842,6 +1094,67 @@ mod tests {
             assert!(guard.check(&tool).is_ok());
             guard.record_call(&tool);
             guard.record_outcome(&tool, "fn main() {}");
+        }
+    }
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(levenshtein_distance("path", "path"), 0);
+        assert_eq!(levenshtein_distance("pash", "path"), 1);
+        assert_eq!(levenshtein_distance("filenam", "filename"), 1);
+        assert_eq!(levenshtein_distance("", "test"), 4);
+    }
+
+    #[test]
+    fn test_coerce_tool_arguments_aliases_and_types() {
+        let args = serde_json::json!({
+            "filepath": "src/main.rs",
+            "allow_multiple": "true"
+        });
+        let coerced = coerce_tool_arguments("patch_file", &args);
+        assert_eq!(coerced.get("path").and_then(|v| v.as_str()), Some("src/main.rs"));
+        assert_eq!(coerced.get("allow_multiple").and_then(|v| v.as_bool()), Some(true));
+
+        let cmd_args = serde_json::json!({
+            "cmd": "cargo check"
+        });
+        let coerced_cmd = coerce_tool_arguments("execute_command", &cmd_args);
+        assert_eq!(coerced_cmd.get("command").and_then(|v| v.as_str()), Some("cargo check"));
+
+        // Single string auto-coercion
+        let str_arg = serde_json::Value::String("README.md".to_string());
+        let coerced_read = coerce_tool_arguments("read_file", &str_arg);
+        assert_eq!(coerced_read.get("path").and_then(|v| v.as_str()), Some("README.md"));
+    }
+
+    #[test]
+    fn test_describe_argument_error_hints() {
+        let hint = describe_argument_error("read_file", "pash");
+        assert_eq!(hint, Some("Unknown argument 'pash' for tool 'read_file'. Did you mean 'path'?".to_string()));
+
+        let no_hint = describe_argument_error("read_file", "completely_unrelated_nonsense");
+        assert_eq!(no_hint, None);
+    }
+
+    #[test]
+    fn test_unpack_canonical_and_arg_pair() {
+        let call = ToolCall {
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/lib.rs",
+                "target_content": "old_foo()",
+                "replacement_content": "new_foo()",
+                "allow_multiple": false
+            }),
+        };
+        match call.unpack_canonical() {
+            CanonicalArgs::PatchFile { path, target_content, replacement_content, allow_multiple } => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(target_content, "old_foo()");
+                assert_eq!(replacement_content, "new_foo()");
+                assert!(!allow_multiple);
+            }
+            _ => panic!("Expected PatchFile"),
         }
     }
 }
