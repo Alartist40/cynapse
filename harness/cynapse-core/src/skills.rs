@@ -37,7 +37,7 @@ impl SkillDiscipline {
                 "DIRECTIVE (Gates): Maintain GATES.md with CHECK, EXPECT, EVIDENCE. Run run_gates to verify machine execution — never assume success. Do not stop until all pass."
             }
             Self::TokenCompression => {
-                "DIRECTIVE (Tokens): High-density imperative terseness. Omit filler words and conversational pleasantries. Keep responses bounded."
+                "DIRECTIVE (Anti-Slop): High-density imperative terseness. Eliminate AI boilerplate ('delve', 'testament', 'revolutionize', 'not just X but Y', empty contrasts). State facts and technical actions directly."
             }
             Self::SecurityAudit => {
                 "DIRECTIVE (Security): White-box vulnerability check. Flag destructive commands, path escapes, and injection vectors. Require PoC verification."
@@ -59,7 +59,7 @@ pub fn select_active_discipline(user_query: &str) -> SkillDiscipline {
         SkillDiscipline::SurgicalEngineering
     } else if q.contains("gate") || q.contains("test") || q.contains("verify") || q.contains("check") || q.contains("unlazy") || q.contains("plan") {
         SkillDiscipline::CompletionGates
-    } else if q.contains("compress") || q.contains("short") || q.contains("caveman") || q.contains("terse") {
+    } else if q.contains("compress") || q.contains("short") || q.contains("caveman") || q.contains("terse") || q.contains("slop") || q.contains("humanize") || q.contains("cleanse") {
         SkillDiscipline::TokenCompression
     } else if q.contains("harness") || q.contains("scaffold") || q.contains("pipeline") {
         SkillDiscipline::HarnessEngineering
