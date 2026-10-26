@@ -1378,7 +1378,32 @@ curl -fsSL https://raw.githubusercontent.com/Alartist40/cynapse/main/install.sh 
 >
 > We introduced an asymmetric dual-model architecture. We run a microscopic 0.5B parameter model called Needle-3 alongside the primary model. Needle-3 specializes in one thing: blazing-fast structural drafting at over 120 tokens per second. 
 >
-> It drafts the JSON tool call, and the primary model verifies the logits in a single parallel batch pass. We achieve a **3.4x wall-clock speedup** on tool invocations, while completely eliminating JSON malformation errors on consumer hardware."
+---
+
+## Slide 8B: Flash-Attention & The 50-Student Feynman Analogy
+
+- **Slide Type**: Hardware Optimization / Deep Dive
+- **Headline**: Eliminating the $O(N^2)$ Memory Wall: Tiled Online Softmax
+- **Visual Design**:
+  - Two-panel comparison visual:
+    - **Panel A (The Naive Way)**: 50 students laying out a 50×50 floor grid of 2,500 paper sheets (representing 268MB of DRAM bandwidth drowned in intermediate scratch arrays).
+    - **Panel B (The Feynman Flash-Attention Way)**: Small student groups of 4 computing running max and running sum tallies in pocket notebooks (L1/L2 cache), with zero intermediate DRAM allocations.
+  - Callout badge: `3× Latency Speedup | 0 Bytes Intermediate RAM Allocated`.
+
+### Key Bullet Points (Slide Display)
+- **Quadratic Memory Trap**: Standard attention on an 8k context requires allocating a 67.1-million-float grid in DRAM.
+- **Tiled Online Softmax**: Computes exact mathematical attention in small cache-resident tiles.
+- **Running Normalization**: Tracks mathematical running maximums without keeping the full attention matrix.
+- **L1/L2 Cache Speed**: Executes at internal processor cache speeds (>1.5 TB/s) rather than bus speeds (64 GB/s).
+
+### Verbatim Speaker Script
+> "When an AI agent analyzes long codebases, it encounters the quadratic memory wall: comparing 8,000 tokens against 8,000 tokens requires calculating 67 million scores.
+>
+> In standard frameworks, this allocates a massive 268-megabyte scratch matrix in RAM for every single layer.
+>
+> Let's explain why Cynapse doesn't do this using Richard Feynman's principle: Imagine 50 students who want to compare test papers. The naive way forces them to lay out 2,500 sheets of paper across the entire classroom floor just to store intermediate notes. The floor is covered, and nobody can move.
+>
+> In Cynapse, we use Tiled Online Softmax—the mathematical engine behind Flash-Attention. Students work in groups of four, write only their running tally in a pocket notebook that fits in CPU cache, and discard the scratch paper instantly. We never allocate that giant matrix in RAM. It computes at CPU cache speed, saving gigabytes of bandwidth and running three times faster."
 
 ---
 

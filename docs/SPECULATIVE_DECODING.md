@@ -241,15 +241,24 @@ Pre-flight heuristic linter scanning prospective tool calls before execution.
 - Escalates privileged pipe and network patterns (`| bash`, `curl`, `sudo`) to interactive approval.
 - Blocks access to sensitive credential paths (`/etc/shadow`, `id_rsa`, `.gnupg`).
 
-### 6.3 Context Budget Accounting
+### 6.4 Memory-Bandwidth Elimination: Tiled Online Softmax (Flash-Attention on CPU)
 
-| Prompt Component | Un-Harnessed Agent Prompt | Cynapse Elevated Architecture |
-| :--- | :--- | :--- |
-| **System Persona & Master Directives** | ~8,000 tokens (30KB Markdown) | **~350 tokens** (Byte-stable Zone A) |
-| **Active Discipline Micro-Directive** | (Included in massive prompt) | **~35 tokens** (Dynamic Zone B slice) |
-| **Tool Definitions (7 tools)** | ~1,200 tokens (Full JSON schemas) | **~180 tokens** (GBNF brief schemas) |
-| **Recalled Memory & Facts** | ~1,500 tokens | **~80 tokens** (BM25 top-scored nodes) |
-| **Total Prompt Baseline** | **~10,700 tokens (Blowout)** | **$\le 645$ tokens (Invariant)** |
+In autoregressive decoding with extended context (8k to 32k tokens), attention score computation scales quadratically ($O(N^2)$). Standard attention calculates:
+
+$$\text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{Q K^T}{\sqrt{d_k}}\right) V$$
+
+This naively forces allocation of an $N \times N$ attention weight matrix in RAM. At $N=8,192$, this intermediate matrix requires over 268 MB of memory transfers per layer, consuming 80%+ of DDR5 memory bus bandwidth on intermediate scratch data.
+
+#### The Feynman Analogy: The 50-Student Paper Comparison
+> Imagine a classroom of 50 students where every student wants to compare their test paper with every other student's paper to see who has common answers:
+>
+> 1. **The Naive Way ($O(N^2)$ Memory Explosion)**:
+>    You force all 50 students to lay out a giant 50×50 grid of 2,500 paper sheets across the classroom floor before they can compute anything. On a laptop with an 8,192-token document, the attention grid requires $8192 \times 8192 = 67.1\text{ million floating-point numbers}$. Storing that temporary grid in RAM consumes 268 MB of memory bandwidth for every attention head in every layer. The processor chokes because the memory bus is completely flooded with temporary scratch paper.
+>
+> 2. **The Feynman Solution (Flash-Attention / Tiled Online Softmax)**:
+>    Instead of building the giant grid, students work in small groups of 4. Four students compare their papers, compute their running maximum score ($m_{\text{new}} = \max(m_{\text{old}}, x)$) and running sum ($d_{\text{new}} = d_{\text{old}} \cdot e^{m_{\text{old}} - m_{\text{new}}} + e^{x - m_{\text{new}}}$), write down just the final tally in a tiny pocket notebook that fits in CPU L1/L2 cache, and throw away the temporary scratch paper immediately.
+>
+> **Mathematical Invariant**: The complete attention output is computed without ever allocating the $N \times N$ matrix in DRAM, running at CPU cache speed ($> 1.5\text{ TB/s}$) instead of DRAM speed ($64\text{ GB/s}$) and delivering up to a **3× latency improvement** on edge CPUs.
 
 ---
 

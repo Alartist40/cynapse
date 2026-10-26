@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Doctor { fix }) => {
             let db_path = dirs::home_dir().map(|h| h.join(".cynapse").join("dendrite.db")).unwrap_or_else(|| PathBuf::from("data/dendrite.db"));
-            let doctor = cynapse_core::doctor::CynapseDoctor::new(models_dir.clone(), db_path, fix);
+            let doctor = cynapse_core::doctor::CynapseDoctor::new(models_dir.clone(), db_path.clone(), fix);
             let report = doctor.run_diagnostics();
 
             println!("======================================================================");
@@ -133,10 +133,43 @@ async fn main() -> Result<()> {
                 print!("\x1b[0m"); // reset color
             }
             println!("======================================================================");
-            if report.total_fail > 0 && !fix {
-                println!("💡 Tip: Run 'cynapse doctor --fix' to execute automatic self-healing repairs.");
+            if report.total_fail > 0 || report.total_warn > 0 {
+                if !fix && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    print!("\nInteractive Remediation: [R] Auto-remediate now | [I] Ignore | [D] View details? (r/i/d): ");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let mut input = String::new();
+                    if let Ok(_) = std::io::stdin().read_line(&mut input) {
+                        let choice = input.trim().to_lowercase();
+                        if choice == "r" {
+                            println!("\n🔧 Launching automatic self-healing remediation...");
+                            let fix_doctor = cynapse_core::doctor::CynapseDoctor::new(models_dir.clone(), db_path.clone(), true);
+                            let fix_report = fix_doctor.run_diagnostics();
+                            println!("Remediation complete. New Health Score: [ {}% ] (Repaired: {})", fix_report.health_score, fix_report.total_repaired);
+                            if fix_report.total_fail == 0 {
+                                return Ok(());
+                            }
+                        } else if choice == "d" {
+                            println!("\n=== Diagnostic Deep Dive ===");
+                            for item in &report.items {
+                                if item.status != cynapse_core::doctor::DoctorStatus::Pass {
+                                    println!("Subsystem: {}", item.subsystem);
+                                    println!("Check: {}", item.check_name);
+                                    println!("Status: {:?}", item.status);
+                                    println!("Detail: {}", item.detail);
+                                    if let Some(ref rec) = item.fix_recommendation {
+                                        println!("Remediation Action: {}", rec);
+                                    }
+                                    println!("---");
+                                }
+                            }
+                        }
+                    }
+                } else if !fix {
+                    println!("💡 Tip: Run 'cynapse doctor --fix' to execute automatic self-healing repairs.");
+                }
             }
-            if report.total_fail > 0 {
+            if report.total_fail > 0 && !fix {
                 std::process::exit(1);
             }
         }

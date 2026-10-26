@@ -2776,6 +2776,20 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 Line::from(vec![Span::styled(" RAM : ", label_style), Span::styled(format!("{:.1}/{:.1}G", used_gb, total_gb), value_style)]),
                 Line::from(vec![Span::styled(" Bar : ", label_style), Span::styled(format!("{}", ram_bar_str), Style::default().fg(Color::Cyan))]),
                 Line::from(vec![Span::styled(" GPU : ", label_style), Span::styled(&self.hw_info.gpu_info, Style::default().fg(Color::Green))]),
+                Line::from(vec![
+                    Span::styled(" Pwr : ", label_style),
+                    Span::styled(
+                        match cynapse_core::power::PowerThrottler::new().detect_power_source() {
+                            cynapse_core::power::PowerSource::Battery => "⚡ Battery (Scaled)",
+                            cynapse_core::power::PowerSource::AcPower => "🔌 AC Power (Max)",
+                            cynapse_core::power::PowerSource::Unknown => "⚡ Auto Balanced",
+                        },
+                        match cynapse_core::power::PowerThrottler::new().detect_power_source() {
+                            cynapse_core::power::PowerSource::Battery => Style::default().fg(Color::Yellow),
+                            _ => Style::default().fg(Color::Green),
+                        },
+                    ),
+                ]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("◖ ", Style::default().fg(Color::Yellow)),

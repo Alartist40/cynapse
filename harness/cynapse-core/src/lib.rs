@@ -14,6 +14,7 @@ pub mod downloader;
 pub mod gates;
 pub mod offline_agent;
 pub mod persona;
+pub mod power;
 pub mod receipts;
 pub mod security;
 pub mod session;
