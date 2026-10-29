@@ -20,6 +20,7 @@ pub mod security;
 pub mod session;
 pub mod skills;
 pub mod subagent;
+pub mod undo;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,6 +207,8 @@ pub fn patch_file_at(
         );
     }
 
+    let _ = undo::UndoJournal::record_patch(&safe_path, &original);
+
     let new_content = if allow_multiple {
         original.replace(target_content, replacement_content)
     } else {
@@ -234,6 +237,7 @@ pub fn execute_tool(name: &str, arg1: &str, arg2: Option<&str>) -> Result<String
             if safe_path.is_dir() {
                 safe_path = safe_path.join("about.md");
             }
+            let _ = undo::UndoJournal::record_write(&safe_path);
             let content = arg2.unwrap_or_default();
             if let Some(parent) = safe_path.parent() {
                 fs::create_dir_all(parent)?;

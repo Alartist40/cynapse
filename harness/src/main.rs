@@ -61,6 +61,8 @@ enum Commands {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Revert the latest file change or patch performed by the agent
+    Undo,
 }
 
 /// Resolve models directory dynamically relative to executable, workspace, or user home folder.
@@ -243,6 +245,16 @@ async fn main() -> Result<()> {
             println!("5. Tiled Flash-Attention RAM Sav.  : 268 MB intermediate memory eliminated");
             println!("======================================================================");
             println!("Overall Edge Readiness Score: [ 98.4 / 100 ] - PRODUCTION CERTIFIED");
+        }
+        Some(Commands::Undo) => {
+            println!("↩ Invoking Cynapse Agent File Undo Journal...");
+            match cynapse_core::undo::UndoJournal::undo_latest() {
+                Ok(msg) => println!("✓ {}", msg),
+                Err(err) => {
+                    eprintln!("✗ Undo failed: {}", err);
+                    std::process::exit(1);
+                }
+            }
         }
         Some(Commands::Run { target }) => {
             if let Some(t) = target {

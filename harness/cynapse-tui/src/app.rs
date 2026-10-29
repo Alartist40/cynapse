@@ -173,6 +173,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/unload", description: "Unload active LLM model from RAM immediately to free memory" },
     SlashCommand { name: "/backup", description: "Create or restore AES-256-GCM encrypted backup of memory database" },
     SlashCommand { name: "/session", description: "Open saved sessions manager" },
+    SlashCommand { name: "/undo", description: "Undo latest file modifications or edits made by the agent" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
     SlashCommand { name: "/exit", description: "Exit Cynapse TUI" },
 ];
@@ -263,6 +264,7 @@ pub struct TuiApp {
     pub is_generating: bool,
     pub last_tok_per_sec: f64,
     pub last_latency_sec: f64,
+    pub throughput_history: std::collections::VecDeque<f64>,
     pub scroll_offset: u16,
     pub last_max_scroll: AtomicU16,
     pub auto_scroll: bool,
@@ -369,6 +371,13 @@ impl TuiApp {
             is_generating: false,
             last_tok_per_sec: 4.8,
             last_latency_sec: 0.0,
+            throughput_history: {
+                let mut v = std::collections::VecDeque::with_capacity(30);
+                for val in [3.2, 3.8, 4.1, 4.5, 4.2, 4.7, 4.8, 5.0, 4.9, 4.8] {
+                    v.push_back(val);
+                }
+                v
+            },
             scroll_offset: 0,
             last_max_scroll: AtomicU16::new(0),
             auto_scroll: true,
@@ -1378,6 +1387,32 @@ impl TuiApp {
                                     }
                                     _ => {}
                                 },
+                                KeyCode::Char('p') | KeyCode::Char('P') => match self.modal {
+                                    ActiveModal::MemoryDrawer | ActiveModal::MemoryGraph => {
+                                        let nodes = self.graph.all();
+                                        if !nodes.is_empty() {
+                                            let idx = self.selected_memory_idx.min(nodes.len() - 1);
+                                            let mut target_node = nodes[idx].clone();
+                                            let pinned = target_node.tags.iter().any(|t| t == "pinned");
+                                            if pinned {
+                                                target_node.tags.retain(|t| t != "pinned");
+                                            } else {
+                                                target_node.tags.push("pinned".into());
+                                            }
+                                            self.graph.insert_hydrated(target_node.clone());
+                                            if let Some(store) = &self.store {
+                                                let _ = store.save(&target_node);
+                                            }
+                                            let status_str = if pinned { "Unpinned" } else { "📌 Pinned (Permanent / Immortal)" };
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("{} memory node: [[{}]]", status_str, target_node.id),
+                                                thinking: None,
+                                            });
+                                        }
+                                    }
+                                    _ => {}
+                                },
                                 KeyCode::Char('e') | KeyCode::Char('E') => match self.modal {
                                     ActiveModal::PersonaManager => {
                                         let personas = self.persona_mgr.list_personas();
@@ -1620,6 +1655,26 @@ impl TuiApp {
                                 if trimmed == "/exit" || trimmed == "exit" || trimmed == "quit" {
                                     self.save_current_session();
                                     break;
+                                }
+
+                                if trimmed == "/undo" {
+                                    match cynapse_core::undo::UndoJournal::undo_latest() {
+                                        Ok(msg) => {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("↩ {}", msg),
+                                                thinking: None,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            self.messages.push(ChatMessage {
+                                                role: "error".into(),
+                                                content: format!("Undo failed: {}", err),
+                                                thinking: None,
+                                            });
+                                        }
+                                    }
+                                    continue;
                                 }
 
                                 if trimmed == "/clear" || trimmed == "/cls" {
@@ -2193,6 +2248,12 @@ impl TuiApp {
                 StreamEvent::Done { tok_per_sec, elapsed_sec } => {
                     self.last_tok_per_sec = tok_per_sec;
                     self.last_latency_sec = elapsed_sec;
+                    if tok_per_sec > 0.0 {
+                        if self.throughput_history.len() >= 30 {
+                            self.throughput_history.pop_front();
+                        }
+                        self.throughput_history.push_back(tok_per_sec);
+                    }
 
                     let tools_allowed = !self.finalization_inflight;
                     if self.finalization_inflight {
@@ -2488,6 +2549,21 @@ impl TuiApp {
         }
     }
 
+    pub fn render_sparkline(&self) -> String {
+        const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        if self.throughput_history.is_empty() {
+            return "        ".to_string();
+        }
+        let max = self.throughput_history.iter().copied().fold(0.0f64, f64::max).max(1.0);
+        let mut out = String::with_capacity(self.throughput_history.len());
+        for &val in self.throughput_history.iter().rev().take(12).collect::<Vec<_>>().iter().rev() {
+            let normalized = (val / max).clamp(0.0, 1.0);
+            let idx = ((normalized * 7.0).round() as usize).min(7);
+            out.push(BARS[idx]);
+        }
+        out
+    }
+
     fn get_matching_commands(&self) -> Vec<&'static SlashCommand> {
         let input = self.input.trim();
         if !input.starts_with('/') {
@@ -2717,7 +2793,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 Span::styled("Perf: ", t.dim_text()),
                 Span::styled(
                     if self.last_tok_per_sec > 0.0 {
-                        format!("{:.1} t/s ({:.2}s)", self.last_tok_per_sec, self.last_latency_sec)
+                        format!("{:.1} t/s ({:.2}s) [{}]", self.last_tok_per_sec, self.last_latency_sec, self.render_sparkline())
                     } else {
                         "idle".to_string()
                     },
@@ -3283,8 +3359,11 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     };
 
                     let spec = n.spec_index();
+                    let is_pinned = n.tags.iter().any(|t| t == "pinned");
+                    let pin_badge = if is_pinned { "📌 " } else { "   " };
                     let line = Line::from(vec![
                         Span::styled(prefix, style),
+                        Span::styled(pin_badge, Style::default().fg(Color::Yellow)),
                         Span::styled(format!("[{:<12}] ", cat.as_str()), Style::default().fg(cat_color).add_modifier(Modifier::BOLD)),
                         Span::styled(format!("{:<28} ", crate::memory_render::truncate_smart(&n.title, 28)), style),
                         Span::styled(format!("spec:{:.2} ", spec), Style::default().fg(Color::LightYellow)),
@@ -3301,7 +3380,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .title(format!(" Dendrite Memory Inspector ({} Nodes) — Up/Down to navigate | d/Delete to erase | Esc/Tab to close ", nodes.len()))
+                        .title(format!(" Dendrite Memory Inspector ({} Nodes) — Up/Down: Select | p: Pin/Unpin | d: Delete | Esc: Close ", nodes.len()))
                         .border_style(t.active_border_style()),
                 );
                 f.render_widget(list, area);
@@ -3984,8 +4063,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         let my = moon_pt.screen_y as usize;
                         if my < height && mx < width {
                             if grid[my][mx].0 == ' ' || grid[my][mx].0 == '·' || grid[my][mx].0 == '.' {
-                                let moon_glyph = if node.mass >= 2.0 { '✦' } else { '•' };
-                                grid[my][mx] = (moon_glyph, Style::default().fg(planet_color));
+                                let is_pinned = node.tags.iter().any(|t| t == "pinned");
+                                let moon_glyph = if is_pinned { '📌' } else if node.mass >= 2.0 { '✦' } else { '•' };
+                                grid[my][mx] = (moon_glyph, if is_pinned { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(planet_color) });
                             }
                         }
                     }
@@ -4002,7 +4082,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             Span::styled(" │ ", t.dim_text()),
             Span::styled("Planets: ● Category Clusters", Style::default().fg(Color::Cyan)),
             Span::styled(" │ ", t.dim_text()),
-            Span::styled("Moons: • Memory Facts", Style::default().fg(Color::LightMagenta)),
+            Span::styled("Moons: • Memory Facts (📌 Pinned)", Style::default().fg(Color::LightMagenta)),
             Span::styled(" │ ", t.dim_text()),
             Span::styled(format!("Orbit: {}", if self.galaxy_auto_spin { "ON" } else { "PAUSED" }), if self.galaxy_auto_spin { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Yellow) }),
             Span::styled(" ◗", t.dim_text()),
@@ -4025,6 +4105,8 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             Span::styled(": 3D Pitch/Yaw  │  ", t.dim_text()),
             Span::styled("Space", Style::default().fg(Color::Yellow)),
             Span::styled(": Toggle Spin  │  ", t.dim_text()),
+            Span::styled("p", Style::default().fg(Color::Green)),
+            Span::styled(": Pin/Immortalize  │  ", t.dim_text()),
             Span::styled("Esc / q", Style::default().fg(Color::LightMagenta)),
             Span::styled(": Return to Chat", t.dim_text()),
         ]));

@@ -463,8 +463,10 @@ fn score(nodes: &[Node], query: &str) -> Vec<ScoredNode> {
             }
 
             // Recency decay gamma^(delta_t) (0.95 decay per day)
+            // If node has 'pinned' tag, it is immortal and immune to Ebbinghaus forgetting decay (recency_decay = 1.0)
+            let is_pinned = n.tags.iter().any(|t| t == "pinned");
             let age_days = (now - n.updated_at).max(0) as f64 / 86400.0;
-            let recency_decay = 0.95f64.powf(age_days);
+            let recency_decay = if is_pinned { 1.0f64 } else { 0.95f64.powf(age_days) };
 
             // If the node has zero lexical match with the query, do not award structural boosts
             if bm25_score <= 0.0 {
