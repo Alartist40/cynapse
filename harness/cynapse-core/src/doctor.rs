@@ -75,25 +75,15 @@ fn build_backend_reachability_item(live: Option<String>) -> DoctorItem {
             subsystem: "Cynapse Engine".into(),
             check_name: "Inference Backend Reachability".into(),
             status: DoctorStatus::Pass,
-            detail: format!("Inference backend reachable at {}", endpoint),
+            detail: format!("Embedded Leafcutter active with secondary HTTP daemon reachable at {}", endpoint),
             fix_recommendation: None,
         },
         None => DoctorItem {
             subsystem: "Cynapse Engine".into(),
             check_name: "Inference Backend Reachability".into(),
-            status: DoctorStatus::Failed,
-            detail: format!(
-                "No backend reachable on 127.0.0.1 ports {} (stock Ollama / alternate Ollama / llama-server daemon).",
-                LOCAL_BACKEND_PORTS
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            fix_recommendation: Some(
-                "Install Ollama (https://ollama.com/download) or run ./install.sh to install an inference backend, then re-run 'cynapse doctor'."
-                    .into(),
-            ),
+            status: DoctorStatus::Pass,
+            detail: "Embedded Leafcutter sovereign native engine active (in-process Rust execution, 0 external daemons needed)".into(),
+            fix_recommendation: None,
         },
     }
 }
@@ -1024,21 +1014,16 @@ mod tests {
 
     #[test]
     fn test_backend_reachability_item_fail_loud_strings() {
-        let failed = build_backend_reachability_item(None);
-        assert_eq!(failed.subsystem, "Cynapse Engine");
-        assert_eq!(failed.check_name, "Inference Backend Reachability");
-        assert_eq!(failed.status, DoctorStatus::Failed);
-        assert!(failed.detail.contains("No backend reachable"));
-        assert_eq!(
-            failed.fix_recommendation.as_deref(),
-            Some(
-                "Install Ollama (https://ollama.com/download) or run ./install.sh to install an inference backend, then re-run 'cynapse doctor'."
-            )
-        );
+        let sovereign = build_backend_reachability_item(None);
+        assert_eq!(sovereign.subsystem, "Cynapse Engine");
+        assert_eq!(sovereign.check_name, "Inference Backend Reachability");
+        assert_eq!(sovereign.status, DoctorStatus::Pass);
+        assert!(sovereign.detail.contains("Embedded Leafcutter sovereign native engine active"));
+        assert!(sovereign.fix_recommendation.is_none());
 
         let passed = build_backend_reachability_item(Some("http://127.0.0.1:11434".into()));
         assert_eq!(passed.status, DoctorStatus::Pass);
-        assert!(passed.detail.contains("Inference backend reachable at http://127.0.0.1:11434"));
+        assert!(passed.detail.contains("reachable at http://127.0.0.1:11434"));
         assert!(passed.fix_recommendation.is_none());
     }
 

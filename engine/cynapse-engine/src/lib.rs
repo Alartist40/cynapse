@@ -535,7 +535,7 @@ struct NativeModelItem {
 /// Locate absolute GGUF file path on host system
 pub fn find_model_file_path(model_name: &str) -> Option<std::path::PathBuf> {
     let p = std::path::PathBuf::from(shellexpand::tilde(model_name).as_ref());
-    if p.exists() && p.is_file() {
+    if p.exists() && (p.is_file() || p.is_dir()) {
         return Some(p);
     }
 
