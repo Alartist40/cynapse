@@ -227,7 +227,7 @@ impl Default for ProviderFallbackChain {
     fn default() -> Self {
         Self::new(
             ProviderKind::LlamaServer,
-            vec![ProviderKind::Ollama, ProviderKind::NativeLeafcutter],
+            vec![ProviderKind::NativeLeafcutter, ProviderKind::Ollama],
         )
     }
 }
@@ -1308,7 +1308,7 @@ pub async fn query_tier1_stream(
     };
 
     let mut candidate_providers = vec![resolved_provider];
-    for p in [ProviderKind::LlamaServer, ProviderKind::Ollama, ProviderKind::NativeLeafcutter] {
+    for p in [ProviderKind::LlamaServer, ProviderKind::NativeLeafcutter, ProviderKind::Ollama] {
         if !candidate_providers.contains(&p) {
             candidate_providers.push(p);
         }
