@@ -595,9 +595,38 @@ fn parse_single_tool_call(v: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+/// Isolates and strips reasoning scratchpad blocks (<thinking>...</thinking> or <thought>...</thought>)
+/// from raw model outputs, returning the sanitized content and optional extracted reasoning tokens.
+pub fn isolate_thinking_scratchpad(output: &str) -> (String, Option<String>) {
+    let mut cleaned = output.to_string();
+    let mut thinking = None;
+
+    let patterns = [
+        ("<thinking>", "</thinking>"),
+        ("<thought>", "</thought>"),
+    ];
+
+    for (start_tag, end_tag) in patterns {
+        if let Some(s_idx) = cleaned.find(start_tag) {
+            let content_start = s_idx + start_tag.len();
+            if let Some(e_idx) = cleaned[content_start..].find(end_tag) {
+                let actual_end = content_start + e_idx;
+                let thought_text = cleaned[content_start..actual_end].trim().to_string();
+                if !thought_text.is_empty() {
+                    thinking = Some(thought_text);
+                }
+                cleaned = format!("{}{}", &cleaned[..s_idx], &cleaned[actual_end + end_tag.len()..]);
+            }
+        }
+    }
+
+    (cleaned, thinking)
+}
+
 /// Validates and extracts GBNF tool calls from raw model output, supporting code blocks, XML tags, and raw JSON objects.
 pub fn validate_gbnf_tool_calls(output: &str) -> Result<Vec<ToolCall>, String> {
-    let trimmed = output.trim();
+    let (clean_output, _) = isolate_thinking_scratchpad(output);
+    let trimmed = clean_output.trim();
 
     // 1. Direct parse of whole trimmed text (if it's already a valid JSON object or array)
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -1157,4 +1186,18 @@ mod tests {
             _ => panic!("Expected PatchFile"),
         }
     }
+
+    #[test]
+    fn test_isolate_thinking_scratchpad_and_tool_call() {
+        let raw = "<thinking>\nI should inspect Cargo.toml first to see dependencies.\n</thinking>\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"Cargo.toml\"}}\n```";
+        let (clean, thought) = isolate_thinking_scratchpad(raw);
+        assert_eq!(thought, Some("I should inspect Cargo.toml first to see dependencies.".to_string()));
+        assert!(!clean.contains("<thinking>"));
+
+        let tools = validate_gbnf_tool_calls(raw).expect("Should parse tool call despite thinking tokens");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "read_file");
+        assert_eq!(tools[0].arguments.get("path").and_then(|v| v.as_str()), Some("Cargo.toml"));
+    }
 }
+

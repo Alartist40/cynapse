@@ -174,6 +174,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/backup", description: "Create or restore AES-256-GCM encrypted backup of memory database" },
     SlashCommand { name: "/session", description: "Open saved sessions manager" },
     SlashCommand { name: "/undo", description: "Undo latest file modifications or edits made by the agent" },
+    SlashCommand { name: "/rewind", description: "Rewind conversation history by N turns (default 1)" },
+    SlashCommand { name: "/fork", description: "Fork current conversation into a new branched session" },
     SlashCommand { name: "/update", description: "Check, pull, and compile latest Cynapse updates from git" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
     SlashCommand { name: "/exit", description: "Exit Cynapse TUI" },
@@ -1778,6 +1780,47 @@ impl TuiApp {
                                     continue;
                                 }
 
+                                if trimmed.starts_with("/rewind") {
+                                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                                    let turns: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+                                    let mut rewound_turns = 0;
+                                    for _ in 0..turns {
+                                        if let Some(pos) = self.messages.iter().rposition(|m| m.role == "user") {
+                                            self.messages.truncate(pos);
+                                            rewound_turns += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    self.save_current_session();
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: format!("Rewound {} turn(s). Active conversation rolled back.", rewound_turns),
+                                        thinking: None,
+                                    });
+                                    continue;
+                                }
+
+                                if trimmed.starts_with("/fork") {
+                                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                                    let fork_name = if parts.len() >= 2 {
+                                        parts[1].to_string()
+                                    } else {
+                                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() % 10000;
+                                        format!("{}_fork_{}", &self.session_id[..6.min(self.session_id.len())], ts)
+                                    };
+                                    let old_id = self.session_id.clone();
+                                    self.session_id = fork_name.clone();
+                                    self.session_created_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    self.save_current_session();
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: format!("Branched session '{}' -> new fork '{}'. Active session switched.", old_id, fork_name),
+                                        thinking: None,
+                                    });
+                                    continue;
+                                }
+
                                 if trimmed == "/session" || trimmed == "/sessions" {
                                     self.selected_session_idx = 0;
                                     self.modal = ActiveModal::SessionList;
@@ -2553,15 +2596,11 @@ impl TuiApp {
                     if !reprompting {
                         let (final_content, final_thinking) = if self.current_response_buf.trim().is_empty() && !self.current_thinking_buf.trim().is_empty() {
                             (self.current_thinking_buf.clone(), None)
+                        } else if !self.current_thinking_buf.is_empty() {
+                            (self.current_response_buf.clone(), Some(self.current_thinking_buf.clone()))
                         } else {
-                            (
-                                self.current_response_buf.clone(),
-                                if self.current_thinking_buf.is_empty() {
-                                    None
-                                } else {
-                                    Some(self.current_thinking_buf.clone())
-                                },
-                            )
+                            let (clean, thought) = cynapse_core::offline_agent::isolate_thinking_scratchpad(&self.current_response_buf);
+                            (clean, thought)
                         };
 
                         self.messages.push(ChatMessage {
@@ -2636,11 +2675,11 @@ impl TuiApp {
     pub fn render_sparkline(&self) -> String {
         const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         if self.throughput_history.is_empty() {
-            return "        ".to_string();
+            return " ▂▃▅".to_string();
         }
         let max = self.throughput_history.iter().copied().fold(0.0f64, f64::max).max(1.0);
-        let mut out = String::with_capacity(self.throughput_history.len());
-        for &val in self.throughput_history.iter().rev().take(12).collect::<Vec<_>>().iter().rev() {
+        let mut out = String::with_capacity(8);
+        for &val in self.throughput_history.iter().rev().take(8).collect::<Vec<_>>().iter().rev() {
             let normalized = (val / max).clamp(0.0, 1.0);
             let idx = ((normalized * 7.0).round() as usize).min(7);
             out.push(BARS[idx]);
@@ -2874,12 +2913,11 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     },
                 ),
                 Span::styled("  │  ", t.dim_text()),
-                Span::styled("Perf: ", t.dim_text()),
                 Span::styled(
                     if self.last_tok_per_sec > 0.0 {
-                        format!("{:.1} t/s ({:.2}s) [{}]", self.last_tok_per_sec, self.last_latency_sec, self.render_sparkline())
+                        format!("Perf: {:.1} t/s {}", self.last_tok_per_sec, self.render_sparkline())
                     } else {
-                        "idle".to_string()
+                        format!("Perf: idle {}", self.render_sparkline())
                     },
                     Style::default().fg(Color::LightYellow),
                 ),
