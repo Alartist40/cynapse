@@ -2901,9 +2901,19 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Span::styled("DENDRITE MEMORY", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
                     Span::styled(" ◗", Style::default().fg(Color::Magenta)),
                 ]),
-                Line::from(vec![Span::styled(" State: ", label_style), Span::styled("Disconnected", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
-                Line::from(vec![Span::styled(" Mode : ", label_style), Span::styled("Isolated Test", Style::default().fg(Color::Cyan))]),
-                Line::from(vec![Span::styled(" Cmd  : ", label_style), Span::styled("/dendrite for atlas", t.dim_text())]),
+                Line::from(vec![
+                    Span::styled(" State: ", label_style),
+                    if self.store.is_some() {
+                        Span::styled(format!("Connected ({} nodes)", self.graph.all().len()), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                    } else {
+                        Span::styled(format!("In-Memory ({} nodes)", self.graph.all().len()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    },
+                ]),
+                Line::from(vec![
+                    Span::styled(" Store : ", label_style),
+                    Span::styled(if self.store.is_some() { "SQLite + FTS5" } else { "RAM Ephemeral" }, Style::default().fg(Color::LightMagenta)),
+                ]),
+                Line::from(vec![Span::styled(" Cmd   : ", label_style), Span::styled("/dendrite for atlas", t.dim_text())]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("◖ ", Style::default().fg(Color::LightCyan)),
