@@ -4,6 +4,7 @@
 //! simd.rs provides architecture-specific SIMD matmul and element-wise ops.
 
 pub mod bitnet_lut;
+pub mod colibri_gemv;
 pub mod int8_gemm;
 pub mod iq4_nl;
 pub mod iq4_nl_gemm;

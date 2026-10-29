@@ -11,7 +11,7 @@ default_model = "ministral-3:3b"
 memory_headroom_mb = 1536
 # Prompt context size shared by llama-server, Ollama num_ctx, and the native
 # engine. Memory context budget must stay below ~40% of this value.
-ctx_size = 8192
+ctx_size = 4096
 # Optional extra directories to search for local GGUF models.
 model_search_paths = []
 

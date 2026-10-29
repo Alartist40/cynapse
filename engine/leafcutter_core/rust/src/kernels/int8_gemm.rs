@@ -172,11 +172,18 @@ pub unsafe fn q8_0_matmul_neon(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize,
 pub fn q8_0_matmul_transposed_b(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(b.cols, k, "B cols must match k in transposed mode");
     assert_eq!(b.rows, n, "B rows must match n in transposed mode");
-    let bpr = b.cols / 32;
     for v in c.iter_mut() { *v = 0.0; }
+
+    // Fast path: m == 1 autoregressive token generation hot path (Colibri integer dot)
+    if m == 1 {
+        super::colibri_gemv::colibri_q8_0_gemv(a, b, c, k, n);
+        return;
+    }
+
+    let bpr = b.cols / 32;
+    let mut temp = vec![0.0f32; k];
     for j in 0..n {
         let row_base = j * bpr;
-        let mut temp = vec![0.0f32; k];
         for block_idx in 0..bpr {
             let block = &b.blocks[row_base + block_idx];
             let base = block_idx * 32;
@@ -357,11 +364,18 @@ pub unsafe fn q4_0_matmul_neon(a: &[f32], b: &Q4Matrix, c: &mut [f32], m: usize,
 pub fn q4_0_matmul_transposed_b(a: &[f32], b: &Q4Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(b.cols, k, "B cols must match k in transposed mode");
     assert_eq!(b.rows, n, "B rows must match n in transposed mode");
-    let bpr = b.cols / 32;
     for v in c.iter_mut() { *v = 0.0; }
+
+    // Fast path: m == 1 autoregressive token generation hot path (Colibri integer dot)
+    if m == 1 {
+        super::colibri_gemv::colibri_q4_0_gemv(a, b, c, k, n);
+        return;
+    }
+
+    let bpr = b.cols / 32;
+    let mut temp = vec![0.0f32; k];
     for j in 0..n {
         let row_base = j * bpr;
-        let mut temp = vec![0.0f32; k];
         for block_idx in 0..bpr {
             let block = &b.blocks[row_base + block_idx];
             let base = block_idx * 32;

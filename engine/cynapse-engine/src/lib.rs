@@ -226,8 +226,8 @@ pub struct ProviderFallbackChain {
 impl Default for ProviderFallbackChain {
     fn default() -> Self {
         Self::new(
-            ProviderKind::NativeLeafcutter,
-            vec![ProviderKind::LlamaServer, ProviderKind::Ollama],
+            ProviderKind::Ollama,
+            vec![ProviderKind::NativeLeafcutter, ProviderKind::LlamaServer],
         )
     }
 }
@@ -676,7 +676,21 @@ pub async fn fetch_native_models(endpoint: &str) -> Vec<String> {
 }
 
 pub async fn fetch_ollama_models(endpoint: &str) -> Vec<String> {
-    fetch_native_models(endpoint).await
+    let mut models = Vec::new();
+    let client = shared_http_client();
+    let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
+    if let Ok(res) = client.get(&url).timeout(std::time::Duration::from_secs(3)).send().await {
+        if let Ok(parsed) = res.json::<NativeTagsResp>().await {
+            if let Some(endpoint_models) = parsed.models {
+                for m in endpoint_models {
+                    if !models.contains(&m.name) {
+                        models.push(m.name);
+                    }
+                }
+            }
+        }
+    }
+    models
 }
 
 pub fn route_model(model_path: &Path, _prefer_gpu: bool) -> RouteDecision {
@@ -739,9 +753,62 @@ pub async fn query_model_stream(
 ) -> Result<ExecutionStats> {
     match tier {
         EngineTier::Tier1Fast => {
+            if leafcutter::llama_ffi::is_available() {
+                if let Some(local_path) = find_model_file_path(model_name) {
+                    if local_path.is_file() {
+                        let p = local_path.clone();
+                        let pr = if system_prompt.is_empty() {
+                            prompt.to_string()
+                        } else {
+                            format!("{}\n\n{}", system_prompt, prompt)
+                        };
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(TokenType, String)>();
+                        let s = sampling();
+                        let handle = tokio::task::spawn_blocking(move || {
+                            let start = Instant::now();
+                            let ngl = std::env::var("CYNAPSE_N_GPU_LAYERS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(99);
+                            let ctx_size = std::env::var("CYNAPSE_CTX_SIZE")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(4096);
+                            let engine = get_or_load_llama_engine(&p, ngl, ctx_size)
+                                .map_err(|e| anyhow::anyhow!("LlamaInProcessEngine load failed: {}", e))?;
+                            let tokens = engine.generate_stream(&pr, 4096, s.temperature, |piece| {
+                                let _ = tx.send((TokenType::Response, piece.to_string()));
+                            }).map_err(|e| anyhow::anyhow!("LlamaInProcessEngine generate failed: {}", e))?;
+                            let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
+                            let tokens_generated = tokens.len().max(1);
+                            let tok_per_sec = tokens_generated as f64 / elapsed_sec;
+                            let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
+                            Ok::<ExecutionStats, anyhow::Error>(ExecutionStats {
+                                model_name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                                tokens_generated,
+                                elapsed_sec,
+                                tok_per_sec,
+                                avail_ram_gb,
+                            })
+                        });
+
+                        let mut token_received = false;
+                        while let Some((ttype, text)) = rx.recv().await {
+                            token_received = true;
+                            on_token(ttype, &text);
+                        }
+
+                        if let Ok(Ok(stats)) = handle.await {
+                            if token_received {
+                                return Ok(stats);
+                            }
+                        }
+                    }
+                }
+            }
             query_tier1_stream(endpoint, model_name, prompt, system_prompt, on_token).await
         }
-        EngineTier::Tier2LargeGguf | EngineTier::Tier3LargeSafetensor => {
+        EngineTier::Tier2LargeGguf => {
             if let Some(local_path) = find_model_file_path(model_name) {
                 let p = local_path.clone();
                 let pr = prompt.to_string();
@@ -765,6 +832,89 @@ pub async fn query_model_stream(
                 }
             } else {
                 // Fallback to Tier 1 endpoint if local GGUF file is missing
+                query_tier1_stream(endpoint, model_name, prompt, system_prompt, on_token).await
+            }
+        }
+        EngineTier::Tier3LargeSafetensor => {
+            if let Some(local_path) = find_model_file_path(model_name) {
+                if local_path.is_dir() || local_path.extension().map_or(false, |ext| ext == "safetensors") {
+                    let p = if local_path.is_dir() {
+                        local_path.clone()
+                    } else {
+                        local_path.parent().unwrap_or(&local_path).to_path_buf()
+                    };
+                    let pr = prompt.to_string();
+                    let sys = system_prompt.to_string();
+                    let full_prompt = if sys.is_empty() {
+                        pr
+                    } else {
+                        format!("{}\n\n{}", sys, pr)
+                    };
+
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(TokenType, String)>();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        let start = Instant::now();
+                        let mut ornith = leafcutter::streaming_ornith::StreamingOrnith::open(&p)
+                            .map_err(|e| anyhow::anyhow!("StreamingOrnith open failed: {}", e))?;
+                        let mut count = 0usize;
+                        let _out = ornith.generate_stream_with(&full_prompt, 4096, &[], |piece| {
+                            count += 1;
+                            let _ = tx.send((TokenType::Response, piece.to_string()));
+                        }).map_err(|e| anyhow::anyhow!("StreamingOrnith generate failed: {}", e))?;
+                        let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
+                        let tokens_generated = count.max(1);
+                        let tok_per_sec = tokens_generated as f64 / elapsed_sec;
+                        let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
+                        Ok::<ExecutionStats, anyhow::Error>(ExecutionStats {
+                            model_name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                            tokens_generated,
+                            elapsed_sec,
+                            tok_per_sec,
+                            avail_ram_gb,
+                        })
+                    });
+
+                    let mut token_received = false;
+                    while let Some((ttype, text)) = rx.recv().await {
+                        token_received = true;
+                        on_token(ttype, &text);
+                    }
+
+                    if let Ok(res) = handle.await {
+                        match res {
+                            Ok(stats) => return Ok(stats),
+                            Err(e) if token_received => {
+                                anyhow::bail!("Tier 3 streaming error for '{}': {}", model_name, e);
+                            }
+                            Err(_) => {
+                                // Fall through to GGUF streaming
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to Tier 2 native leafcutter GGUF streaming
+                let p = local_path.clone();
+                let pr = prompt.to_string();
+                let sys = system_prompt.to_string();
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(TokenType, String)>();
+                let handle = tokio::task::spawn_blocking(move || {
+                    query_native_leafcutter_stream(&p, &pr, &sys, |ttype, text| {
+                        let _ = tx.send((ttype, text.to_string()));
+                    })
+                });
+
+                while let Some((ttype, text)) = rx.recv().await {
+                    on_token(ttype, &text);
+                }
+
+                match handle.await {
+                    Ok(Ok(stats)) => Ok(stats),
+                    Ok(Err(e)) => anyhow::bail!("Tier 3 streaming error for '{}': {}", model_name, e),
+                    Err(join_err) => anyhow::bail!("Tier 3 streaming task panicked: {}", join_err),
+                }
+            } else {
                 query_tier1_stream(endpoint, model_name, prompt, system_prompt, on_token).await
             }
         }
@@ -935,6 +1085,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 static NATIVE_ENGINE_CACHE: OnceLock<StdMutex<HashMap<String, Arc<leafcutter::api::NativeStreamingEngine>>>> = OnceLock::new();
+static LLAMA_ENGINE_CACHE: OnceLock<StdMutex<HashMap<String, Arc<leafcutter::llama_ffi::LlamaInProcessEngine>>>> = OnceLock::new();
+
+pub fn get_or_load_llama_engine(path: &Path, ngl: i32, ctx_size: u32) -> Result<Arc<leafcutter::llama_ffi::LlamaInProcessEngine>> {
+    let key = path.to_string_lossy().to_string();
+    let cache = LLAMA_ENGINE_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = cache.lock().map_err(|_| anyhow::anyhow!("Llama engine cache lock poisoned"))?;
+
+    if let Some(engine) = guard.get(&key) {
+        return Ok(Arc::clone(engine));
+    }
+
+    let engine = leafcutter::llama_ffi::LlamaInProcessEngine::load(path, ngl, ctx_size)
+        .map_err(|e| anyhow::anyhow!("Failed to load in-process llama engine for {}: {}", path.display(), e))?;
+    let arc_engine = Arc::new(engine);
+    guard.insert(key, Arc::clone(&arc_engine));
+    Ok(arc_engine)
+}
 
 fn get_or_load_native_engine(path_str: &str) -> Result<Arc<leafcutter::api::NativeStreamingEngine>> {
     let cache = NATIVE_ENGINE_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
@@ -1038,6 +1205,7 @@ async fn parse_http_stream(
 ) -> Result<ExecutionStats> {
     let mut stream = res.bytes_stream();
     let mut tokens_generated = 0usize;
+    let mut first_token_time: Option<Instant> = None;
     let _is_reasoning = is_reasoning_model(model_name);
     let mut is_thinking = false;
     let mut buffer = String::with_capacity(65536);
@@ -1067,6 +1235,9 @@ async fn parse_http_stream(
                 if let Some((extracted_type, token)) = parsed.extract_token_and_type() {
                     if !token.is_empty() {
                         tokens_generated += 1;
+                        if first_token_time.is_none() {
+                            first_token_time = Some(Instant::now());
+                        }
 
                         if token.contains("<think>") {
                             is_thinking = true;
@@ -1095,7 +1266,16 @@ async fn parse_http_stream(
     }
 
     let elapsed_sec = start.elapsed().as_secs_f64().max(0.001);
-    let tok_per_sec = tokens_generated as f64 / elapsed_sec;
+    let tok_per_sec = if tokens_generated > 1 {
+        if let Some(ft) = first_token_time {
+            let gen_elapsed = ft.elapsed().as_secs_f64().max(0.001);
+            (tokens_generated - 1) as f64 / gen_elapsed
+        } else {
+            tokens_generated as f64 / elapsed_sec
+        }
+    } else {
+        tokens_generated as f64 / elapsed_sec
+    };
     let avail_ram_gb = available_ram_mb() as f64 / 1024.0;
 
     Ok(ExecutionStats {
@@ -1180,8 +1360,12 @@ pub async fn try_ollama_stream(
     on_token: impl FnMut(TokenType, &str),
 ) -> Result<ExecutionStats> {
     let client = shared_http_client();
-    let available_tags = fetch_ollama_models(endpoint).await;
-    let resolved = resolve_model_tag(model_name, &available_tags);
+    let resolved = if model_name.contains(':') {
+        model_name.to_string()
+    } else {
+        let available_tags = fetch_ollama_models(endpoint).await;
+        resolve_model_tag(model_name, &available_tags)
+    };
     let ollama_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
     let (slot_id, cache_prompt) = slots::SlotManager::slot_params(slots::SlotPurpose::Interactive);
     let s = sampling();
@@ -1308,7 +1492,7 @@ pub async fn query_tier1_stream(
     };
 
     let mut candidate_providers = vec![resolved_provider];
-    for p in [ProviderKind::NativeLeafcutter, ProviderKind::LlamaServer, ProviderKind::Ollama] {
+    for p in [ProviderKind::Ollama, ProviderKind::NativeLeafcutter, ProviderKind::LlamaServer] {
         if !candidate_providers.contains(&p) {
             candidate_providers.push(p);
         }
@@ -1317,6 +1501,12 @@ pub async fn query_tier1_stream(
     let mut last_error = String::new();
 
     for provider in candidate_providers {
+        engine_log(&format!(
+            "query_tier1_stream trying provider '{}' for model '{}' (endpoint: '{}')",
+            provider.name(),
+            model_name,
+            endpoint
+        ));
         let result = match provider {
             ProviderKind::LlamaServer => {
                 try_llama_server_stream(model_name, prompt, system_prompt, &mut on_token).await
@@ -1372,7 +1562,60 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
     let client = shared_http_client();
     let endpoint_clean = endpoint.trim_end_matches('/');
 
-    // 1. Check if Ollama is running and pin with keep_alive: -1
+    engine_log(&format!("preload_model requested for '{}' on '{}'", model_name, endpoint));
+
+    // 1. In-process Tier 1 (llama.cpp FFI) preloading into memory cache
+    if leafcutter::llama_ffi::is_available() {
+        if let Some(local_path) = find_model_file_path(model_name) {
+            if local_path.is_file() {
+                let ngl = std::env::var("CYNAPSE_N_GPU_LAYERS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(99);
+                let ctx_size = std::env::var("CYNAPSE_CTX_SIZE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4096);
+                engine_log(&format!("Preloading Tier 1 in-process llama model: {}", local_path.display()));
+                let lp = local_path.clone();
+                match tokio::task::spawn_blocking(move || get_or_load_llama_engine(&lp, ngl, ctx_size)).await {
+                    Ok(Ok(_)) => {
+                        engine_log(&format!("Tier 1 in-process llama model preloaded into RAM: {}", local_path.display()));
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        engine_log(&format!("Tier 1 in-process preload notice: {}", e));
+                    }
+                    Err(join_err) => {
+                        engine_log(&format!("Tier 1 in-process preload task error: {}", join_err));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. In-process Tier 2 (Leafcutter pure Rust) preloading into memory cache
+    if let Some(local_path) = find_model_file_path(model_name) {
+        if local_path.is_file() && local_path.extension().map_or(false, |ext| ext == "gguf") {
+            let path_str = local_path.to_string_lossy().to_string();
+            engine_log(&format!("Preloading Tier 2 native Leafcutter model: {}", path_str));
+            let ps = path_str.clone();
+            match tokio::task::spawn_blocking(move || get_or_load_native_engine(&ps)).await {
+                Ok(Ok(_)) => {
+                    engine_log(&format!("Tier 2 native Leafcutter model preloaded into RAM: {}", path_str));
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    engine_log(&format!("Tier 2 native preload notice: {}", e));
+                }
+                Err(join_err) => {
+                    engine_log(&format!("Tier 2 native preload task error: {}", join_err));
+                }
+            }
+        }
+    }
+
+    // 3. Check if Ollama is running and pin with keep_alive: -1
     let tags_url = format!("{}/api/tags", endpoint_clean);
     if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_secs(3)).send().await {
         if resp.status().is_success() {
@@ -1383,12 +1626,21 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
                 "model": resolved,
                 "keep_alive": -1
             });
-            let _ = client.post(&gen_url)
+            engine_log(&format!("Preloading model '{}' (resolved as '{}') via Ollama /api/generate keep_alive: -1", model_name, resolved));
+            match client.post(&gen_url)
                 .json(&payload)
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(90))
                 .send()
-                .await;
-            return Ok(());
+                .await
+            {
+                Ok(r) => {
+                    engine_log(&format!("Ollama preload completed with status: {}", r.status()));
+                    return Ok(());
+                }
+                Err(e) => {
+                    engine_log(&format!("Ollama preload request error: {}", e));
+                }
+            }
         }
     }
 
@@ -1396,6 +1648,7 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
     let daemon_port = daemon::DEFAULT_DAEMON_PORT;
     if !daemon::LlamaServerDaemon::is_healthy(daemon_port) {
         if let Some(local_path) = find_model_file_path(model_name) {
+            engine_log(&format!("Spawning local llama-server daemon for '{}'", local_path.display()));
             let _ = daemon::LlamaServerDaemon::get_or_spawn_daemon(&local_path, daemon_port);
         }
     }

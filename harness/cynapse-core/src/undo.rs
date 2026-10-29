@@ -25,7 +25,9 @@ pub struct JournalEntry {
 }
 
 pub struct UndoJournal {
+    #[allow(dead_code)]
     session_id: String,
+    #[allow(dead_code)]
     journal_dir: PathBuf,
     history: Mutex<Vec<JournalEntry>>,
 }

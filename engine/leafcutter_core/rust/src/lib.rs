@@ -67,8 +67,41 @@ pub mod llama_ffi {
         pub fn generate(&mut self, _prompt: &[i32], _max_tokens: usize, _temperature: f32, _eos_token: i32) -> Vec<i32> {
             vec![]
         }
+        pub fn generate_stream<F>(
+            &mut self,
+            _prompt_tokens: &[i32],
+            _max_tokens: usize,
+            _temperature: f32,
+            _eos_token: i32,
+            _on_token: F,
+        ) -> Vec<i32>
+        where
+            F: FnMut(&str),
+        {
+            vec![]
+        }
         pub fn sample_greedy(&self) -> i32 { 0 }
         pub fn sample_temperature(&self, _t: f32) -> i32 { 0 }
+    }
+
+    pub struct LlamaInProcessEngine;
+
+    impl LlamaInProcessEngine {
+        pub fn load(_path: &std::path::Path, _n_gpu_layers: i32, _n_ctx: u32) -> Result<Self, String> {
+            Err("llama.cpp FFI not available. Build with --features llama-ffi".into())
+        }
+        pub fn generate_stream<F>(
+            &self,
+            _prompt: &str,
+            _max_tokens: usize,
+            _temperature: f32,
+            _on_token: F,
+        ) -> Result<Vec<i32>, String>
+        where
+            F: FnMut(&str),
+        {
+            Err("llama.cpp FFI not available. Build with --features llama-ffi".into())
+        }
     }
 }
 

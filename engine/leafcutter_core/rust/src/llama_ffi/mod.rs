@@ -363,6 +363,68 @@ impl LlamaContext {
             };
         }
 
+    /// Streaming text generation autoregressively from a prompt.
+    pub fn generate_stream<F>(
+        &mut self,
+        prompt_tokens: &[llama_token],
+        max_tokens: usize,
+        temperature: f32,
+        eos_token: llama_token,
+        mut on_token: F,
+    ) -> Vec<llama_token>
+    where
+        F: FnMut(&str),
+    {
+        if prompt_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        let mut generated = Vec::new();
+
+        // Prefill: feed all prompt tokens at once
+        {
+            let mut batch = match LlamaBatch::new(prompt_tokens.len() as i32, 1) {
+                Ok(b) => b,
+                Err(_) => return Vec::new(),
+            };
+            batch.set_tokens(prompt_tokens);
+
+            unsafe {
+                let ret = bindings::llama_decode(self.ptr.as_ptr(), batch.inner);
+                if ret != 0 {
+                    return Vec::new();
+                }
+            }
+        }
+
+        let mut pos = prompt_tokens.len() as llama_pos;
+
+        let mut next_token = if temperature <= 0.0 {
+            self.sample_greedy()
+        } else {
+            self.sample_temperature(temperature)
+        };
+
+        for _ in 0..max_tokens {
+            if next_token == eos_token {
+                break;
+            }
+            let piece = self.token_to_piece(next_token);
+            on_token(&piece);
+            generated.push(next_token);
+
+            if self.decode_single(next_token, pos).is_err() {
+                break;
+            }
+            pos += 1;
+
+            next_token = if temperature <= 0.0 {
+                self.sample_greedy()
+            } else {
+                self.sample_temperature(temperature)
+            };
+        }
+
         generated
     }
 
@@ -462,3 +524,43 @@ pub fn backend_free() {
         bindings::llama_backend_free();
     }
 }
+
+/// In-process native llama.cpp execution engine for Tier 1 Fast.
+pub struct LlamaInProcessEngine {
+    model: std::sync::Arc<LlamaModel>,
+    context: std::sync::Mutex<LlamaContext>,
+}
+
+impl LlamaInProcessEngine {
+    pub fn load(path: &Path, n_gpu_layers: i32, n_ctx: u32) -> Result<Self, String> {
+        let model = std::sync::Arc::new(LlamaModel::load(path, n_gpu_layers)?);
+        let n_threads = std::env::var("CYNAPSE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                let total = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let phys = if total > 4 { total / 2 } else { total };
+                phys.clamp(2, 8) as i32
+            });
+        let context = std::sync::Mutex::new(LlamaContext::new(&model, n_ctx, n_threads)?);
+        Ok(Self { model, context })
+    }
+
+    pub fn generate_stream<F>(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        mut on_token: F,
+    ) -> Result<Vec<llama_token>, String>
+    where
+        F: FnMut(&str),
+    {
+        let mut ctx = self.context.lock().map_err(|_| "Context lock poisoned".to_string())?;
+        let tokens = ctx.tokenize(prompt, true, true);
+        let eos = self.model.eos_token();
+        let generated = ctx.generate_stream(&tokens, max_tokens, temperature, eos, &mut on_token);
+        Ok(generated)
+    }
+}
+

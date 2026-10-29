@@ -367,7 +367,6 @@ pub fn q6_k_dot_q8_k_scalar(
         let mut aux8 = [0i8; Q6QK];
         let mut ql_off = 0usize;
         let mut qh_off = 0usize;
-        let mut sc_off = 0usize;
         let mut idx = 0usize;
         for _ in 0..(Q6QK / 128) {
             for l in 0..32 {
@@ -388,7 +387,6 @@ pub fn q6_k_dot_q8_k_scalar(
             idx += 128;
             ql_off += 64;
             qh_off += 32;
-            sc_off += 8;
         }
 
         // Sum over 128-value halves, each with 8 i8 scales covering 16 values.

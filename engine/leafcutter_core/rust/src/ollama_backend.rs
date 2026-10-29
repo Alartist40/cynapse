@@ -53,12 +53,12 @@ pub struct ChatMessage {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
-    model: String,
-    message: ChatMessage,
-    done: bool,
+pub struct ChatResponse {
+    pub model: String,
+    pub message: ChatMessage,
+    pub done: bool,
     #[serde(default)]
-    done_reason: Option<String>,
+    pub done_reason: Option<String>,
 }
 
 impl OllamaClient {

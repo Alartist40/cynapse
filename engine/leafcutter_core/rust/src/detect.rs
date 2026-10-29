@@ -59,6 +59,8 @@ impl GpuKind {
 pub enum NpuKind {
     /// No NPU found.
     None,
+    /// AMD XDNA / Ryzen AI NPU (`/dev/accel/accel*`, driver `amdxdna`, XRT runtime).
+    AmdXdna,
     /// Arm China Zhouyi AIPU (`/dev/aipu`, kernel driver aliases
     /// `armchina,zhouyi-*`; used by e.g. the CIX Sky1 SoC).
     ZhouyiAipu,
@@ -72,6 +74,7 @@ impl NpuKind {
     pub fn label(self) -> &'static str {
         match self {
             NpuKind::None => "none",
+            NpuKind::AmdXdna => "amd-xdna",
             NpuKind::ZhouyiAipu => "zhouyi-aipu",
             NpuKind::RockchipRknpu => "rockchip-rknpu",
             NpuKind::Other => "other",
@@ -82,15 +85,82 @@ impl NpuKind {
         self != NpuKind::None
     }
 
-    /// True when the NPU accepts arbitrary LLM compute at runtime.  Zhouyi
-    /// AIPUs (like most embedded NPUs) only run precompiled `.aipu.bin`
-    /// graphs compiled by Arm China's offline compiler — there is no
-    /// userland runtime that can stream llama.cpp ops through them, so this
-    /// is always false today.  Kept as a method so a future dynamic-offload
-    /// NPU (e.g. a full Ethos-U with a live runtime) can opt in without
-    /// changing call sites.
+    /// True when the NPU accepts arbitrary LLM compute at runtime.
     pub fn supports_dynamic_offload(self) -> bool {
-        false
+        matches!(self, NpuKind::AmdXdna)
+    }
+}
+
+/// Host CPU SIMD vector feature set (reverse-engineered from Colibri compat.h & setup_hw.py).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuFeatures {
+    pub avx2: bool,
+    pub avx512f: bool,
+    pub avx512vnni: bool,
+    pub fma: bool,
+    pub neon: bool,
+    pub neon_dotprod: bool,
+}
+
+impl CpuFeatures {
+    pub fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self {
+                avx2: is_x86_feature_detected!("avx2"),
+                avx512f: is_x86_feature_detected!("avx512f"),
+                avx512vnni: is_x86_feature_detected!("avx512vnni"),
+                fma: is_x86_feature_detected!("fma"),
+                neon: false,
+                neon_dotprod: false,
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self {
+                avx2: false,
+                avx512f: false,
+                avx512vnni: false,
+                fma: false,
+                neon: true,
+                neon_dotprod: cfg!(target_feature = "dotprod"),
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Self {
+                avx2: false,
+                avx512f: false,
+                avx512vnni: false,
+                fma: false,
+                neon: false,
+                neon_dotprod: false,
+            }
+        }
+    }
+}
+
+/// Optimal compute execution target determined by hardware detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeTarget {
+    Cuda,
+    Vulkan,
+    Metal,
+    Rocm,
+    NpuXdna,
+    CpuSimd,
+}
+
+impl ComputeTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            ComputeTarget::Cuda => "CUDA GPU",
+            ComputeTarget::Vulkan => "Vulkan GPU",
+            ComputeTarget::Metal => "Apple Metal GPU",
+            ComputeTarget::Rocm => "ROCm GPU",
+            ComputeTarget::NpuXdna => "AMD XDNA NPU",
+            ComputeTarget::CpuSimd => "CPU Vector SIMD",
+        }
     }
 }
 
@@ -101,8 +171,10 @@ pub struct HardwareInfo {
     pub ram_total_mb: u64,
     pub ram_available_mb: u64,
     pub gpu: GpuKind,
-    /// Fixed-function NPU, if any (reported but never used for offload).
+    /// NPU accelerator, if any.
     pub npu: NpuKind,
+    /// CPU SIMD capabilities.
+    pub cpu_features: CpuFeatures,
     /// Host OS (linux, macos, windows, ...).
     pub os: &'static str,
     /// CPU architecture (x86_64, aarch64, ...).
@@ -120,8 +192,26 @@ impl HardwareInfo {
             ram_available_mb: avail,
             gpu: probe_gpu(),
             npu: probe_npu(),
+            cpu_features: CpuFeatures::detect(),
             os: current_os(),
             arch: current_arch(),
+        }
+    }
+
+    /// Select the best available compute hardware target.
+    pub fn best_compute_target(&self) -> ComputeTarget {
+        match self.gpu {
+            GpuKind::Cuda => ComputeTarget::Cuda,
+            GpuKind::Metal => ComputeTarget::Metal,
+            GpuKind::Rocm => ComputeTarget::Rocm,
+            GpuKind::Vulkan => ComputeTarget::Vulkan,
+            GpuKind::None => {
+                if self.npu == NpuKind::AmdXdna {
+                    ComputeTarget::NpuXdna
+                } else {
+                    ComputeTarget::CpuSimd
+                }
+            }
         }
     }
 }
@@ -389,6 +479,13 @@ fn path_exists(p: &str) -> bool {
 /// other Arm-NPU SoCs.  Other NPU driver nodes fall back to `NpuKind::Other`
 /// when present.  NPUs are never treated as GPUs for tier dispatch.
 fn probe_npu() -> NpuKind {
+    // AMD XDNA NPU (Ryzen AI) exposed via Linux compute accelerator subsystem /dev/accel/accel*
+    if path_exists("/dev/accel/accel0")
+        || path_exists("/dev/amdxdna")
+        || Path::new("/sys/class/accel").exists()
+    {
+        return NpuKind::AmdXdna;
+    }
     if path_exists("/dev/aipu") || sysfs_misc_exists("aipu") {
         return NpuKind::ZhouyiAipu;
     }
@@ -519,17 +616,23 @@ mod tests {
     #[test]
     fn npu_kind_labels_and_never_offloads() {
         assert_eq!(NpuKind::None.label(), "none");
+        assert_eq!(NpuKind::AmdXdna.label(), "amd-xdna");
         assert_eq!(NpuKind::ZhouyiAipu.label(), "zhouyi-aipu");
         assert_eq!(NpuKind::RockchipRknpu.label(), "rockchip-rknpu");
         assert_eq!(NpuKind::Other.label(), "other");
         assert!(!NpuKind::None.is_present());
+        assert!(NpuKind::AmdXdna.is_present());
         assert!(NpuKind::ZhouyiAipu.is_present());
         assert!(NpuKind::RockchipRknpu.is_present());
+        assert!(NpuKind::AmdXdna.supports_dynamic_offload());
         assert!(!NpuKind::ZhouyiAipu.supports_dynamic_offload());
         assert!(!NpuKind::RockchipRknpu.supports_dynamic_offload());
         // An NPU must never upgrade the tier to GPU even if present.
         let hw = HardwareInfo { npu: NpuKind::RockchipRknpu, gpu: GpuKind::None, ..probe_hardware() };
         assert_eq!(choose_tier(hw.gpu, hw.ram_available_mb, 40_000_000_000, true), Tier::StreamingCpu);
+        assert_eq!(hw.best_compute_target(), ComputeTarget::CpuSimd);
+        let xdna_hw = HardwareInfo { npu: NpuKind::AmdXdna, gpu: GpuKind::None, ..probe_hardware() };
+        assert_eq!(xdna_hw.best_compute_target(), ComputeTarget::NpuXdna);
     }
 
     #[test]

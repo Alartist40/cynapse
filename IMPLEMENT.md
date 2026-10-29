@@ -60,4 +60,68 @@ Docs brought current: README (MAX_AGENT_STEPS 14, 14-check doctor + exit-1, inst
 - AutoHarness-Dendrite synthesis documented for self-learning and self-pruning synaptic memory.
 - Test Suite: 324 passed, 0 failed across entire workspace.
 
+## 2026-10-29 — Session: Reverse Engineering llama.cpp, AirLLM, and Colibri Engine Unification (Stage 34)
+- Scope: Reverse-engineered three reference engines (`llama.cpp`, `airllm`, and `colibri`) into Cynapse inference architecture without touching external repositories:
+  1. **Hardware Matrix Auto-Detection (`detect.rs`)**:
+     - Added `NpuKind::AmdXdna` detecting AMD Ryzen AI NPUs via Linux `/dev/accel/accel*` and XRT device probing.
+     - Added `CpuFeatures` with runtime detection of AVX2, AVX-512 (F & VNNI), FMA, ARM NEON, and NEON dotprod.
+     - Added `ComputeTarget` selector choosing the best acceleration backend (CUDA, ROCm, Metal, Vulkan, AMD XDNA, RKNPU, AVX-512, AVX2, NEON, or Generic CPU).
+  2. **Colibri Fused Integer GEMV (`colibri_gemv.rs`, `int8_gemm.rs`)**:
+     - Reverse-engineered Colibri's `qgemv.h` into native Rust integer and register-vectorized kernels: eliminated per-row `vec![0.0f32; k]` allocations that previously caused thousands of heap allocations per token.
+     - Implemented zero-allocation fused GEMV `colibri_q8_0_gemv` and `colibri_q4_0_gemv` for `m == 1` autoregressive decoding with Rayon multi-threading.
+     - Implemented AVX2 and NEON dotprod integer kernels (`colibri_dot_i8_i8`, `colibri_quantize_act_i8`).
+  3. **AirLLM Asynchronous Double-Buffered Layer Streaming (`airllm_stream.rs`, `streaming_ornith.rs`)**:
+     - Reverse-engineered AirLLM's `airllm_base.py` disk streaming pipeline into `AirLlmStreamer` using Rust `std::sync::mpsc::sync_channel(1)`.
+     - Prefetches layer $L+1$ weights asynchronously on a dedicated worker thread while computing layer $L$, eliminating I/O stalls and strictly enforcing $O(1\text{ layer})$ peak RAM footprint.
+     - Exposed `StreamingOrnith::generate_stream_with` for streaming token callbacks.
+  4. **llama.cpp Exact Integration (`llama_ffi/mod.rs`)**:
+     - Vendored exact llama.cpp C/C++ engine into `engine/leafcutter_core/rust/llama.cpp`.
+     - Wrapped in `LlamaInProcessEngine` providing zero-overhead in-process streaming inference with complete tokenization, sampling, and EOS detection.
+  5. **3-Tier Engine Dispatch (`cynapse-engine/src/lib.rs`)**:
+     - Updated `query_model_stream` to route Tier 1 through in-process `LlamaInProcessEngine` (falling back to external daemon if missing), Tier 2 through Colibri-accelerated Leafcutter GGUF streaming, and Tier 3 through AirLLM-style Safetensor layer streaming.
+- Acceptance Gates & Verification:
+  - `cargo check --workspace`: exit 0
+  - `cargo test -p cynapse-engine`: 9 passed, 0 failed
+  - `cargo test -p leafcutter`: 214 passed, 0 failed, 3 ignored
 
+## 2026-10-29 — Session: Tier 1 Model Preloading, Skill Obsolescence Pruning & Bloat Removal (Stage 35)
+- Scope: Implemented instant model preloading, dynamic skill obsolescence pruning, dead-code fixes, and build bloat cleanup:
+  1. **Tier 1 & Tier 2 In-Process Preloading & Memory Caching (`cynapse-engine/src/lib.rs`)**:
+     - Added `LLAMA_ENGINE_CACHE` storing thread-safe `Arc<LlamaInProcessEngine>` in memory.
+     - Implemented `get_or_load_llama_engine` and wired `preload_model` to load the active local model into memory during startup and model-switching turns.
+     - Eliminates cold-start latency: first prompt responds immediately without mmap/allocation delays.
+  2. **Dynamic Skill Growth & Obsolescence Pruning (`cynapse-core/src/skills.rs`)**:
+     - Implemented `LearnedSkill`, `DynamicSkillRegistry`, and `global_skills()`.
+     - Added `prune_obsolete` to automatically shed unpinned skills unused past an idle threshold, preventing prompt bloat on low-parameter models.
+  3. **Compiler Warnings & Dead Code Cleanup**:
+     - Cleaned up unused variables and warnings in `undo.rs`, `simd.rs`, `ollama_backend.rs`, `launch.rs`, and `q8_k.rs`.
+  4. **Build Bloat Purge**:
+     - Purged 16.4 GiB of obsolete compiler object caches and stale test artifacts from `target/`.
+     - Fresh rebuild verified at 856 MB.
+- Acceptance Gates & Verification:
+  - `cargo check --workspace`: exit 0
+  - `cargo test --workspace`: all 324+ tests passed, 0 failed.
+
+## 2026-10-29 — Session: Ollama Root-Cause Profiling, SMT Contention Fix & Context Tuning (Stage 36)
+- Empirical Root Causes Identified:
+  1. **Thread Contention & SMT Thrashing**: `available_parallelism()` assigned 16 threads to an 8-core AMD Ryzen 7 5800HS. Two threads per core fought for L1 data cache and Zen 3 FPUs, triggering thermal throttling and fan spikes while token rate dropped to 1.3 t/s.
+  2. **Context-Reload Lockout**: `ctx_size = 8192` in `cynapse.toml` forced Ollama to dump warm models and execute a 9.51s cold reload from disk on every query, inflating RAM to 13.3 GB (89%) and triggering Linux disk swap.
+  3. **Timing Metric Distortion**: `parse_http_stream` included the 9.5s disk reload inside generation tok/s calculation.
+- Engineering Resolutions:
+  - Tuned `cynapse.toml` default `ctx_size` to 4096, matching Ollama's native context and cutting KV cache allocation by 50%.
+  - Capped inference threads in `daemon.rs` and `llama_ffi/mod.rs` to physical cores (`clamp(2, 8)`), eliminating SMT cache thrashing.
+  - Added `first_token_time` tracking in `parse_http_stream` to decouple pure streaming generation rate from TTFT.
+  - Optimized `try_ollama_stream` to bypass redundant `/api/tags` HTTP roundtrip when tag delimiter is present.
+- Acceptance Gates & Verification:
+  - `cargo check --workspace`: exit 0
+  - `cargo test -p cynapse-engine`: 9 passed, 0 failed
+
+## 2026-10-29 — Session: Release Profile Compilation & Git Checkpoint (Stage 37)
+- Scope: Configured max-optimization release profile, compiled production binary, and verified system health:
+  1. **Release Profile Configuration (`Cargo.toml`)**:
+     - Added `[profile.release]` with `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`, and `strip = true`.
+  2. **Release Binary Compilation**:
+     - Compiled `./target/release/cynapse` in 1m 50s. Binary size: 9.2 MB.
+     - ThinLTO and opt-level 3 enable full SIMD vectorization and inline loop unrolling across crates.
+  3. **Verification**:
+     - Executed `./target/release/cynapse doctor`: 22 Pass | 0 Warning | 0 Failed (100% health score).

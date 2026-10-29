@@ -8,8 +8,10 @@ pub mod format;
 pub mod loader;
 pub mod writer;
 pub mod lfru_cache;
+pub mod airllm_stream;
 
 pub use format::{ShardHeader, ShardTensorMeta, QuantFormat};
 pub use loader::{ShardLoader, Manifest, LayerCache, CachePolicy, ShardCache};
 pub use lfru_cache::{LfruCache, CacheStats};
 pub use writer::split_gguf_model;
+pub use airllm_stream::AirLlmStreamer;

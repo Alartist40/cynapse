@@ -418,6 +418,7 @@ pub fn simd_sum_sq(data: &[f32]) -> f32 {
 pub fn simd_silu(x: &[f32], out: &mut [f32]) {
     debug_assert_eq!(x.len(), out.len());
     let len = x.len();
+    #[allow(unused_mut)]
     let mut i = 0;
 
     #[cfg(target_arch = "aarch64")]

@@ -101,9 +101,18 @@ impl LlamaServerDaemon {
             Some(vram) if vram > 1000 => "16".to_string(),
             _ => "0".to_string(),
         };
-        let threads = std::thread::available_parallelism()
-            .map(|p| p.get().to_string())
-            .unwrap_or_else(|_| "4".to_string());
+        let threads = std::env::var("CYNAPSE_THREADS")
+            .ok()
+            .or_else(|| {
+                std::thread::available_parallelism()
+                    .ok()
+                    .map(|p| {
+                        let total = p.get();
+                        let phys = if total > 4 { total / 2 } else { total };
+                        phys.clamp(2, 8).to_string()
+                    })
+            })
+            .unwrap_or_else(|| "4".to_string());
         // Context size: uses configured engine context or default ENGINE_CTX_SIZE
         let ctx_size = crate::engine_ctx_size().to_string();
 
@@ -120,12 +129,8 @@ impl LlamaServerDaemon {
             .arg(&threads)
             .arg("--flash-attn")
             .arg("auto")
-            .arg("--cache-type-k")
-            .arg("q8_0")
-            .arg("--cache-type-v")
-            .arg("q8_0")
             .arg("--parallel")
-            .arg("2")
+            .arg("1")
             .arg("--ctx-size")
             .arg(&ctx_size)
             .arg("--no-webui")

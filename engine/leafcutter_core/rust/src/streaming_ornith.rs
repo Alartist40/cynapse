@@ -762,6 +762,35 @@ impl StreamingOrnith {
         Ok(self.tok.decode(&ids))
     }
 
+    /// Streaming generation with callback for each token piece (AirLLM-style layer streaming output).
+    pub fn generate_stream_with<F>(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        stop_tokens: &[i32],
+        mut on_token: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str),
+    {
+        let mut ids = self.tok.encode(prompt, 1024);
+        let (temperature, top_p) = crate::inference::sampler::default_sampling();
+        let top_k = crate::inference::sampler::resolve_top_k();
+        for _ in 0..max_tokens {
+            let last = *ids.last().unwrap() as i32;
+            let pos = ids.len() - 1;
+            let logits = self.forward_one_token(last, pos)?;
+            let next = crate::inference::sampler::sample_top_p_top_k(&logits, temperature, top_p, top_k) as i32;
+            if stop_tokens.contains(&next) {
+                break;
+            }
+            ids.push(next);
+            let text = self.tok.decode(&[next]);
+            on_token(&text);
+        }
+        Ok(self.tok.decode(&ids))
+    }
+
     /// Chat convenience: wraps input in the Ornith chat template and
     /// stops at `<|im_end|>` (looked up dynamically from the tokenizer).
     pub fn chat(&mut self, user_input: &str, max_tokens: usize) -> Result<String, String> {

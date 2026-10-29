@@ -373,7 +373,6 @@ fn rewrite_cynapse_yaml(text: &str, model_path: &str, leafcutter_path: &str) -> 
         out.push_str("llm:\n    provider: leafcutter\n");
         out.push_str(&format!("    model: {}\n", model_path));
         out.push_str(&format!("    leafcutter_path: {}\n", leafcutter_path));
-        wrote = true;
     } else if !wrote {
         out.push_str(&format!("    model: {}\n", model_path));
         out.push_str(&format!("    leafcutter_path: {}\n", leafcutter_path));
