@@ -2476,14 +2476,23 @@ impl TuiApp {
                     }
 
                     if !reprompting {
+                        let (final_content, final_thinking) = if self.current_response_buf.trim().is_empty() && !self.current_thinking_buf.trim().is_empty() {
+                            (self.current_thinking_buf.clone(), None)
+                        } else {
+                            (
+                                self.current_response_buf.clone(),
+                                if self.current_thinking_buf.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.current_thinking_buf.clone())
+                                },
+                            )
+                        };
+
                         self.messages.push(ChatMessage {
                             role: "assistant".into(),
-                            content: self.current_response_buf.clone(),
-                            thinking: if self.current_thinking_buf.is_empty() {
-                                None
-                            } else {
-                                Some(self.current_thinking_buf.clone())
-                            },
+                            content: final_content,
+                            thinking: final_thinking,
                         });
                         self.save_current_session();
 

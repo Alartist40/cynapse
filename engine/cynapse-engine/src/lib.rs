@@ -801,6 +801,7 @@ struct StreamChoice {
 struct StreamChunk {
     response: Option<String>,
     content: Option<String>,
+    thinking: Option<String>,
     message: Option<StreamMessage>,
     choices: Option<Vec<StreamChoice>>,
     #[allow(dead_code)]
@@ -810,21 +811,26 @@ struct StreamChunk {
 }
 
 impl StreamChunk {
-    fn extract_token(&self) -> Option<String> {
+    fn extract_token_and_type(&self) -> Option<(TokenType, String)> {
+        if let Some(t) = &self.thinking {
+            if !t.is_empty() {
+                return Some((TokenType::Thinking, t.clone()));
+            }
+        }
         if let Some(r) = &self.response {
             if !r.is_empty() {
-                return Some(r.clone());
+                return Some((TokenType::Response, r.clone()));
             }
         }
         if let Some(c) = &self.content {
             if !c.is_empty() {
-                return Some(c.clone());
+                return Some((TokenType::Response, c.clone()));
             }
         }
         if let Some(m) = &self.message {
             if let Some(c) = &m.content {
                 if !c.is_empty() {
-                    return Some(c.clone());
+                    return Some((TokenType::Response, c.clone()));
                 }
             }
         }
@@ -833,13 +839,13 @@ impl StreamChunk {
                 if let Some(d) = &first.delta {
                     if let Some(c) = &d.content {
                         if !c.is_empty() {
-                            return Some(c.clone());
+                            return Some((TokenType::Response, c.clone()));
                         }
                     }
                 }
                 if let Some(t) = &first.text {
                     if !t.is_empty() {
-                        return Some(t.clone());
+                        return Some((TokenType::Response, t.clone()));
                     }
                 }
             }
@@ -970,8 +976,8 @@ pub fn query_native_leafcutter_stream(
     };
 
     let start = Instant::now();
-    let is_reasoning = is_reasoning_model(&path_str);
-    let mut is_thinking = is_reasoning;
+    let _is_reasoning = is_reasoning_model(&path_str);
+    let mut is_thinking = false;
     let s = sampling();
 
     let (_text, tokens) = engine
@@ -1032,8 +1038,8 @@ async fn parse_http_stream(
 ) -> Result<ExecutionStats> {
     let mut stream = res.bytes_stream();
     let mut tokens_generated = 0usize;
-    let is_reasoning = is_reasoning_model(model_name);
-    let mut is_thinking = is_reasoning;
+    let _is_reasoning = is_reasoning_model(model_name);
+    let mut is_thinking = false;
     let mut buffer = String::with_capacity(65536);
 
     while let Some(item) = stream.next().await {
@@ -1058,7 +1064,7 @@ async fn parse_http_stream(
             }
 
             if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&line) {
-                if let Some(token) = parsed.extract_token() {
+                if let Some((extracted_type, token)) = parsed.extract_token_and_type() {
                     if !token.is_empty() {
                         tokens_generated += 1;
 
@@ -1075,7 +1081,11 @@ async fn parse_http_stream(
                             }
                             is_thinking = false;
                         } else {
-                            let ttype = if is_thinking { TokenType::Thinking } else { TokenType::Response };
+                            let ttype = if extracted_type == TokenType::Thinking || is_thinking {
+                                TokenType::Thinking
+                            } else {
+                                TokenType::Response
+                            };
                             on_token(ttype, &token);
                         }
                     }
