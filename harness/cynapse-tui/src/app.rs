@@ -174,6 +174,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/backup", description: "Create or restore AES-256-GCM encrypted backup of memory database" },
     SlashCommand { name: "/session", description: "Open saved sessions manager" },
     SlashCommand { name: "/undo", description: "Undo latest file modifications or edits made by the agent" },
+    SlashCommand { name: "/update", description: "Check, pull, and compile latest Cynapse updates from git" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
     SlashCommand { name: "/exit", description: "Exit Cynapse TUI" },
 ];
@@ -325,6 +326,7 @@ pub struct TuiApp {
     pub approval_tx: mpsc::UnboundedSender<ToolApprovalRequest>,
     pub approval_rx: mpsc::UnboundedReceiver<ToolApprovalRequest>,
     pub pending_approval: Option<PendingToolApproval>,
+    pub update_notification: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TuiApp {
@@ -429,6 +431,23 @@ impl TuiApp {
             approval_tx,
             approval_rx,
             pending_approval: None,
+            update_notification: {
+                let slot = Arc::new(std::sync::Mutex::new(None));
+                let worker_slot = slot.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let repo_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                        if let Ok(Some(info)) = cynapse_core::updater::check_for_updates(&repo_dir) {
+                            if info.has_update {
+                                if let Ok(mut lock) = worker_slot.lock() {
+                                    *lock = Some(info.summary());
+                                }
+                            }
+                        }
+                    });
+                }
+                slot
+            },
         }
     }
 
@@ -1043,6 +1062,18 @@ impl TuiApp {
         }
     }
 
+    fn poll_update_notification(&mut self) {
+        if let Ok(mut lock) = self.update_notification.lock() {
+            if let Some(msg) = lock.take() {
+                self.messages.push(ChatMessage {
+                    role: "system".into(),
+                    content: format!("◖UPDATE◗ {}", msg),
+                    thinking: None,
+                });
+            }
+        }
+    }
+
     async fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
             self.anim_tick += 1;
@@ -1056,6 +1087,7 @@ impl TuiApp {
 
             self.poll_stream_events();
             self.poll_download_events();
+            self.poll_update_notification();
 
             terminal.draw(|f| self.ui(f))?;
 
@@ -1749,6 +1781,49 @@ impl TuiApp {
                                 if trimmed == "/session" || trimmed == "/sessions" {
                                     self.selected_session_idx = 0;
                                     self.modal = ActiveModal::SessionList;
+                                    continue;
+                                }
+
+                                if trimmed == "/update" || trimmed == "/upgrade" {
+                                    let repo_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                                    self.messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: "Checking remote repository and preparing update...".into(),
+                                        thinking: None,
+                                    });
+                                    let mut steps = Vec::new();
+                                    match cynapse_core::updater::execute_update(&repo_dir, |step| {
+                                        steps.push(step.to_string());
+                                    }) {
+                                        Ok(summary) => {
+                                            for step in steps {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: step,
+                                                    thinking: None,
+                                                });
+                                            }
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("✓ {}", summary),
+                                                thinking: None,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            for step in steps {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: step,
+                                                    thinking: None,
+                                                });
+                                            }
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("Update failed: {}", e),
+                                                thinking: None,
+                                            });
+                                        }
+                                    }
                                     continue;
                                 }
 

@@ -21,6 +21,7 @@ pub mod session;
 pub mod skills;
 pub mod subagent;
 pub mod undo;
+pub mod updater;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
