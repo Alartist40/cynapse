@@ -464,6 +464,13 @@ impl TuiApp {
         prefix
     }
 
+    /// Compiles a query-pruned Zone A system prompt prefix tailored to the active user prompt.
+    pub fn compile_zone_a_for_query(&mut self, query: &str) -> String {
+        let persona_prompt = self.persona_mgr.build_system_prompt();
+        let tools = cynapse_core::offline_agent::prune_tools_for_query(query);
+        cynapse_core::offline_agent::compile_zone_a_prefix_with_tools(&persona_prompt, &tools)
+    }
+
     /// Invalidates the compiled Zone A prefix when persona or system settings change.
     pub fn invalidate_zone_a_prefix(&mut self) {
         self.cached_zone_a_prefix = None;
@@ -2216,8 +2223,8 @@ impl TuiApp {
                                 self.current_response_buf.clear();
                                 self.auto_scroll = true; // Lock scroll to bottom for incoming response
 
-                                // Build Two-Zone Prompt: Zone A (Invariant Prefix) & Zone B (Variable Tail)
-                                let system_prompt = self.get_or_compile_zone_a_prefix();
+                                // Build Two-Zone Prompt: Zone A (Pruned Invariant Prefix) & Zone B (Variable Tail)
+                                let system_prompt = self.compile_zone_a_for_query(&trimmed);
                                 let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&trimmed, 1500, true, false);
 
                                 let history_context: String = self.messages
@@ -2419,7 +2426,7 @@ impl TuiApp {
                                 self.current_response_buf.clear();
 
                                 let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
-                                let system_prompt = self.get_or_compile_zone_a_prefix();
+                                let system_prompt = self.compile_zone_a_for_query(&user_msg);
                                 let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&user_msg, 1500, true, false);
                                 let endpoint = self.tier1_endpoint.clone();
                                 let model_name = self.active_model_name.clone();
@@ -2490,6 +2497,15 @@ impl TuiApp {
                                 for batch in partitions {
                                     for tool_call in &batch {
                                         tool_names.push(tool_call.name.clone());
+
+                                        // System 2 Critic: Pre-execution schema and path verification
+                                        if let Err(schema_err) = cynapse_core::offline_agent::validate_tool_call_schema(tool_call, std::path::Path::new(".")) {
+                                            self.turn_verified = false;
+                                            veto_notices.push(format!("Schema validation failed for `{}`: {}", tool_call.name, schema_err));
+                                            tool_results.push(format!("[{}] Schema Error: {}", tool_call.name, schema_err));
+                                            continue;
+                                        }
+
                                         match self.loop_guard.check(tool_call) {
                                             Ok(()) => {
                                                 all_vetoed = false;
@@ -2534,7 +2550,7 @@ impl TuiApp {
                                     self.current_response_buf.clear();
 
                                     let user_msg = self.messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("").to_string();
-                                    let system_prompt = self.get_or_compile_zone_a_prefix();
+                                    let system_prompt = self.compile_zone_a_for_query(&user_msg);
                                     let memory_prompt = self.dendrite_ctx.build_prompt_with_options(&user_msg, 1500, true, false);
                                     let endpoint = self.tier1_endpoint.clone();
                                     let model_name = self.active_model_name.clone();

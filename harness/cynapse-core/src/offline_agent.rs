@@ -595,11 +595,11 @@ fn parse_single_tool_call(v: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
-/// Isolates and strips reasoning scratchpad blocks (<thinking>...</thinking> or <thought>...</thought>)
-/// from raw model outputs, returning the sanitized content and optional extracted reasoning tokens.
+/// Isolates and strips reasoning scratchpad blocks (<thinking>...</thinking>, <thought>...</thought>,
+/// or untagged monologue preambles like "The user is... Let me check...") from raw model outputs.
 pub fn isolate_thinking_scratchpad(output: &str) -> (String, Option<String>) {
     let mut cleaned = output.to_string();
-    let mut thinking = None;
+    let mut thinking_parts = Vec::new();
 
     let patterns = [
         ("<thinking>", "</thinking>"),
@@ -607,20 +607,67 @@ pub fn isolate_thinking_scratchpad(output: &str) -> (String, Option<String>) {
     ];
 
     for (start_tag, end_tag) in patterns {
-        if let Some(s_idx) = cleaned.find(start_tag) {
+        while let Some(s_idx) = cleaned.find(start_tag) {
             let content_start = s_idx + start_tag.len();
             if let Some(e_idx) = cleaned[content_start..].find(end_tag) {
                 let actual_end = content_start + e_idx;
                 let thought_text = cleaned[content_start..actual_end].trim().to_string();
                 if !thought_text.is_empty() {
-                    thinking = Some(thought_text);
+                    thinking_parts.push(thought_text);
                 }
                 cleaned = format!("{}{}", &cleaned[..s_idx], &cleaned[actual_end + end_tag.len()..]);
+            } else {
+                break;
             }
         }
     }
 
-    (cleaned, thinking)
+    // Detect leading untagged Chain-of-Thought monologue (e.g. "The user is...", "Let me check...")
+    let trimmed = cleaned.trim();
+    let monologue_prefixes = [
+        "The user is",
+        "The user wants",
+        "The user asks",
+        "The user requested",
+        "Let me check",
+        "Let me see",
+        "Thinking Process:",
+        "Thought:",
+        "I will now",
+        "I should lead with",
+        "First, I need to",
+        "First, I will",
+    ];
+    let starts_with_monologue = monologue_prefixes.iter().any(|&p| trimmed.starts_with(p));
+
+    if starts_with_monologue {
+        if let Some(tool_start) = trimmed.find("```json").or_else(|| trimmed.find('{')) {
+            let monologue = trimmed[..tool_start].trim();
+            if !monologue.is_empty() {
+                thinking_parts.push(monologue.to_string());
+                cleaned = trimmed[tool_start..].to_string();
+            }
+        } else if let Some(sep) = trimmed.find("\n\n") {
+            let monologue = trimmed[..sep].trim();
+            let remainder = trimmed[sep + 2..].trim();
+            if !monologue.is_empty() && !remainder.is_empty() {
+                thinking_parts.push(monologue.to_string());
+                cleaned = remainder.to_string();
+            }
+        } else {
+            // Entire output was internal monologue with no subsequent response
+            thinking_parts.push(trimmed.to_string());
+            cleaned = "I am ready to help. What would you like to work on?".to_string();
+        }
+    }
+
+    let final_thinking = if thinking_parts.is_empty() {
+        None
+    } else {
+        Some(thinking_parts.join("\n\n"))
+    };
+
+    (cleaned, final_thinking)
 }
 
 /// Validates and extracts GBNF tool calls from raw model output, supporting code blocks, XML tags, and raw JSON objects.
@@ -741,14 +788,146 @@ pub fn compile_conversational_prefix(_system_persona: &str) -> String {
     "You are Cynapse, an intelligent, concise, and friendly local companion. Respond naturally and directly to the user.".to_string()
 }
 
-/// Zone A (100% byte-stable prefix): Invariant persona, behavior directives, and tool definitions.
-/// Pinned in KV cache to enable 0 ms prefill latency across multi-turn sessions.
-pub fn compile_zone_a_prefix(system_persona: &str) -> String {
-    let tools = crate::list_tools();
+/// Dynamically prunes the available tools down to the tools relevant to the active user prompt.
+/// If the query is conversational or a greeting, returns an empty list to prevent
+/// small models from hallucinating or executing unwanted shell commands.
+pub fn prune_tools_for_query(user_query: &str) -> Vec<crate::ToolDefinition> {
+    let lower = user_query.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-').filter(|w| !w.is_empty()).collect();
+
+    // Pure greetings, conversational questions, and updates inquiries: ZERO tools exposed
+    let is_greeting = ["hi", "hey", "hello", "yo", "sup", "howdy", "hiya", "good morning", "good afternoon", "good evening", "greetings"]
+        .iter().any(|&g| lower.starts_with(g));
+    let has_explicit_cmd = words.iter().any(|&w| w == "run" || w == "exec" || w == "execute" || w == "grep" || w == "patch" || w == "write")
+        || lower.contains("git log") || lower.contains("git diff") || lower.contains("git status")
+        || lower.contains("cargo test") || lower.contains("cargo check") || lower.contains("cargo build")
+        || lower.contains("read file") || lower.contains("view file") || lower.contains("open file");
+
+    if is_greeting && !has_explicit_cmd {
+        return Vec::new();
+    }
+
+    let all_tools = crate::list_tools();
+    let mut selected = Vec::new();
+
+    let asks_file_read = (words.iter().any(|&w| w == "read" || w == "view" || w == "inspect" || w == "cat" || w == "open"))
+        && (lower.contains("file") || lower.contains(".rs") || lower.contains(".toml") || lower.contains(".md") || lower.contains(".json") || lower.contains("/"));
+    let asks_file_edit = (words.iter().any(|&w| w == "write" || w == "patch" || w == "modify" || w == "edit" || w == "replace" || w == "append"))
+        && (lower.contains("file") || lower.contains(".rs") || lower.contains(".toml") || lower.contains(".md") || lower.contains("code"));
+    let asks_search = words.iter().any(|&w| w == "grep" || w == "search" || w == "locate") || lower.contains("search for");
+    let asks_exec = has_explicit_cmd;
+
+    for t in all_tools {
+        match t.name {
+            "read_file" if asks_file_read || asks_file_edit || asks_search => selected.push(t),
+            "patch_file" | "write_file" if asks_file_edit => selected.push(t),
+            "grep" if asks_search => selected.push(t),
+            "execute_command" if asks_exec => selected.push(t),
+            "run_gates" if lower.contains("gate") || lower.contains("check gates") || lower.contains("run gates") => selected.push(t),
+            _ => {}
+        }
+    }
+
+    if selected.is_empty() {
+        Vec::new()
+    } else {
+        selected.truncate(4);
+        selected
+    }
+}
+
+/// Returns a clean 1-shot exemplar for the given tool to enforce strict syntax on weak models.
+pub fn get_tool_exemplar(tool_name: &str) -> &'static str {
+    match tool_name {
+        "read_file" => "```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/main.rs\"}}\n```",
+        "patch_file" => "```json\n{\"name\": \"patch_file\", \"arguments\": {\"path\": \"src/main.rs\", \"target_content\": \"old_line()\", \"replacement_content\": \"new_line()\", \"allow_multiple\": false}}\n```",
+        "write_file" => "```json\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"notes.txt\", \"content\": \"hello world\"}}\n```",
+        "execute_command" => "```json\n{\"name\": \"execute_command\", \"arguments\": {\"command\": \"cargo check\"}}\n```",
+        "grep" => "```json\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"fn main\"}}\n```",
+        _ => "```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"Cargo.toml\"}}\n```",
+    }
+}
+
+/// System 2 Schema Validator Critic: validates tool arguments before execution.
+pub fn validate_tool_call_schema(call: &ToolCall, workspace_dir: &std::path::Path) -> Result<(), String> {
+    match call.name.as_str() {
+        "read_file" => {
+            let path_str = call.arguments.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'path' for read_file".to_string())?;
+            let p = workspace_dir.join(path_str.trim_start_matches('/'));
+            if !p.exists() {
+                return Err(format!("File '{}' does not exist in workspace. Verify path before reading.", path_str));
+            }
+        }
+        "patch_file" => {
+            let path_str = call.arguments.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'path' for patch_file".to_string())?;
+            let target = call.arguments.get("target_content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'target_content' for patch_file".to_string())?;
+            let _replacement = call.arguments.get("replacement_content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'replacement_content' for patch_file".to_string())?;
+            let p = workspace_dir.join(path_str.trim_start_matches('/'));
+            if !p.exists() {
+                return Err(format!("Target file '{}' does not exist in workspace.", path_str));
+            }
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                if !content.contains(target) {
+                    return Err(format!("target_content not found in '{}'. Ensure target matches exact lines in the file.", path_str));
+                }
+            }
+        }
+        "write_file" => {
+            let _path = call.arguments.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'path' for write_file".to_string())?;
+            let _content = call.arguments.get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'content' for write_file".to_string())?;
+        }
+        "execute_command" => {
+            let cmd = call.arguments.get("command")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'command' for execute_command".to_string())?;
+            if cmd.trim().is_empty() {
+                return Err("Empty command passed to execute_command".to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Builds dynamic Zone A prompt tailored to the subset of active tools.
+pub fn compile_zone_a_prefix_with_tools(system_persona: &str, tools: &[crate::ToolDefinition]) -> String {
+    if tools.is_empty() {
+        return format!(
+            "You are Cynapse, an autonomous local intelligent assistant.\n\
+            {}\n\n\
+            Operating Directives:\n\
+            1. Lead with the direct answer on line 1.\n\
+            2. Number multi-step tasks clearly. Cap lists at maximum 5 items.\n\
+            3. End with exactly one concrete next action doable immediately.\n\
+            4. State cause and fix directly for errors. Be concise and eliminate conversational filler.\n\
+            5. Output ONLY your direct answer to the user. Never output internal monologue or planning prose ('The user wants...', 'Let me check...').\n\
+            6. For this query, no tools are required. Answer directly in clean GitHub markdown.",
+            system_persona.trim()
+        );
+    }
+
     let mut tools_desc = String::new();
     for t in tools {
         tools_desc.push_str(&format!("- `{}`: {}\n", t.name, t.description));
     }
+
+    let exemplar = if let Some(first) = tools.first() {
+        format!("\nExemplar format:\n{}\n", get_tool_exemplar(first.name))
+    } else {
+        String::new()
+    };
 
     format!(
         "You are Cynapse, an autonomous local intelligent assistant.\n\
@@ -758,17 +937,25 @@ pub fn compile_zone_a_prefix(system_persona: &str) -> String {
         2. Number multi-step tasks clearly. Cap lists at maximum 5 items.\n\
         3. End with exactly one concrete next action doable immediately.\n\
         4. State cause and fix directly for errors. Be concise and eliminate conversational filler.\n\
-        5. When asked to write, create, edit, or read a file, search code, or run a shell command:\n\
+        5. Output ONLY your direct answer or tool calls. Never output internal monologue or planning prose ('The user is...', 'Let me check...').\n\
+        6. When asked to write, create, edit, or read a file, search code, or run a shell command:\n\
            Immediately emit the tool call in a ```json code block. Do not just talk about doing it — execute it:\n\
            ```json\n\
            {{\"name\": \"<tool_name>\", \"arguments\": {{\"path\": \"...\", \"content\": \"...\"}}}}\n\
            ```\n\
-           For general conversational questions or explanations, respond directly in plain text without tools.\n\n\
+           {}\
         Available Tools:\n\
         {}",
         system_persona.trim(),
+        exemplar,
         tools_desc.trim()
     )
+}
+
+/// Zone A (100% byte-stable prefix): Invariant persona, behavior directives, and tool definitions.
+/// Pinned in KV cache to enable 0 ms prefill latency across multi-turn sessions.
+pub fn compile_zone_a_prefix(system_persona: &str) -> String {
+    compile_zone_a_prefix_with_tools(system_persona, &crate::list_tools())
 }
 
 /// Zone B (Variable tail): Recalled Dendrite knowledge nodes (deterministically sorted),

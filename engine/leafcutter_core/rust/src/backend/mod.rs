@@ -10,6 +10,7 @@
 
 pub mod cpu;
 pub mod wgpu;
+pub mod rknn;
 
 #[cfg(feature = "openblas")]
 pub mod openblas;

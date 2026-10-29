@@ -156,6 +156,52 @@ impl UndoJournal {
         let lock = GLOBAL_JOURNAL.lock().unwrap();
         lock.as_ref().map(|j| j.history.lock().unwrap().len()).unwrap_or(0)
     }
+
+    /// Ephemeral git shadow snapshot for safety before executing tool batches.
+    pub fn create_shadow_snapshot(repo_dir: &Path) -> Result<Option<String>> {
+        if !repo_dir.join(".git").exists() {
+            return Ok(None);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let ref_name = format!("refs/cynapse/shadow-{}", now);
+        let output = std::process::Command::new("git")
+            .args(["stash", "create", &format!("cynapse-shadow-{}", now)])
+            .current_dir(repo_dir)
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !commit.is_empty() {
+                    let _ = std::process::Command::new("git")
+                        .args(["update-ref", &ref_name, &commit])
+                        .current_dir(repo_dir)
+                        .output();
+                    return Ok(Some(ref_name));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Restores a shadow snapshot if tool verification fails.
+    pub fn restore_shadow_snapshot(repo_dir: &Path, shadow_ref: &str) -> Result<bool> {
+        if !repo_dir.join(".git").exists() {
+            return Ok(false);
+        }
+        let output = std::process::Command::new("git")
+            .args(["stash", "apply", shadow_ref])
+            .current_dir(repo_dir)
+            .output();
+        if let Ok(out) = output {
+            Ok(out.status.success())
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]
