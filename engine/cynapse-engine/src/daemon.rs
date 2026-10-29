@@ -101,18 +101,7 @@ impl LlamaServerDaemon {
             Some(vram) if vram > 1000 => "16".to_string(),
             _ => "0".to_string(),
         };
-        let threads = std::env::var("CYNAPSE_THREADS")
-            .ok()
-            .or_else(|| {
-                std::thread::available_parallelism()
-                    .ok()
-                    .map(|p| {
-                        let total = p.get();
-                        let phys = if total > 4 { total / 2 } else { total };
-                        phys.clamp(2, 8).to_string()
-                    })
-            })
-            .unwrap_or_else(|| "4".to_string());
+        let threads = crate::physical_core_count().to_string();
         // Context size: uses configured engine context or default ENGINE_CTX_SIZE
         let ctx_size = crate::engine_ctx_size().to_string();
 

@@ -140,6 +140,7 @@ impl TuiSession {
         let config_candidates = [
             PathBuf::from("cynapse.toml"),
             models_dir.parent().map(|p| p.join("cynapse.toml")).unwrap_or_default(),
+            dirs::home_dir().map(|h| h.join(".cynapse").join("cynapse.toml")).unwrap_or_default(),
         ];
 
         for cfg_path in &config_candidates {

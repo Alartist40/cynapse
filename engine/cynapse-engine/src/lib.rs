@@ -28,7 +28,7 @@ pub const DEFAULT_RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
 /// Ollama `num_ctx`, native engine max tokens). Must stay in sync with the
 /// memory context budget: `memory::context::DEFAULT_MAX_TOKENS` is sized to
 /// ~36% of this value so assembled prompts cannot overflow the engine.
-pub const ENGINE_CTX_SIZE: usize = 8192;
+pub const ENGINE_CTX_SIZE: usize = 4096;
 
 static ENGINE_CTX: OnceLock<usize> = OnceLock::new();
 
@@ -44,6 +44,23 @@ pub fn set_engine_ctx_size(n: usize) {
 /// Drives llama-server `--ctx-size`, Ollama `num_ctx`, and overflow reporting.
 pub fn engine_ctx_size() -> usize {
     ENGINE_CTX.get().copied().unwrap_or(ENGINE_CTX_SIZE)
+}
+
+/// Physical CPU core count clamped between 2 and 8 to eliminate SMT thread contention.
+pub fn physical_core_count() -> usize {
+    std::env::var("CYNAPSE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .map(|p| {
+                    let total = p.get();
+                    let phys = if total > 4 { total / 2 } else { total };
+                    phys.clamp(2, 8)
+                })
+        })
+        .unwrap_or(4)
 }
 
 /// Shared sampling defaults, applied to every provider payload from ONE
@@ -1377,11 +1394,12 @@ pub async fn try_ollama_stream(
         "system": system_prompt,
         "stream": true,
         "cache_prompt": cache_prompt,
-        "keep_alive": -1,
+        "keep_alive": "5m",
         "slot_id": slot_id,
         "id_slot": slot_id,
         "options": {
             "num_ctx": ctx_size,
+            "num_thread": physical_core_count(),
             "temperature": s.temperature,
             "top_p": s.top_p,
             "top_k": s.top_k,
@@ -1408,10 +1426,12 @@ pub async fn try_ollama_stream(
                     "system": system_prompt,
                     "stream": true,
                     "cache_prompt": cache_prompt,
+                    "keep_alive": "5m",
                     "slot_id": slot_id,
                     "id_slot": slot_id,
                     "options": {
                         "num_ctx": ctx_size,
+                        "num_thread": physical_core_count(),
                         "temperature": s.temperature,
                         "top_p": s.top_p,
                         "top_k": s.top_k,
