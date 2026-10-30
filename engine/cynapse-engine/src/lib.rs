@@ -1044,30 +1044,7 @@ pub fn resolve_model_tag(model_name: &str, available_tags: &[String]) -> String 
         }
     }
 
-    // 2. Tag base name matching (e.g. "ornith:9b" -> base "ornith")
-    for tag in available_tags {
-        let tag_base = tag.split(':').next().unwrap_or(tag).to_lowercase();
-        let clean_base = tag_base.split('/').last().unwrap_or(&tag_base);
-        if !clean_base.is_empty() && (stripped.contains(clean_base) || clean_base.contains(&stripped)) {
-            return tag.clone();
-        }
-    }
-
-    // 3. Main model keyword token matching
-    let keywords = [
-        "ornith", "qwen", "ministral", "mistral", "llama", "gemma", "phi", "deepseek",
-        "smollm", "starcoder", "command", "granite", "internlm", "baichuan", "chatglm",
-        "minimax", "falcon", "yi", "nemotron", "cohere", "ocr", "nomic",
-    ];
-    for kw in keywords {
-        if stripped.contains(kw) {
-            if let Some(matched) = available_tags.iter().find(|t| t.to_lowercase().contains(kw)) {
-                return matched.clone();
-            }
-        }
-    }
-
-    // 4. Token overlap scoring fallback
+    // 2. Token overlap scoring (prioritizes highest overlap, e.g. "ornith-1.5:9b" over "ornith:9b")
     let stripped_tokens: Vec<&str> = stripped.split(['-', '_', '.', ':', '/']).filter(|s| !s.is_empty()).collect();
     let mut best_match: Option<(&String, usize)> = None;
 
@@ -1087,6 +1064,35 @@ pub fn resolve_model_tag(model_name: &str, available_tags: &[String]) -> String 
                 }
             } else {
                 best_match = Some((tag, score));
+            }
+        }
+    }
+
+    if let Some((best_tag, score)) = best_match {
+        if score >= 2 || available_tags.len() == 1 {
+            return best_tag.clone();
+        }
+    }
+
+    // 3. Tag base name matching (e.g. "ornith:9b" -> base "ornith")
+    for tag in available_tags {
+        let tag_base = tag.split(':').next().unwrap_or(tag).to_lowercase();
+        let clean_base = tag_base.split('/').last().unwrap_or(&tag_base);
+        if !clean_base.is_empty() && (stripped.contains(clean_base) || clean_base.contains(&stripped)) {
+            return tag.clone();
+        }
+    }
+
+    // 4. Main model keyword token matching
+    let keywords = [
+        "ornith", "qwen", "ministral", "mistral", "llama", "gemma", "phi", "deepseek",
+        "smollm", "starcoder", "command", "granite", "internlm", "baichuan", "chatglm",
+        "minimax", "falcon", "yi", "nemotron", "cohere", "ocr", "nomic",
+    ];
+    for kw in keywords {
+        if stripped.contains(kw) {
+            if let Some(matched) = available_tags.iter().find(|t| t.to_lowercase().contains(kw)) {
+                return matched.clone();
             }
         }
     }
@@ -1388,17 +1394,23 @@ pub async fn try_ollama_stream(
     let s = sampling();
     let ctx_size = engine_ctx_size();
 
+    let ngl = std::env::var("CYNAPSE_N_GPU_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(99);
+
     let payload = serde_json::json!({
         "model": resolved,
         "prompt": prompt,
         "system": system_prompt,
         "stream": true,
         "cache_prompt": cache_prompt,
-        "keep_alive": "5m",
+        "keep_alive": -1,
         "slot_id": slot_id,
         "id_slot": slot_id,
         "options": {
             "num_ctx": ctx_size,
+            "num_gpu": ngl,
             "num_thread": physical_core_count(),
             "temperature": s.temperature,
             "top_p": s.top_p,
@@ -1426,11 +1438,12 @@ pub async fn try_ollama_stream(
                     "system": system_prompt,
                     "stream": true,
                     "cache_prompt": cache_prompt,
-                    "keep_alive": "5m",
+                    "keep_alive": -1,
                     "slot_id": slot_id,
                     "id_slot": slot_id,
                     "options": {
                         "num_ctx": ctx_size,
+                        "num_gpu": ngl,
                         "num_thread": physical_core_count(),
                         "temperature": s.temperature,
                         "top_p": s.top_p,

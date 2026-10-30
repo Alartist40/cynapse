@@ -59,6 +59,8 @@ pub enum ActiveModal {
     ModelList,
     ModelPuller,
     SessionList,
+    SessionRename,
+    ThemePicker,
     Doctor,
     PersonaManager,
     Bots,
@@ -162,9 +164,9 @@ pub struct SlashCommand {
 
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/help", description: "Display commands & keyboard controls" },
-    SlashCommand { name: "/dendrite", description: "Open interactive Dendrite Graph & 3D Planetary Memory Atlas" },
+    SlashCommand { name: "/dendrite", description: "Open interactive Dendrite 3D Planetary Memory Graph" },
     SlashCommand { name: "/model", description: "Open interactive model selector" },
-    SlashCommand { name: "/theme", description: "Cycle visual color theme (Dark Slate, Neon, Amber, Matrix, Nord)" },
+    SlashCommand { name: "/theme", description: "Open interactive visual color theme switcher" },
     SlashCommand { name: "/doctor", description: "Run self-healing Cynapse Doctor system diagnostic & recovery" },
     SlashCommand { name: "/pull", description: "Download GGUF model from HuggingFace (hardware curated)" },
     SlashCommand { name: "/persona", description: "Manage agent personality markdown files (IDENTITY, SOUL, USER)" },
@@ -329,6 +331,9 @@ pub struct TuiApp {
     pub approval_rx: mpsc::UnboundedReceiver<ToolApprovalRequest>,
     pub pending_approval: Option<PendingToolApproval>,
     pub update_notification: Arc<std::sync::Mutex<Option<String>>>,
+    pub selected_theme_idx: usize,
+    pub session_rename_buf: String,
+    pub available_update: Option<String>,
 }
 
 impl TuiApp {
@@ -450,6 +455,9 @@ impl TuiApp {
                 }
                 slot
             },
+            selected_theme_idx: 0,
+            session_rename_buf: String::new(),
+            available_update: None,
         }
     }
 
@@ -1074,11 +1082,7 @@ impl TuiApp {
     fn poll_update_notification(&mut self) {
         if let Ok(mut lock) = self.update_notification.lock() {
             if let Some(msg) = lock.take() {
-                self.messages.push(ChatMessage {
-                    role: "system".into(),
-                    content: format!("◖UPDATE◗ {}", msg),
-                    thinking: None,
-                });
+                self.available_update = Some(msg);
             }
         }
     }
@@ -1292,6 +1296,54 @@ impl TuiApp {
                                 continue;
                             }
 
+                            if self.modal == ActiveModal::SessionRename {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        self.modal = ActiveModal::SessionList;
+                                    }
+                                    KeyCode::Char(c) => {
+                                        self.session_rename_buf.push(c);
+                                    }
+                                    KeyCode::Backspace => {
+                                        self.session_rename_buf.pop();
+                                    }
+                                    KeyCode::Enter => {
+                                        let new_name = self.session_rename_buf.trim().to_string();
+                                        if !new_name.is_empty() {
+                                            let sessions = self.session_mgr.list_sessions();
+                                            if !sessions.is_empty() {
+                                                let idx = self.selected_session_idx.min(sessions.len() - 1);
+                                                let old_id = sessions[idx].session_id.clone();
+                                                if old_id != new_name {
+                                                    match self.session_mgr.rename_session(&old_id, &new_name) {
+                                                        Ok(_) => {
+                                                            if self.session_id == old_id {
+                                                                self.session_id = new_name.clone();
+                                                            }
+                                                            self.messages.push(ChatMessage {
+                                                                role: "system".into(),
+                                                                content: format!("Renamed session from '{}' to '{}'", old_id, new_name),
+                                                                thinking: None,
+                                                            });
+                                                        }
+                                                        Err(e) => {
+                                                            self.messages.push(ChatMessage {
+                                                                role: "system".into(),
+                                                                content: format!("Failed to rename session: {}", e),
+                                                                thinking: None,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        self.modal = ActiveModal::SessionList;
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+
                             if self.modal == ActiveModal::ToolApproval {
                                 if let Some(ref mut pending) = self.pending_approval {
                                     if pending.edit_mode {
@@ -1340,6 +1392,9 @@ impl TuiApp {
                                 KeyCode::Esc | KeyCode::Char('q') => {
                                     if self.modal == ActiveModal::ToolApproval {
                                         self.handle_approval_decision(false);
+                                    } else if self.modal == ActiveModal::ThemePicker {
+                                        self.theme = crate::theme::load_theme();
+                                        self.modal = ActiveModal::None;
                                     } else {
                                         self.modal = ActiveModal::None;
                                     }
@@ -1374,6 +1429,15 @@ impl TuiApp {
                                     ActiveModal::SessionList => {
                                         self.selected_session_idx = self.selected_session_idx.saturating_sub(1);
                                     }
+                                    ActiveModal::ThemePicker => {
+                                        let all_themes = crate::theme::AppTheme::all();
+                                        if self.selected_theme_idx > 0 {
+                                            self.selected_theme_idx -= 1;
+                                        } else {
+                                            self.selected_theme_idx = all_themes.len().saturating_sub(1);
+                                        }
+                                        self.theme = all_themes[self.selected_theme_idx];
+                                    }
                                     ActiveModal::PersonaManager => {
                                         self.selected_persona_idx = self.selected_persona_idx.saturating_sub(1);
                                     }
@@ -1393,7 +1457,15 @@ impl TuiApp {
                                         self.selected_model_idx = self.selected_model_idx.saturating_add(1);
                                     }
                                     ActiveModal::SessionList => {
-                                        self.selected_session_idx = self.selected_session_idx.saturating_add(1);
+                                        let sessions = self.session_mgr.list_sessions();
+                                        if !sessions.is_empty() && self.selected_session_idx + 1 < sessions.len() {
+                                            self.selected_session_idx += 1;
+                                        }
+                                    }
+                                    ActiveModal::ThemePicker => {
+                                        let all_themes = crate::theme::AppTheme::all();
+                                        self.selected_theme_idx = (self.selected_theme_idx + 1) % all_themes.len();
+                                        self.theme = all_themes[self.selected_theme_idx];
                                     }
                                     ActiveModal::PersonaManager => {
                                         self.selected_persona_idx = self.selected_persona_idx.saturating_add(1);
@@ -1416,6 +1488,22 @@ impl TuiApp {
                                             self.messages.push(ChatMessage {
                                                 role: "system".into(),
                                                 content: format!("Deleted memory node: [[{}]]", target_id),
+                                                thinking: None,
+                                            });
+                                        }
+                                    }
+                                    ActiveModal::SessionList => {
+                                        let sessions = self.session_mgr.list_sessions();
+                                        if !sessions.is_empty() {
+                                            let idx = self.selected_session_idx.min(sessions.len() - 1);
+                                            let sid = sessions[idx].session_id.clone();
+                                            let _ = self.session_mgr.delete_session(&sid);
+                                            if self.selected_session_idx > 0 && self.selected_session_idx >= sessions.len() - 1 {
+                                                self.selected_session_idx = self.selected_session_idx.saturating_sub(1);
+                                            }
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: format!("✓ Deleted session: {}", sid),
                                                 thinking: None,
                                             });
                                         }
@@ -1473,6 +1561,14 @@ impl TuiApp {
                                         let doctor = cynapse_core::doctor::CynapseDoctor::new(self.models_dir.clone(), db_path, true);
                                         self.doctor_report = Some(doctor.run_diagnostics());
                                     }
+                                    ActiveModal::SessionList => {
+                                        let sessions = self.session_mgr.list_sessions();
+                                        if !sessions.is_empty() {
+                                            let idx = self.selected_session_idx.min(sessions.len() - 1);
+                                            self.session_rename_buf = sessions[idx].session_id.clone();
+                                            self.modal = ActiveModal::SessionRename;
+                                        }
+                                    }
                                     ActiveModal::PersonaManager => {
                                         self.persona_mgr.set_active_persona(None);
                                         self.invalidate_zone_a_prefix();
@@ -1525,6 +1621,17 @@ impl TuiApp {
                                             let sid = sessions[idx].session_id.clone();
                                             let _ = self.load_session(&sid);
                                         }
+                                        self.modal = ActiveModal::None;
+                                    }
+                                    ActiveModal::ThemePicker => {
+                                        let all_themes = crate::theme::AppTheme::all();
+                                        self.theme = all_themes[self.selected_theme_idx.min(all_themes.len() - 1)];
+                                        crate::theme::save_theme(self.theme);
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: format!("Visual theme set to: {}", self.theme.name()),
+                                            thinking: None,
+                                        });
                                         self.modal = ActiveModal::None;
                                     }
                                     ActiveModal::PersonaManager => {
@@ -1732,13 +1839,30 @@ impl TuiApp {
                                 }
 
                                 if trimmed == "/theme" {
-                                    self.theme = self.theme.next();
-                                    crate::theme::save_theme(self.theme);
-                                    self.messages.push(ChatMessage {
-                                        role: "system".into(),
-                                        content: format!("Switched visual theme to: {}", self.theme.name()),
-                                        thinking: None,
-                                    });
+                                    let all = crate::theme::AppTheme::all();
+                                    self.selected_theme_idx = all.iter().position(|&t| t == self.theme).unwrap_or(0);
+                                    self.modal = ActiveModal::ThemePicker;
+                                    continue;
+                                }
+
+                                if trimmed.starts_with("/theme ") {
+                                    let name_query = trimmed[7..].trim().to_lowercase();
+                                    let all = crate::theme::AppTheme::all();
+                                    if let Some(th) = all.iter().find(|t| t.name().to_lowercase().contains(&name_query)) {
+                                        self.theme = *th;
+                                        crate::theme::save_theme(self.theme);
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: format!("Switched visual theme to: {}", self.theme.name()),
+                                            thinking: None,
+                                        });
+                                    } else {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: format!("Unknown theme '{}'. Type /theme to select from interactive dropdown.", name_query),
+                                            thinking: None,
+                                        });
+                                    }
                                     continue;
                                 }
 
@@ -2868,7 +2992,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
 
             // Bottom Prompt Input Bar
             let input_text = vec![Line::from(vec![
-                Span::styled("・> ", t.prompt_prefix()),
+                Span::styled("・ ", t.prompt_prefix()),
                 Span::raw(&self.input),
             ])];
             let input_bar = Paragraph::new(input_text)
@@ -2892,8 +3016,6 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 Span::styled(&self.active_model_name, t.active_model()),
                 Span::styled(" │ ", t.dim_text()),
                 Span::styled(format!("{:.1}G", self.hw_info.ram_used_mb as f64 / 1024.0), Style::default().fg(Color::Green)),
-                Span::styled(" │ ", t.dim_text()),
-                Span::styled(format!("[{}]", t.name()), t.dim_text()),
             ]
         } else {
             // Full Header for standard/wide terminals
@@ -2937,8 +3059,6 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     },
                     Style::default().fg(Color::LightYellow),
                 ),
-                Span::styled("  │  ", t.dim_text()),
-                Span::styled(format!("[{}]", t.name()), t.dim_text()),
             ]
         };
 
@@ -2955,7 +3075,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             let middle_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(28),
+                    Constraint::Length(32),
                     Constraint::Min(40),
                 ])
                 .split(main_chunks[1]);
@@ -2994,9 +3114,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Span::styled(" Pwr : ", label_style),
                     Span::styled(
                         match cynapse_core::power::PowerThrottler::new().detect_power_source() {
-                            cynapse_core::power::PowerSource::Battery => "⚡ Battery (Scaled)",
-                            cynapse_core::power::PowerSource::AcPower => "🔌 AC Power (Max)",
-                            cynapse_core::power::PowerSource::Unknown => "⚡ Auto Balanced",
+                            cynapse_core::power::PowerSource::Battery => "Battery (Scaled)",
+                            cynapse_core::power::PowerSource::AcPower => "AC Power (Max)",
+                            cynapse_core::power::PowerSource::Unknown => "Auto Balanced",
                         },
                         match cynapse_core::power::PowerThrottler::new().detect_power_source() {
                             cynapse_core::power::PowerSource::Battery => Style::default().fg(Color::Yellow),
@@ -3042,7 +3162,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Span::styled(" Store : ", label_style),
                     Span::styled(if self.store.is_some() { "SQLite + FTS5" } else { "RAM Ephemeral" }, Style::default().fg(Color::LightMagenta)),
                 ]),
-                Line::from(vec![Span::styled(" Cmd   : ", label_style), Span::styled("/dendrite for atlas", t.dim_text())]),
+                Line::from(vec![Span::styled(" Cmd   : ", label_style), Span::styled("/dendrite", t.dim_text())]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("◖ ", Style::default().fg(Color::LightCyan)),
@@ -3065,7 +3185,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Span::styled(" ◗", Style::default().fg(Color::Rgb(100, 180, 255))),
                 ]),
                 Line::from(vec![Span::styled(" /help    ", Style::default().fg(Color::Cyan)), Span::styled("Palette", value_style)]),
-                Line::from(vec![Span::styled(" /dendrite", Style::default().fg(Color::Yellow)), Span::styled("3D Atlas", value_style)]),
+                Line::from(vec![Span::styled(" /dendrite", Style::default().fg(Color::Yellow)), Span::styled("3D Graph", value_style)]),
                 Line::from(vec![Span::styled(" /model   ", Style::default().fg(Color::Green)), Span::styled("Switch Model", value_style)]),
                 Line::from(vec![Span::styled(" /theme   ", Style::default().fg(Color::Magenta)), Span::styled("Theme Switch", value_style)]),
                 Line::from(vec![Span::styled(" /doctor  ", Style::default().fg(Color::LightBlue)), Span::styled("Diagnostics", value_style)]),
@@ -3140,6 +3260,16 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             ]));
             chat_lines.push(Line::from(""));
 
+            if let Some(ref update_msg) = self.available_update {
+                let badge = format!("◖ UPDATE AVAILABLE ◗  {} (Run /update to apply)", update_msg);
+                let u_pad = " ".repeat((vp_w.saturating_sub(badge.chars().count())) / 2);
+                chat_lines.push(Line::from(vec![
+                    Span::raw(u_pad),
+                    Span::styled(badge, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                ]));
+                chat_lines.push(Line::from(""));
+            }
+
             let prompt_hint = "Type your prompt below to chat, or type '/' for commands...";
             let hint_pad = " ".repeat((vp_w.saturating_sub(prompt_hint.chars().count())) / 2);
             chat_lines.push(Line::from(vec![
@@ -3161,16 +3291,15 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         chat_lines.push(Line::from(Span::styled("Cynapse:", t.assistant_header())));
                         if let Some(think) = &msg.thinking {
                             if self.show_thinking {
-                                chat_lines.push(Line::from(Span::styled("  ▼ [Thinking... (Press Ctrl+T to collapse)]", t.thinking_header())));
+                                chat_lines.push(Line::from(Span::styled("  ▼ [Thinking... (Ctrl+T to collapse)]", t.thinking_header())));
                                 for t_line in think.lines() {
                                     chat_lines.push(Line::from(Span::styled(format!("    {}", t_line), t.thinking_text())));
                                 }
                             } else {
-                                chat_lines.push(Line::from(Span::styled("  ▶ [Thinking... (Collapsed - Press Ctrl+T to expand)]", t.thinking_header())));
+                                chat_lines.push(Line::from(Span::styled("  ▶ [Thinking... (Ctrl+T to expand)]", t.thinking_header())));
                             }
                             chat_lines.push(Line::from(""));
                         }
-                        chat_lines.push(Line::from(Span::styled("  [Response]:", Style::default().fg(Color::Green))));
                         let parsed_lines = Self::render_markdown_lines(&msg.content, t);
                         chat_lines.extend(parsed_lines);
                         chat_lines.push(Line::from(""));
@@ -3203,16 +3332,15 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             )));
             if !self.current_thinking_buf.is_empty() {
                 if self.show_thinking {
-                    chat_lines.push(Line::from(Span::styled("  ▼ [Thinking... (Press Ctrl+T to collapse)]", t.thinking_header())));
+                    chat_lines.push(Line::from(Span::styled("  ▼ [Thinking... (Ctrl+T to collapse)]", t.thinking_header())));
                     for l in self.current_thinking_buf.lines() {
                         chat_lines.push(Line::from(Span::styled(format!("    {}", l), t.thinking_text())));
                     }
                 } else {
-                    chat_lines.push(Line::from(Span::styled("  ▶ [Thinking... (Collapsed - Press Ctrl+T to expand)]", t.thinking_header())));
+                    chat_lines.push(Line::from(Span::styled("  ▶ [Thinking... (Ctrl+T to expand)]", t.thinking_header())));
                 }
             }
             if !self.current_response_buf.is_empty() {
-                chat_lines.push(Line::from(Span::styled("  [Streaming Response]:", Style::default().fg(Color::Green))));
                 let parsed_lines = Self::render_markdown_lines(&self.current_response_buf, t);
                 chat_lines.extend(parsed_lines);
             }
@@ -3246,9 +3374,9 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(scroll_title).border_style(t.border_style()));
         f.render_widget(viewport, viewport_area);
 
-        // 3. Bottom Prompt Input Bar (Dynamic Height & Multi-line Wrap with '・> ' prefix)
+        // 3. Bottom Prompt Input Bar (Dynamic Height & Multi-line Wrap with '・ ' prefix)
         let input_text = vec![Line::from(vec![
-            Span::styled("・> ", t.prompt_prefix()),
+            Span::styled("・ ", t.prompt_prefix()),
             Span::raw(&self.input),
         ])];
 
@@ -3454,10 +3582,26 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 f.render_widget(Clear, area);
 
                 let sessions = self.session_mgr.list_sessions();
-                let mut items = Vec::new();
+                let inner_h = (area.height.saturating_sub(2)) as usize;
+                let page_size = inner_h.max(1);
 
-                for (idx, s) in sessions.iter().enumerate() {
-                    let is_selected = idx == self.selected_session_idx;
+                let selected = if !sessions.is_empty() {
+                    self.selected_session_idx.min(sessions.len() - 1)
+                } else {
+                    0
+                };
+
+                let start_idx = if selected >= page_size {
+                    selected + 1 - page_size
+                } else {
+                    0
+                };
+                let end_idx = (start_idx + page_size).min(sessions.len());
+
+                let mut items = Vec::new();
+                for (offset, s) in sessions[start_idx..end_idx].iter().enumerate() {
+                    let actual_idx = start_idx + offset;
+                    let is_selected = actual_idx == selected;
                     let prefix = if is_selected { "> " } else { "  " };
                     let style = if is_selected { t.highlight_item() } else { Style::default().fg(Color::White) };
 
@@ -3479,7 +3623,68 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .title(" Saved Sessions Manager (Up/Down to navigate | Enter to resume) ")
+                        .title(" Saved Sessions (Enter: open │ 'r': rename │ 'd': delete │ Esc: close) ")
+                        .border_style(t.active_border_style()),
+                );
+                f.render_widget(list, area);
+            }
+            ActiveModal::SessionRename => {
+                let area = centered_rect(60, 20, f.area());
+                f.render_widget(Clear, area);
+
+                let content = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(" Enter new session name: ", t.dim_text()),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(" > ", Style::default().fg(Color::Cyan)),
+                        Span::styled(&self.session_rename_buf, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled("█", Style::default().fg(Color::Cyan)),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(" (Press Enter to confirm, Esc to cancel)", t.dim_text())),
+                ];
+
+                let widget = Paragraph::new(content).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Rename Session ")
+                        .border_style(t.active_border_style()),
+                );
+                f.render_widget(widget, area);
+            }
+            ActiveModal::ThemePicker => {
+                let area = centered_rect(54, 45, f.area());
+                f.render_widget(Clear, area);
+
+                let all_themes = crate::theme::AppTheme::all();
+                let mut items = Vec::new();
+                for (idx, th) in all_themes.iter().enumerate() {
+                    let is_cursor = idx == self.selected_theme_idx;
+                    let is_active = *th == self.theme;
+                    let prefix = if is_cursor { "> " } else { "  " };
+                    let mark = if is_active { " [Active]" } else { "" };
+                    let style = if is_cursor {
+                        t.highlight_item()
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let line = Line::from(vec![
+                        Span::styled(prefix, style),
+                        Span::styled(format!("{:<20}", th.name()), style),
+                        Span::styled(mark, Style::default().fg(Color::Green)),
+                    ]);
+                    items.push(ListItem::new(line));
+                }
+
+                let list = List::new(items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Visual Theme Switcher (Up/Down: preview │ Enter: apply │ Esc: cancel) ")
                         .border_style(t.active_border_style()),
                 );
                 f.render_widget(list, area);
@@ -4212,7 +4417,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         if my < height && mx < width {
                             if grid[my][mx].0 == ' ' || grid[my][mx].0 == '·' || grid[my][mx].0 == '.' {
                                 let is_pinned = node.tags.iter().any(|t| t == "pinned");
-                                let moon_glyph = if is_pinned { '📌' } else if node.mass >= 2.0 { '✦' } else { '•' };
+                                let moon_glyph = if is_pinned { '*' } else if node.mass >= 2.0 { '+' } else { '.' };
                                 grid[my][mx] = (moon_glyph, if is_pinned { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(planet_color) });
                             }
                         }
@@ -4224,13 +4429,13 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         // 5. Convert grid to lines
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled("🌌 DENDRITE PLANETARY GALAXY ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("DENDRITE PLANETARY GALAXY ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(" ◖ ", t.dim_text()),
-            Span::styled("Sun: ✸ Core", Style::default().fg(Color::Rgb(255, 215, 0))),
+            Span::styled("Sun: Core", Style::default().fg(Color::Rgb(255, 215, 0))),
             Span::styled(" │ ", t.dim_text()),
-            Span::styled("Planets: ● Category Clusters", Style::default().fg(Color::Cyan)),
+            Span::styled("Planets: Clusters", Style::default().fg(Color::Cyan)),
             Span::styled(" │ ", t.dim_text()),
-            Span::styled("Moons: • Memory Facts (📌 Pinned)", Style::default().fg(Color::LightMagenta)),
+            Span::styled("Moons: Facts (* Pinned)", Style::default().fg(Color::LightMagenta)),
             Span::styled(" │ ", t.dim_text()),
             Span::styled(format!("Orbit: {}", if self.galaxy_auto_spin { "ON" } else { "PAUSED" }), if self.galaxy_auto_spin { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Yellow) }),
             Span::styled(" ◗", t.dim_text()),
@@ -4263,7 +4468,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" 🌌 Dendrite 3D Planetary Galaxy ")
+                .title(" Dendrite 3D Planetary Galaxy ")
                 .border_style(t.active_border_style()),
         );
 

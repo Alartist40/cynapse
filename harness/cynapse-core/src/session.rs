@@ -116,6 +116,16 @@ impl SessionManager {
         }
         Ok(())
     }
+
+    pub fn rename_session(&self, old_id: &str, new_id: &str) -> Result<SessionData> {
+        let clean_old = old_id.trim_end_matches(".json");
+        let clean_new = new_id.trim_end_matches(".json");
+        let mut data = self.load_session(clean_old)?;
+        self.delete_session(clean_old)?;
+        data.session_id = clean_new.to_string();
+        self.save_session(&data)?;
+        Ok(data)
+    }
 }
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
