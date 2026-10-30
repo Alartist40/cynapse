@@ -16,6 +16,7 @@ pub mod offline_agent;
 pub mod persona;
 pub mod power;
 pub mod receipts;
+pub mod sbc_cluster;
 pub mod security;
 pub mod session;
 pub mod skills;

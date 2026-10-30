@@ -62,6 +62,7 @@ pub enum ActiveModal {
     SessionList,
     SessionRename,
     ThemePicker,
+    CommandPalette,
     Doctor,
     PersonaManager,
     Bots,
@@ -297,6 +298,10 @@ pub struct TuiApp {
     pub galaxy_auto_spin: bool,
     pub galaxy_anim_spin: f32,
     pub show_thinking: bool,
+    pub vim_mode: bool,
+    pub last_ttft_ms: Option<u64>,
+    pub stream_start_time: Option<std::time::Instant>,
+    pub palette_selected_idx: usize,
     pub loop_guard: LoopGuard,
     pub agent_step_count: usize,
     pub finalization_inflight: bool,
@@ -392,6 +397,10 @@ impl TuiApp {
             last_max_scroll: AtomicU16::new(0),
             auto_scroll: true,
             show_thinking: true,
+            vim_mode: false,
+            last_ttft_ms: None,
+            stream_start_time: None,
+            palette_selected_idx: 0,
             session_mgr,
             session_id,
             session_created_at,
@@ -550,6 +559,66 @@ impl TuiApp {
         } else {
             self.auto_scroll = false;
         }
+    }
+
+    pub fn copy_last_code_block(&self) -> bool {
+        let text = if !self.current_response_buf.is_empty() {
+            self.current_response_buf.as_str()
+        } else {
+            self.messages.iter().rev()
+                .find(|m| m.role == "assistant")
+                .map(|m| m.content.as_str())
+                .unwrap_or("")
+        };
+
+        if let Some(end_idx) = text.rfind("```") {
+            let prefix = &text[..end_idx];
+            if let Some(start_idx) = prefix.rfind("```") {
+                let code_segment = &prefix[start_idx + 3..];
+                let code = if let Some(first_nl) = code_segment.find('\n') {
+                    &code_segment[first_nl + 1..]
+                } else {
+                    code_segment
+                };
+                return Self::copy_to_system_clipboard(code.trim());
+            }
+        }
+        false
+    }
+
+    pub fn copy_to_system_clipboard(text: &str) -> bool {
+        if let Ok(mut child) = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    return true;
+                }
+            }
+        }
+
+        if let Ok(mut child) = std::process::Command::new("xclip")
+            .arg("-selection")
+            .arg("clipboard")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn delete_word_backward(&mut self) {
@@ -1448,6 +1517,13 @@ impl TuiApp {
                                     ActiveModal::Bots => {
                                         self.selected_bot_idx = self.selected_bot_idx.saturating_sub(1);
                                     }
+                                    ActiveModal::CommandPalette => {
+                                        if self.palette_selected_idx > 0 {
+                                            self.palette_selected_idx -= 1;
+                                        } else {
+                                            self.palette_selected_idx = 12;
+                                        }
+                                    }
                                     _ => {}
                                 },
                                 KeyCode::Down => match self.modal {
@@ -1476,6 +1552,9 @@ impl TuiApp {
                                     }
                                     ActiveModal::Bots => {
                                         self.selected_bot_idx = self.selected_bot_idx.saturating_add(1);
+                                    }
+                                    ActiveModal::CommandPalette => {
+                                        self.palette_selected_idx = (self.palette_selected_idx + 1) % 13;
                                     }
                                     _ => {}
                                 },
@@ -1656,6 +1735,59 @@ impl TuiApp {
                                     ActiveModal::Bots => {
                                         self.modal = ActiveModal::None;
                                     }
+                                    ActiveModal::CommandPalette => {
+                                        const PALETTE_COMMANDS: &[&str] = &[
+                                            "/help", "/dendrite", "/theme", "/model", "/session", "/doctor",
+                                            "/rewind", "/fork", "/bots", "/persona", "/undo", "/clear", "/exit"
+                                        ];
+                                        let sel = PALETTE_COMMANDS[self.palette_selected_idx.min(PALETTE_COMMANDS.len() - 1)];
+                                        self.modal = ActiveModal::None;
+                                        match sel {
+                                            "/help" => self.modal = ActiveModal::Help,
+                                            "/dendrite" => self.modal = ActiveModal::MemoryGraph,
+                                            "/theme" => self.modal = ActiveModal::ThemePicker,
+                                            "/model" => self.modal = ActiveModal::ModelList,
+                                            "/session" => self.modal = ActiveModal::SessionList,
+                                            "/doctor" => {
+                                                let db_path = dirs::home_dir().map(|h| h.join(".cynapse").join("dendrite.db")).unwrap_or_else(|| PathBuf::from("data/dendrite.db"));
+                                                let doctor = cynapse_core::doctor::CynapseDoctor::new(self.models_dir.clone(), db_path, true);
+                                                self.doctor_report = Some(doctor.run_diagnostics());
+                                                self.modal = ActiveModal::Doctor;
+                                            }
+                                            "/rewind" => {
+                                                if self.messages.len() > 1 {
+                                                    self.messages.pop();
+                                                    self.save_current_session();
+                                                }
+                                            }
+                                            "/fork" => {
+                                                let fork_name = format!("fork-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+                                                self.session_id = fork_name.clone();
+                                                self.save_current_session();
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("✦ Forked conversation branch into new session: {}", fork_name),
+                                                    thinking: None,
+                                                });
+                                            }
+                                            "/bots" => self.modal = ActiveModal::Bots,
+                                            "/persona" => self.modal = ActiveModal::PersonaManager,
+                                            "/undo" => {
+                                                if let Ok(msg) = cynapse_core::undo::UndoJournal::undo_latest() {
+                                                    self.messages.push(ChatMessage { role: "system".into(), content: format!("✓ {}", msg), thinking: None });
+                                                }
+                                            }
+                                            "/clear" => {
+                                                self.messages.clear();
+                                                self.messages.push(ChatMessage { role: "system".into(), content: "Conversation cleared.".into(), thinking: None });
+                                            }
+                                            "/exit" => {
+                                                self.save_current_session();
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                     _ => {
                                         self.modal = ActiveModal::None;
                                     }
@@ -1730,6 +1862,93 @@ impl TuiApp {
                                     self.input_cursor = 0;
                                     continue;
                                 }
+                                KeyCode::Char('y') => {
+                                    if self.copy_last_code_block() {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "✓ Copied code block to system clipboard!".into(),
+                                            thinking: None,
+                                        });
+                                    } else {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "Notice: No code block found in response to copy.".into(),
+                                            thinking: None,
+                                        });
+                                    }
+                                    continue;
+                                }
+                                KeyCode::Char('p') => {
+                                    self.modal = if self.modal == ActiveModal::CommandPalette {
+                                        ActiveModal::None
+                                    } else {
+                                        self.palette_selected_idx = 0;
+                                        ActiveModal::CommandPalette
+                                    };
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Alt Key Viewport Navigation Shortcuts
+                        if key.modifiers.contains(KeyModifiers::ALT) {
+                            match key.code {
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    self.scroll_down(1);
+                                    continue;
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    self.scroll_up(1);
+                                    continue;
+                                }
+                                KeyCode::Char('g') => {
+                                    self.scroll_offset = 0;
+                                    self.auto_scroll = false;
+                                    continue;
+                                }
+                                KeyCode::Char('G') => {
+                                    self.scroll_down(u16::MAX);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Normal / Vim Navigation Mode
+                        if self.vim_mode && key.modifiers.is_empty() {
+                            match key.code {
+                                KeyCode::Char('j') => {
+                                    self.scroll_down(1);
+                                    continue;
+                                }
+                                KeyCode::Char('k') => {
+                                    self.scroll_up(1);
+                                    continue;
+                                }
+                                KeyCode::Char('g') => {
+                                    self.scroll_offset = 0;
+                                    self.auto_scroll = false;
+                                    continue;
+                                }
+                                KeyCode::Char('G') => {
+                                    self.scroll_down(u16::MAX);
+                                    continue;
+                                }
+                                KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Enter => {
+                                    self.vim_mode = false;
+                                    continue;
+                                }
+                                KeyCode::Char('/') | KeyCode::Char(':') => {
+                                    self.palette_selected_idx = 0;
+                                    self.modal = ActiveModal::CommandPalette;
+                                    self.vim_mode = false;
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    self.vim_mode = false;
+                                    continue;
+                                }
                                 _ => {}
                             }
                         }
@@ -1740,8 +1959,12 @@ impl TuiApp {
                                 // Typing '/' opens command palette; Tab does not hijack chat focus
                             }
                             KeyCode::Esc => {
-                                self.input.clear();
-                                self.input_cursor = 0;
+                                if !self.input.is_empty() {
+                                    self.input.clear();
+                                    self.input_cursor = 0;
+                                } else {
+                                    self.vim_mode = !self.vim_mode;
+                                }
                                 self.modal = ActiveModal::None;
                             }
                             KeyCode::Left => {
@@ -2347,6 +2570,8 @@ impl TuiApp {
                                 self.finalization_inflight = false;
                                 self.turn_verified = true;
                                 self.is_generating = true;
+                                self.stream_start_time = Some(std::time::Instant::now());
+                                self.last_ttft_ms = None;
                                 self.current_thinking_buf.clear();
                                 self.current_response_buf.clear();
                                 self.auto_scroll = true; // Lock scroll to bottom for incoming response
@@ -2494,9 +2719,16 @@ impl TuiApp {
         let mut reprompting = false;
         for event in events {
             match event {
-                StreamEvent::Token { ttype, text } => match ttype {
-                    TokenType::Thinking => self.current_thinking_buf.push_str(&text),
-                    TokenType::Response => self.current_response_buf.push_str(&text),
+                StreamEvent::Token { ttype, text } => {
+                    if let Some(st) = self.stream_start_time {
+                        if self.last_ttft_ms.is_none() {
+                            self.last_ttft_ms = Some(st.elapsed().as_millis() as u64);
+                        }
+                    }
+                    match ttype {
+                        TokenType::Thinking => self.current_thinking_buf.push_str(&text),
+                        TokenType::Response => self.current_response_buf.push_str(&text),
+                    }
                 },
                 StreamEvent::Done { tok_per_sec, elapsed_sec } => {
                     self.last_tok_per_sec = tok_per_sec;
@@ -3057,7 +3289,11 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 Span::styled("  │  ", t.dim_text()),
                 Span::styled(
                     if self.last_tok_per_sec > 0.0 {
-                        format!("Perf: {:.1} t/s {}", self.last_tok_per_sec, self.render_sparkline())
+                        if let Some(ttft) = self.last_ttft_ms {
+                            format!("Perf: {:.1} t/s (TTFT: {}ms) {}", self.last_tok_per_sec, ttft, self.render_sparkline())
+                        } else {
+                            format!("Perf: {:.1} t/s {}", self.last_tok_per_sec, self.render_sparkline())
+                        }
                     } else {
                         format!("Perf: idle {}", self.render_sparkline())
                     },
@@ -3689,6 +3925,52 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .title(" Visual Theme Switcher (Up/Down: preview │ Enter: apply │ Esc: cancel) ")
+                        .border_style(t.active_border_style()),
+                );
+                f.render_widget(list, area);
+            }
+            ActiveModal::CommandPalette => {
+                let area = centered_rect(56, 50, f.area());
+                f.render_widget(Clear, area);
+
+                const PALETTE_COMMANDS: &[(&str, &str)] = &[
+                    ("/help", "Interactive help & keybindings"),
+                    ("/dendrite", "3D Planetary Graph Visualizer"),
+                    ("/theme", "Switch UI theme palette"),
+                    ("/model", "Switch or pull LLM models"),
+                    ("/session", "Saved conversation sessions"),
+                    ("/doctor", "System self-healing diagnostics"),
+                    ("/rewind", "Rewind last conversational turn"),
+                    ("/fork", "Branch session into new fork"),
+                    ("/bots", "Bot profile catalog"),
+                    ("/persona", "Manage AI personality personas"),
+                    ("/undo", "Undo latest file modifications"),
+                    ("/clear", "Clear chat history"),
+                    ("/exit", "Save and exit Cynapse"),
+                ];
+
+                let mut items = Vec::new();
+                for (idx, (cmd, desc)) in PALETTE_COMMANDS.iter().enumerate() {
+                    let is_cursor = idx == self.palette_selected_idx;
+                    let prefix = if is_cursor { "> " } else { "  " };
+                    let style = if is_cursor {
+                        t.highlight_item()
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let line = Line::from(vec![
+                        Span::styled(prefix, style),
+                        Span::styled(format!("{:<14}", cmd), if is_cursor { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Cyan) }),
+                        Span::styled(format!(" {}", desc), if is_cursor { Style::default().fg(Color::White) } else { t.dim_text() }),
+                    ]);
+                    items.push(ListItem::new(line));
+                }
+
+                let list = List::new(items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" ✦ Command Palette (Up/Down: select │ Enter: execute │ Esc: close) ")
                         .border_style(t.active_border_style()),
                 );
                 f.render_widget(list, area);

@@ -1082,6 +1082,82 @@ impl LoopGuard {
     }
 }
 
+/// Step-Back Prompting Directive: prepends a structural constraint reflection
+/// instruction to force small edge models to examine prerequisites before emitting tool actions.
+pub fn format_step_back_prompt(query: &str) -> String {
+    format!(
+        "System 2 Reflection: Before selecting any tools, review: \
+        (1) Is this an investigatory question or modifying action? \
+        (2) Do required paths/dependencies exist? \
+        (3) What is the minimal sufficient tool action?\n\
+        User Query: {}",
+        query.trim()
+    )
+}
+
+/// Hallucination Guardrail: Validates that a requested file path exists before execution.
+pub fn verify_path_exists(path_str: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::PathBuf::from(path_str);
+    if p.exists() {
+        Ok(p)
+    } else {
+        Err(format!("Hallucination Guard: Path does not exist on filesystem: '{}'", path_str))
+    }
+}
+
+/// Hallucination Guardrail: Validates that the primary binary in a command line exists.
+pub fn verify_command_binary_exists(cmd_str: &str) -> Result<String, String> {
+    let binary = cmd_str.split_whitespace().next().unwrap_or("").trim();
+    if binary.is_empty() {
+        return Err("Empty command".to_string());
+    }
+    // Whitelisted common shell builtins
+    if ["cd", "echo", "pwd", "true", "false", "test", "export"].contains(&binary) {
+        return Ok(binary.to_string());
+    }
+    if std::path::Path::new(binary).is_file() {
+        return Ok(binary.to_string());
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&paths) {
+            let candidate = p.join(binary);
+            if candidate.is_file() {
+                return Ok(binary.to_string());
+            }
+        }
+    }
+    Err(format!("Hallucination Guard: Executable binary '{}' not found in PATH", binary))
+}
+
+/// Self-Consistency Majority Voting: Takes multiple candidate tool calls sampled at T > 0,
+/// grouping by tool name and canonical path/command, and returns the highest consensus call.
+pub fn self_consistency_majority_vote(candidates: &[ToolCall]) -> Option<ToolCall> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+
+    let mut votes: std::collections::HashMap<(String, String), (usize, ToolCall)> = std::collections::HashMap::new();
+    for call in candidates {
+        let key = (
+            call.name.clone(),
+            call.arguments.get("path")
+                .or_else(|| call.arguments.get("cmd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
+        let entry = votes.entry(key).or_insert((0, call.clone()));
+        entry.0 += 1;
+    }
+
+    votes.into_values()
+        .max_by_key(|(count, _)| *count)
+        .map(|(_, call)| call)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1386,6 +1462,32 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "read_file");
         assert_eq!(tools[0].arguments.get("path").and_then(|v| v.as_str()), Some("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_system2_guardrails_and_voting() {
+        // 1. Step-back prompt
+        let sb = format_step_back_prompt("delete my database");
+        assert!(sb.contains("System 2 Reflection:"));
+        assert!(sb.contains("delete my database"));
+
+        // 2. Path verification
+        assert!(verify_path_exists("Cargo.toml").is_ok());
+        assert!(verify_path_exists("non_existent_file_xyz_123.rs").is_err());
+
+        // 3. Command binary verification
+        assert!(verify_command_binary_exists("cargo test").is_ok());
+        assert!(verify_command_binary_exists("echo hello").is_ok());
+        assert!(verify_command_binary_exists("fake_non_existent_binary_987").is_err());
+
+        // 4. Majority voting
+        let candidates = vec![
+            ToolCall { name: "read_file".into(), arguments: serde_json::json!({"path": "src/lib.rs"}) },
+            ToolCall { name: "patch_file".into(), arguments: serde_json::json!({"path": "src/lib.rs"}) },
+            ToolCall { name: "read_file".into(), arguments: serde_json::json!({"path": "src/lib.rs"}) },
+        ];
+        let voted = self_consistency_majority_vote(&candidates).unwrap();
+        assert_eq!(voted.name, "read_file");
     }
 }
 
