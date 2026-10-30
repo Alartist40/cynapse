@@ -210,7 +210,7 @@ impl TuiSession {
             if let Some(ref st) = store { let _ = st.save(&n1); }
         }
         if graph.get("fast_tier").is_none() {
-            let n2 = graph.upsert("fast_tier", "Ollama/llama.cpp Fast Engine", "Tier 1 execution engine optimized for SBC hardware reaching 4.8 tok/s.", NodeType::Concept, Some(vec!["#engine".into()]));
+            let n2 = graph.upsert("fast_tier", "Native llama.cpp Daemon", "Tier 1 execution engine daemon running on port 38265 with hardware acceleration reaching 4.8 tok/s.", NodeType::Concept, Some(vec!["#engine".into()]));
             if let Some(ref st) = store { let _ = st.save(&n2); }
         }
         if graph.get("rust_inference").is_none() {
