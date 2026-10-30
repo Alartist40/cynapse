@@ -244,8 +244,8 @@ pub struct ProviderFallbackChain {
 impl Default for ProviderFallbackChain {
     fn default() -> Self {
         Self::new(
-            ProviderKind::NativeLeafcutter,
-            vec![ProviderKind::LlamaServer, ProviderKind::Ollama],
+            ProviderKind::Ollama,
+            vec![ProviderKind::LlamaServer, ProviderKind::NativeLeafcutter],
         )
     }
 }
@@ -1538,7 +1538,7 @@ pub async fn query_tier1_stream(
     };
 
     let mut candidate_providers = vec![resolved_provider];
-    for p in [ProviderKind::NativeLeafcutter, ProviderKind::LlamaServer, ProviderKind::Ollama] {
+    for p in [ProviderKind::Ollama, ProviderKind::LlamaServer, ProviderKind::NativeLeafcutter] {
         if !candidate_providers.contains(&p) {
             candidate_providers.push(p);
         }
@@ -1616,60 +1616,7 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
         .unwrap_or(99);
     let ctx_size = engine_ctx_size();
 
-    // 1. In-process Tier 1 (llama.cpp FFI) preloading into memory cache
-    if leafcutter::llama_ffi::is_available() {
-        if let Some(local_path) = find_model_file_path(model_name) {
-            if local_path.is_file() {
-                engine_log(&format!("Preloading Tier 1 in-process llama model: {}", local_path.display()));
-                let lp = local_path.clone();
-                match tokio::task::spawn_blocking(move || get_or_load_llama_engine(&lp, ngl, ctx_size as u32)).await {
-                    Ok(Ok(_)) => {
-                        engine_log(&format!("Tier 1 in-process llama model preloaded into RAM: {}", local_path.display()));
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        engine_log(&format!("Tier 1 in-process preload notice: {}", e));
-                    }
-                    Err(join_err) => {
-                        engine_log(&format!("Tier 1 in-process preload task error: {}", join_err));
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. In-process Tier 2 (Leafcutter pure Rust) preloading into memory cache
-    if let Some(local_path) = find_model_file_path(model_name) {
-        if local_path.is_file() && local_path.extension().map_or(false, |ext| ext == "gguf") {
-            let path_str = local_path.to_string_lossy().to_string();
-            engine_log(&format!("Preloading Tier 2 native Leafcutter model: {}", path_str));
-            let ps = path_str.clone();
-            match tokio::task::spawn_blocking(move || get_or_load_native_engine(&ps)).await {
-                Ok(Ok(_)) => {
-                    engine_log(&format!("Tier 2 native Leafcutter model preloaded into RAM: {}", path_str));
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    engine_log(&format!("Tier 2 native preload notice: {}", e));
-                }
-                Err(join_err) => {
-                    engine_log(&format!("Tier 2 native preload task error: {}", join_err));
-                }
-            }
-        }
-    }
-
-    // 3. Embedded local llama-server daemon for local GGUF
-    let daemon_port = daemon::DEFAULT_DAEMON_PORT;
-    if let Some(local_path) = find_model_file_path(model_name) {
-        if !daemon::LlamaServerDaemon::is_healthy(daemon_port) {
-            engine_log(&format!("Spawning local llama-server daemon for '{}'", local_path.display()));
-            let _ = daemon::LlamaServerDaemon::get_or_spawn_daemon(&local_path, daemon_port);
-        }
-        return Ok(());
-    }
-
-    // 4. Tertiary Fallback: Check if Ollama is running and pin with keep_alive: -1
+    // 1. Check if Ollama is running and pin with keep_alive: -1 and GPU layers offloaded
     let tags_url = format!("{}/api/tags", endpoint_clean);
     if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_secs(3)).send().await {
         if resp.status().is_success() {
@@ -1706,6 +1653,59 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
                 }
             }
         }
+    }
+
+    // 2. In-process Tier 1 (llama.cpp FFI) preloading into memory cache
+    if leafcutter::llama_ffi::is_available() {
+        if let Some(local_path) = find_model_file_path(model_name) {
+            if local_path.is_file() {
+                engine_log(&format!("Preloading Tier 1 in-process llama model: {}", local_path.display()));
+                let lp = local_path.clone();
+                match tokio::task::spawn_blocking(move || get_or_load_llama_engine(&lp, ngl, ctx_size as u32)).await {
+                    Ok(Ok(_)) => {
+                        engine_log(&format!("Tier 1 in-process llama model preloaded into RAM: {}", local_path.display()));
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        engine_log(&format!("Tier 1 in-process preload notice: {}", e));
+                    }
+                    Err(join_err) => {
+                        engine_log(&format!("Tier 1 in-process preload task error: {}", join_err));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. In-process Tier 2 (Leafcutter pure Rust) preloading into memory cache
+    if let Some(local_path) = find_model_file_path(model_name) {
+        if local_path.is_file() && local_path.extension().map_or(false, |ext| ext == "gguf") {
+            let path_str = local_path.to_string_lossy().to_string();
+            engine_log(&format!("Preloading Tier 2 native Leafcutter model: {}", path_str));
+            let ps = path_str.clone();
+            match tokio::task::spawn_blocking(move || get_or_load_native_engine(&ps)).await {
+                Ok(Ok(_)) => {
+                    engine_log(&format!("Tier 2 native Leafcutter model preloaded into RAM: {}", path_str));
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    engine_log(&format!("Tier 2 native preload notice: {}", e));
+                }
+                Err(join_err) => {
+                    engine_log(&format!("Tier 2 native preload task error: {}", join_err));
+                }
+            }
+        }
+    }
+
+    // 4. Embedded local llama-server daemon for local GGUF
+    let daemon_port = daemon::DEFAULT_DAEMON_PORT;
+    if let Some(local_path) = find_model_file_path(model_name) {
+        if !daemon::LlamaServerDaemon::is_healthy(daemon_port) {
+            engine_log(&format!("Spawning local llama-server daemon for '{}'", local_path.display()));
+            let _ = daemon::LlamaServerDaemon::get_or_spawn_daemon(&local_path, daemon_port);
+        }
+        return Ok(());
     }
 
     Ok(())
