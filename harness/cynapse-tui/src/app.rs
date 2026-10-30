@@ -67,6 +67,7 @@ pub enum ActiveModal {
     PersonaManager,
     Bots,
     ToolApproval,
+    Updater,
 }
 
 #[derive(Debug)]
@@ -143,6 +144,22 @@ pub struct DownloadProgressState {
     pub pct: f64,
     pub is_done: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateProgressState {
+    pub is_running: bool,
+    pub is_done: bool,
+    pub current_step: String,
+    pub steps_log: Vec<String>,
+    pub error: Option<String>,
+    pub success_message: Option<String>,
+}
+
+pub enum UpdateEvent {
+    Step(String),
+    Success(String),
+    Error(String),
 }
 
 pub enum StreamEvent {
@@ -337,6 +354,8 @@ pub struct TuiApp {
     pub approval_rx: mpsc::UnboundedReceiver<ToolApprovalRequest>,
     pub pending_approval: Option<PendingToolApproval>,
     pub update_notification: Arc<std::sync::Mutex<Option<String>>>,
+    pub update_state: Option<UpdateProgressState>,
+    pub update_rx: Option<mpsc::UnboundedReceiver<UpdateEvent>>,
     pub selected_theme_idx: usize,
     pub session_rename_buf: String,
     pub available_update: Option<String>,
@@ -468,6 +487,8 @@ impl TuiApp {
             selected_theme_idx: 0,
             session_rename_buf: String::new(),
             available_update: None,
+            update_state: None,
+            update_rx: None,
         }
     }
 
@@ -1160,6 +1181,49 @@ impl TuiApp {
         }
     }
 
+    fn poll_update_events(&mut self) {
+        if let Some(rx) = &mut self.update_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    UpdateEvent::Step(step) => {
+                        if let Some(st) = &mut self.update_state {
+                            st.current_step = step.clone();
+                            st.steps_log.push(step);
+                        }
+                    }
+                    UpdateEvent::Success(msg) => {
+                        if let Some(st) = &mut self.update_state {
+                            st.is_running = false;
+                            st.is_done = true;
+                            st.success_message = Some(msg.clone());
+                        }
+                        self.available_update = None;
+                        self.messages.push(ChatMessage {
+                            role: "system".into(),
+                            content: format!("✓ {}", msg),
+                            thinking: None,
+                        });
+                        self.update_rx = None;
+                        break;
+                    }
+                    UpdateEvent::Error(err) => {
+                        if let Some(st) = &mut self.update_state {
+                            st.is_running = false;
+                            st.error = Some(err.clone());
+                        }
+                        self.messages.push(ChatMessage {
+                            role: "system".into(),
+                            content: format!("Update failed: {}", err),
+                            thinking: None,
+                        });
+                        self.update_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     async fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
             self.anim_tick += 1;
@@ -1173,6 +1237,7 @@ impl TuiApp {
 
             self.poll_stream_events();
             self.poll_download_events();
+            self.poll_update_events();
             self.poll_update_notification();
 
             terminal.draw(|f| self.ui(f))?;
@@ -1788,6 +1853,13 @@ impl TuiApp {
                                             _ => {}
                                         }
                                     }
+                                    ActiveModal::Updater => {
+                                        if let Some(st) = &self.update_state {
+                                            if !st.is_running {
+                                                self.modal = ActiveModal::None;
+                                            }
+                                        }
+                                    }
                                     _ => {
                                         self.modal = ActiveModal::None;
                                     }
@@ -2186,45 +2258,39 @@ impl TuiApp {
                                 }
 
                                 if trimmed == "/update" || trimmed == "/upgrade" {
-                                    let repo_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                                    self.messages.push(ChatMessage {
-                                        role: "system".into(),
-                                        content: "Checking remote repository and preparing update...".into(),
-                                        thinking: None,
-                                    });
-                                    let mut steps = Vec::new();
-                                    match cynapse_core::updater::execute_update(&repo_dir, |step| {
-                                        steps.push(step.to_string());
-                                    }) {
-                                        Ok(summary) => {
-                                            for step in steps {
-                                                self.messages.push(ChatMessage {
-                                                    role: "system".into(),
-                                                    content: step,
-                                                    thinking: None,
-                                                });
-                                            }
-                                            self.messages.push(ChatMessage {
-                                                role: "system".into(),
-                                                content: format!("✓ {}", summary),
-                                                thinking: None,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            for step in steps {
-                                                self.messages.push(ChatMessage {
-                                                    role: "system".into(),
-                                                    content: step,
-                                                    thinking: None,
-                                                });
-                                            }
-                                            self.messages.push(ChatMessage {
-                                                role: "system".into(),
-                                                content: format!("Update failed: {}", e),
-                                                thinking: None,
-                                            });
+                                    if let Some(st) = &self.update_state {
+                                        if st.is_running {
+                                            self.modal = ActiveModal::Updater;
+                                            continue;
                                         }
                                     }
+
+                                    let (tx, rx) = mpsc::unbounded_channel();
+                                    self.update_rx = Some(rx);
+                                    self.update_state = Some(UpdateProgressState {
+                                        is_running: true,
+                                        is_done: false,
+                                        current_step: "[1/3] Checking repository status...".into(),
+                                        steps_log: vec!["[1/3] Initializing Cynapse update sequence...".into()],
+                                        error: None,
+                                        success_message: None,
+                                    });
+                                    self.modal = ActiveModal::Updater;
+
+                                    let repo_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                                    std::thread::spawn(move || {
+                                        let res = cynapse_core::updater::execute_update(&repo_dir, |step| {
+                                            let _ = tx.send(UpdateEvent::Step(step.to_string()));
+                                        });
+                                        match res {
+                                            Ok(msg) => {
+                                                let _ = tx.send(UpdateEvent::Success(msg));
+                                            }
+                                            Err(err) => {
+                                                let _ = tx.send(UpdateEvent::Error(err.to_string()));
+                                            }
+                                        }
+                                    });
                                     continue;
                                 }
 
@@ -3439,10 +3505,10 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
 
         // 2B. RIGHT CHAT HISTORY VIEWPORT (Jcode-style Synapse Neural Logo & Transcript)
         let mut chat_lines = Vec::new();
-        let has_user_prompts = self.messages.iter().any(|m| m.role == "user");
+        let show_welcome = self.messages.is_empty();
 
         // Render Centered Synapse Neural Logo when starting / clear state
-        if !has_user_prompts {
+        if show_welcome {
             let vp_w = viewport_area.width.saturating_sub(2) as usize;
 
             chat_lines.push(Line::from(""));
@@ -3593,7 +3659,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         let total_visual_lines = calculate_visual_lines(&chat_lines, inner_width);
         let max_scroll = (total_visual_lines as u16 + 4).saturating_sub(inner_height as u16);
         self.last_max_scroll.store(max_scroll, Ordering::Relaxed);
-        let effective_scroll = if !has_user_prompts {
+        let effective_scroll = if show_welcome {
             self.scroll_offset.min(max_scroll)
         } else if self.auto_scroll {
             max_scroll
@@ -4575,6 +4641,81 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
 
                 let p = Paragraph::new(text).wrap(Wrap { trim: true });
                 f.render_widget(p, inner_area);
+            }
+            ActiveModal::Updater => {
+                let area = centered_rect(76, 50, f.area());
+                f.render_widget(Clear, area);
+
+                let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let spinner = spinner_frames[self.anim_tick % spinner_frames.len()];
+
+                let mut lines = Vec::new();
+                lines.push(Line::from(""));
+
+                if let Some(st) = &self.update_state {
+                    if let Some(err) = &st.error {
+                        lines.push(Line::from(vec![
+                            Span::styled("  ❌ CYNAPSE UPDATE FAILED", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                        ]));
+                        lines.push(Line::from(Span::styled("  ──────────────────────────────────────────────────────────", Style::default().fg(Color::DarkGray))));
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(vec![
+                            Span::styled("  Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                            Span::styled(err, Style::default().fg(Color::LightRed)),
+                        ]));
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled("  Press Enter or Esc to return to chat.", Style::default().fg(Color::Yellow))));
+                    } else if st.is_done {
+                        lines.push(Line::from(vec![
+                            Span::styled("  ✓ CYNAPSE UPDATE COMPLETE!", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                        ]));
+                        lines.push(Line::from(Span::styled("  ──────────────────────────────────────────────────────────", Style::default().fg(Color::DarkGray))));
+                        lines.push(Line::from(""));
+                        if let Some(msg) = &st.success_message {
+                            lines.push(Line::from(vec![
+                                Span::styled("  Result: ", Style::default().fg(Color::Cyan)),
+                                Span::styled(msg, Style::default().fg(Color::White)),
+                            ]));
+                        }
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled("  Please restart Cynapse to run the newly compiled binary.", Style::default().fg(Color::Green))));
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled("  Press Enter or Esc to return to chat.", t.dim_text())));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {} UPDATING CYNAPSE SYSTEM...", spinner), t.header_title()),
+                        ]));
+                        lines.push(Line::from(Span::styled("  ──────────────────────────────────────────────────────────", Style::default().fg(Color::DarkGray))));
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(vec![
+                            Span::styled("  Current Task: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::styled(&st.current_step, Style::default().fg(Color::Yellow)),
+                        ]));
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled("  Log Steps:", Style::default().fg(Color::Cyan))));
+                        for step in st.steps_log.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+                            lines.push(Line::from(vec![
+                                Span::styled("    • ", Style::default().fg(Color::Cyan)),
+                                Span::styled(step, Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled("  Building in background. Press Esc to background this window.", t.dim_text())));
+                    }
+                } else {
+                    lines.push(Line::from(Span::styled("  No update currently in progress.", t.dim_text())));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled("  Press Esc to close.", t.dim_text())));
+                }
+
+                let modal = Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" ◖ Cynapse In-Process System Updater ◗ ")
+                        .border_style(t.active_border_style()),
+                );
+                f.render_widget(modal, area);
             }
             ActiveModal::None => {}
         }

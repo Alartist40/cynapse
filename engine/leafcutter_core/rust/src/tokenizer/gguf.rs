@@ -286,7 +286,7 @@ impl GgufTokenizer {
             // tokens, but `[THINK]` is NOT (HF splits it into `[`, `TH`,
             // `INK`, `]`), so it must stay in the word stream for BPE to
             // shatter it identically.
-            let (is_marker, close_len) = if c == '[' {
+            let (is_marker, _close_len) = if c == '[' {
                 (true, 1usize)
             } else if c == '<' && i + 2 < n && chars[i + 1] == '|' {
                 (true, 2usize)

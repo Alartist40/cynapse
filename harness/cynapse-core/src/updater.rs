@@ -89,7 +89,18 @@ pub fn check_for_updates(repo_dir: &Path) -> Result<Option<UpdateInfo>> {
         return Ok(None);
     }
 
-    let has_update = current_commit != remote_commit;
+    let has_update = if current_commit == remote_commit {
+        false
+    } else {
+        // If remote_commit is an ancestor of HEAD, local is ahead of remote, so no update needed
+        let is_ancestor = Command::new("git")
+            .args(["merge-base", "--is-ancestor", &remote_commit, "HEAD"])
+            .current_dir(repo_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        !is_ancestor
+    };
 
     Ok(Some(UpdateInfo {
         current_commit,
@@ -100,12 +111,12 @@ pub fn check_for_updates(repo_dir: &Path) -> Result<Option<UpdateInfo>> {
     }))
 }
 
-/// Executes full update sequence: git pull, cargo build --release, and binary installation.
+/// Executes full update sequence: git pull, cargo build --release, and binary verification.
 pub fn execute_update<F>(repo_dir: &Path, mut progress: F) -> Result<String>
 where
     F: FnMut(&str),
 {
-    progress("[1/4] Checking repository status...");
+    progress("[1/3] Checking repository status...");
     let status_out = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(repo_dir)
@@ -114,29 +125,56 @@ where
 
     let dirty = !status_out.stdout.is_empty();
     if dirty {
-        progress("[1/4] Stashing local changes to prevent merge conflicts...");
+        progress("[1/3] Stashing local changes to prevent merge conflicts...");
         let _ = Command::new("git")
             .args(["stash", "save", "cynapse-auto-update"])
             .current_dir(repo_dir)
             .output();
     }
 
-    progress("[2/4] Pulling latest commits from remote origin...");
-    let pull_out = Command::new("git")
-        .args(["pull", "--ff-only", "origin", "main"])
+    // Get current branch
+    let branch_out = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(repo_dir)
         .output()
-        .context("Failed to run git pull")?;
+        .context("Failed to query git branch")?;
+    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    let branch = if branch.is_empty() { "main".to_string() } else { branch };
 
-    if !pull_out.status.success() {
-        let err = String::from_utf8_lossy(&pull_out.stderr);
-        if dirty {
-            let _ = Command::new("git")
-                .args(["stash", "pop"])
-                .current_dir(repo_dir)
-                .output();
+    progress(&format!("[2/3] Fetching remote branch '{}' from origin...", branch));
+    let _ = Command::new("git")
+        .args(["fetch", "origin", &branch])
+        .current_dir(repo_dir)
+        .output();
+
+    let remote_ref = format!("origin/{}", branch);
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &remote_ref, "HEAD"])
+        .current_dir(repo_dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if is_ancestor {
+        progress(&format!("Local '{}' is already up to date with {}.", branch, remote_ref));
+    } else {
+        progress(&format!("[2/3] Fast-forwarding local '{}' from {}...", branch, remote_ref));
+        let pull_out = Command::new("git")
+            .args(["pull", "--ff-only", "origin", &branch])
+            .current_dir(repo_dir)
+            .output()
+            .context("Failed to run git pull")?;
+
+        if !pull_out.status.success() {
+            let err = String::from_utf8_lossy(&pull_out.stderr);
+            if dirty {
+                let _ = Command::new("git")
+                    .args(["stash", "pop"])
+                    .current_dir(repo_dir)
+                    .output();
+            }
+            bail!("Git pull failed: {}", err.trim());
         }
-        bail!("Git pull failed: {}", err.trim());
     }
 
     if dirty {
@@ -147,7 +185,7 @@ where
             .output();
     }
 
-    progress("[3/4] Compiling optimized release binary (cargo build --release --bin cynapse)...");
+    progress("[3/3] Compiling optimized release binary (cargo build --release --bin cynapse)...");
     let build_out = Command::new("cargo")
         .args(["build", "--release", "--bin", "cynapse"])
         .current_dir(repo_dir)
@@ -159,18 +197,9 @@ where
         bail!("Compilation failed: {}", err.trim());
     }
 
-    progress("[4/4] Installing updated binary to ~/.local/bin/cynapse...");
     let bin_path = repo_dir.join("target").join("release").join("cynapse");
-    if let Some(home) = dirs::home_dir() {
-        let target_dir = home.join(".local").join("bin");
-        let _ = std::fs::create_dir_all(&target_dir);
-        let target_bin = target_dir.join("cynapse");
-        let install_status = Command::new("install")
-            .args(["-m", "755", bin_path.to_str().unwrap_or_default(), target_bin.to_str().unwrap_or_default()])
-            .output();
-        if let Err(_) = install_status {
-            let _ = std::fs::copy(&bin_path, &target_bin);
-        }
+    if !bin_path.exists() {
+        bail!("Build completed but binary not found at {:?}", bin_path);
     }
 
     let head_out = Command::new("git")
@@ -182,7 +211,7 @@ where
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "latest".into());
 
-    Ok(format!("Cynapse successfully updated to commit {}! Please restart Cynapse to run the new binary.", head_hash))
+    Ok(format!("Cynapse release binary successfully built at ./target/release/cynapse (commit {}). Restart Cynapse to run updated binary.", head_hash))
 }
 
 #[cfg(test)]

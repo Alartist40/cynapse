@@ -13,13 +13,12 @@ use crate::model::tensor::Tensor;
 use crate::cache::{KVCache, ssm_state::SSMStateCache, deltanet_state::DeltaNetStateCache};
 use crate::inference::attention::{attention_forward, AttentionParams};
 use crate::inference::deltanet::{deltanet_forward, DeltaNetParams};
-use crate::inference::mla::{mla_forward, MlaParams};
+use crate::inference::mla::mla_forward;
 use crate::inference::moe::MoeConfig;
 use crate::inference::sampler::sample_top_p;
 use crate::inference::ssm::{ssm_forward, SSMConfig};
 use crate::inference::speculative::SpeculativeHead;
 use crate::tokenizer::GgufTokenizer;
-use rayon::prelude::*;
 use std::collections::HashMap;
 #[cfg(feature = "llama-ffi")]
 use crate::llama_ffi::{LlamaModel, LlamaContext};
@@ -1788,11 +1787,11 @@ fn infer_gemma_layouts(
         .file
         .get_metadata_int("gemma4.attention.value_length")
         .unwrap_or(256) as usize;
-    let key_length_swa = model
+    let _key_length_swa = model
         .file
         .get_metadata_int("gemma4.attention.key_length_swa")
         .unwrap_or(key_length as i64) as usize;
-    let value_length_swa = model
+    let _value_length_swa = model
         .file
         .get_metadata_int("gemma4.attention.value_length_swa")
         .unwrap_or(value_length as i64) as usize;
@@ -1818,7 +1817,7 @@ fn infer_gemma_layouts(
     };
     // Per-layer sliding-window pattern (bool array).
     // Gemma 3/4 default: 5 global then 1 sliding, repeating.
-    let mut default_pattern: Vec<bool> = (0..num_layers).map(|i| i % 6 == 5).collect();
+    let default_pattern: Vec<bool> = (0..num_layers).map(|i| i % 6 == 5).collect();
     let swa_pattern: Vec<bool> = match model
         .file
         .metadata

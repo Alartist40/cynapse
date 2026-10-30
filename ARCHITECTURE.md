@@ -117,20 +117,28 @@ Detection signals:
 - **Wandering** (warn at 6, escalation at 12): distinct args on `execute_command`
 - **Circuit breaker** (trips at 3 consecutive vetoes): forces graceful turn end
 
-### Provider Fallback Chain
+### Sovereign Inference & Provider Fallback Chain
 
-Sticky multi-provider fallback with escalating cooldown:
+Pure local execution with zero external frameworks or service dependencies:
 
 ```
-LlamaServer (primary) → Ollama → NativeLeafcutter
+llama-server (primary daemon on :38265) → NativeLeafcutter (in-process tensor stream)
 ```
 
-- `resolve_provider()` returns active provider + probe flag
-- `record_success()` clears override, resets breaker
+- `resolve_provider()` returns active sovereign provider
+- `record_success()` resets circuit breaker and error counts
 - `record_failure()` escalates cooldown: 30s → 60s → 300s
-- Lazy probe: after cooldown, attempt primary before staying on fallback
-- Startup endpoint probe: configured tier1 port verified live, falling back through 11434/11435/38265 (`select_live_endpoint`); `cynapse doctor` fails loud when none answers
-- Per-session isolation (future: partition by session id)
+- Port 38265 daemon probe: verifies daemon reachability and auto-spawns managed background process with physical-core thread pinning and Vulkan hardware acceleration
+- Speculative decoding: drafts $\gamma=4$ candidate tokens with edge-curated draft models (`needle3` / `qwen2.5-0.5b`) for 1.8×–2.5× wall-clock acceleration
+
+### Non-Blocking In-Process System Updater (`/update`)
+
+Asynchronous Git synchronization and release compiler decoupled from the TUI event loop:
+- **Git Ancestor Validation**: Replaces simple hash inequality with `git merge-base --is-ancestor origin/<branch> HEAD`. If remote is an ancestor of local HEAD, local is recognized as up-to-date or ahead, eliminating false-positive update notifications.
+- **Background Worker & Event Channel**: Long-running `git fetch` and `cargo build --release --bin cynapse` execute on a background worker thread, communicating status through a Tokio `mpsc::UnboundedReceiver<UpdateEvent>`.
+- **Live Ratatui Overlay Modal (`ActiveModal::Updater`)**: Renders a dynamic rotating braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), real-time task indicator, and scrollable build log without blocking frame redraws.
+- **Strict Workspace Confinement**: Compilation is kept strictly inside `./target/release/cynapse`. No binaries or scripts are installed outside the repository.
+- **Viewport Visibility Gating**: Viewport rendering is guarded by `self.messages.is_empty()` rather than user prompt presence, ensuring all slash command and system status messages are visible.
 
 ### Memory Micro-Channels
 
@@ -328,9 +336,9 @@ cargo test -p cynapse-engine
 cargo test --workspace -- --nocapture
 ```
 
-Current test count: **281 passed, 0 failed** (core 44, engine 8, memory 16, tui 14, leafcutter 197, e2e 1, doctest 1).
+Current test count: **324 passed, 0 failed** across all workspace crates.
 
-Acceptance gates G1-G22 all passed — see `GATES.md`.
+Acceptance gates G1-G37 all passed — see `GATES.md`.
 
 ## Build
 

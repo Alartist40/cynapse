@@ -65,7 +65,7 @@ pub fn mla_forward(
     position_offset: usize,
 ) -> Tensor {
     let seq_len = hidden_states.shape[0];
-    let hidden_size = hidden_states.shape[1];
+    let _hidden_size = hidden_states.shape[1];
 
     // — Step 1: Q down → norm → up.
     let q_a = weights
@@ -119,7 +119,7 @@ pub fn mla_forward(
         }
         Tensor::from_vec(out, vec![seq_len, params.kv_lora_rank])
     };
-    let k_rope_raw = {
+    let _k_rope_raw = {
         let mut out = Vec::with_capacity(seq_len * params.qk_rope_head_dim);
         for s in 0..seq_len {
             out.extend_from_slice(
@@ -264,7 +264,7 @@ pub fn mla_forward(
         for s in 0..cache_seq_len {
             for d in 0..params.qk_rope_head_dim / 2 {
                 let freq = 1.0 / params.rope_theta.powf(2.0 * d as f32 / params.qk_rope_head_dim as f32);
-                let pos = position_offset as f32 + 0.0; // prefill path; decode uses (position_offset + s)
+                let _pos = position_offset as f32 + 0.0; // prefill path; decode uses (position_offset + s)
                 // For prefill (seq_len > 1, position_offset=0), RoPE position is s.
                 let pos = if seq_len > 1 { s as f32 } else { position_offset as f32 + s as f32 };
                 let angle = pos * freq;

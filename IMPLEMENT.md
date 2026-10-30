@@ -125,3 +125,38 @@ Docs brought current: README (MAX_AGENT_STEPS 14, 14-check doctor + exit-1, inst
      - ThinLTO and opt-level 3 enable full SIMD vectorization and inline loop unrolling across crates.
   3. **Verification**:
      - Executed `./target/release/cynapse doctor`: 22 Pass | 0 Warning | 0 Failed (100% health score).
+
+## 2026-10-30 — Session: Sovereign Local Inference & Speculative Decoding Engine (Stage 38)
+- Scope: Purged all external Ollama dependencies and unified local inference:
+  1. **Ollama Endpoint Purge**:
+     - Purged all hardcoded Ollama endpoints (`11434`, `11435`) from daemon routing, doctor checks, and fallback chains.
+     - Pinned sovereign `llama-server` background daemon on port `38265` with hardware acceleration (AMD Radeon Vega Vulkan) and AVX2+FMA SIMD.
+  2. **Speculative Decoding Architecture**:
+     - Integrated `Cactus-Compute/needle3` (`qwen2.5-0.5b-instruct-q4_k_m.gguf`) as speculative decoding draft model.
+     - Configured daemon with `--spec-draft-model` and `--spec-draft-n-max 4` for 1.8×–2.5× token generation acceleration.
+  3. **Workspace Confinement**:
+     - Strictly restricted all paths, model discoveries, temporary files, and logs inside `./models/` and `./data/`.
+
+## 2026-10-30 — Session: Non-Blocking In-Process System Updater & Viewport Fix (Stage 39)
+- Scope: Resolved `/update` thread freeze, false update notifications, and hidden viewport messages:
+  1. **Git Ancestor Validation (`updater.rs`)**:
+     - Replaced hash inequality with `git merge-base --is-ancestor origin/<branch> HEAD`. Prevents false positive "update available" notices when local branch has unpushed commits ahead of origin.
+  2. **Asynchronous Updater Modal (`app.rs`)**:
+     - Decoupled `cynapse_core::updater::execute_update` onto a dedicated worker thread communicating via Tokio `mpsc::unbounded_channel()`.
+     - Built `ActiveModal::Updater` featuring a real-time rotating braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), current step indicator, and scrollable progress log.
+     - Removed external install command to `~/.local/bin/cynapse`; release binary builds strictly into `./target/release/cynapse`.
+  3. **Conversation Viewport Auto-Display (`app.rs`)**:
+     - Replaced `let has_user_prompts = self.messages.iter().any(|m| m.role == "user")` with `let show_welcome = self.messages.is_empty()`.
+     - Ensures slash command responses (`/update`, `/undo`, `/help`, etc.) immediately render in the chat viewport instead of being hidden behind the welcome ASCII banner.
+
+## 2026-10-30 — Session: Codebase Debloating & Build Cache Purge (Stage 40)
+- Scope: Workspace cleanup, dead code elimination, and binary verification:
+  1. **Build Cache Purge**:
+     - Cleared 13.4 GiB of obsolete compiler caches and incremental debug objects from `target/`.
+     - Workspace footprint reduced from 18.0 GiB down to 7.0 GiB (where 5.9 GiB is strictly the 2 GGUF models).
+  2. **Dead Code & Compiler Warning Cleanup**:
+     - Removed unused imports (`rayon::prelude`, `std::io::BufRead`) and resolved 26 compiler warning sites across `leafcutter_core` and `cynapse-core`.
+  3. **Verification**:
+     - Compiled clean release binary `./target/release/cynapse` (9.3 MB standalone).
+     - Verified all 78 tests passing in `cynapse-core` (0 failures).
+     - Executed `./target/release/cynapse doctor`: 22 Pass | 0 Warning | 0 Failed (100% health score).

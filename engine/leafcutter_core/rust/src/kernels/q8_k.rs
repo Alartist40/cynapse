@@ -355,7 +355,7 @@ pub fn q6_k_dot_q8_k_scalar(
     w_blocks: &[crate::kernels::q6_k::Block],
     a_blocks: &[Q8KBlock],
 ) -> f32 {
-    use crate::kernels::q6_k::Block;
+    
     use crate::kernels::q6_k::QK_K as Q6QK;
     debug_assert_eq!(w_blocks.len(), a_blocks.len());
     let mut sumf = 0.0f32;

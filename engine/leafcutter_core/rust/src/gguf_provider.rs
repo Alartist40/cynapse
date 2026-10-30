@@ -13,7 +13,6 @@
 //!   - Conv1d dimension transposition (GGUF [kernel, conv_dim] → [conv_dim, kernel])
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::model::gguf::{GGUFile, GGUError};
 use crate::ornith_config::OrnithConfig;
@@ -72,14 +71,14 @@ impl GGUFWeightProvider {
     pub fn open(path: &str) -> Result<Self, GGUError> {
         let gguf = GGUFile::open(path)?;
         let non_layer = load_gguf_non_layer_weights(&gguf)
-            .map_err(|e| GGUError::InvalidTensorType(0))?;
+            .map_err(|_e| GGUError::InvalidTensorType(0))?;
         Ok(Self { gguf, non_layer })
     }
 
     /// Wrap an already-opened GGUFile.
     pub fn from_gguf(gguf: GGUFile) -> Result<Self, GGUError> {
         let non_layer = load_gguf_non_layer_weights(&gguf)
-            .map_err(|e| GGUError::InvalidTensorType(0))?;
+            .map_err(|_e| GGUError::InvalidTensorType(0))?;
         Ok(Self { gguf, non_layer })
     }
 
@@ -300,7 +299,7 @@ pub fn extract_ornith_config(gguf: &GGUFile) -> Result<OrnithConfig, String> {
         "ornith.rope.dimension_count", "qwen35.rope.dimension_count",
     ]).unwrap_or(head_dim as i64) as usize;
 
-    let attention_interval = prefix_meta(&[
+    let _attention_interval = prefix_meta(&[
         "ornith.full_attention_interval", "qwen35.full_attention_interval",
     ]).unwrap_or(4) as usize;
 

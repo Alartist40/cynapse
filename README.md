@@ -2,32 +2,27 @@
 
 **Cynapse** is a high-performance, offline-first AI agent platform engineered entirely in 100% pure Rust. Designed for total privacy, zero external runtime dependencies, and instant local execution, it bridges host hardware telemetry with an intelligent multi-engine router, a dynamic synaptic knowledge graph, and an Atomic-Agent-inspired architecture elevation.
 
-At the heart of Cynapse lies a unified architecture where three powerful engines work in concert: **Dendrite**, a force-directed 3D graph memory system with Coulomb/Hooke physics, SQLite FTS5 full-text indexing, and BM25 relevance ranking; **Leafcutter**, a custom pure-Rust GGUF and Safetensors execution core providing local tensor streaming with KV cache trunk reservation; and **llama.cpp / Ollama integration**, acting as a high-speed Tier-1 HTTP inference runner with NDJSON streaming and multi-provider fallback. Together, these subsystems provide a complete local agent harness capable of autonomous tool execution, strict GBNF grammar constrained outputs, real-time memory synthesis, 3D orbital galaxy memory visualization, and self-healing diagnostics—all running locally on your hardware without a single byte leaving your machine.
+At the heart of Cynapse lies a unified architecture where three sovereign systems work in concert: **Dendrite**, a force-directed 3D graph memory system with Coulomb/Hooke physics, SQLite FTS5 full-text indexing, and BM25 relevance ranking; **Leafcutter**, a custom pure-Rust GGUF and Safetensors execution core providing local tensor streaming with KV cache trunk reservation; and **sovereign llama-server daemon / in-process Leafcutter engine**, acting as a high-speed Tier-1 inference runner with Vulkan/AVX2 acceleration, speculative decoding (`needle3` / `qwen2.5-0.5b`), and multi-provider fallback. Together, these subsystems provide a complete local agent harness capable of autonomous tool execution, strict GBNF grammar constrained outputs, real-time memory synthesis, 3D orbital galaxy memory visualization, and self-healing diagnostics—all running strictly locally on your hardware without a single byte leaving your machine.
 
 ---
 
 ## Installation & Setup
 
-### Single-Line Automated Install (Linux & macOS)
-```bash
-curl -fsSL https://raw.githubusercontent.com/Alartist40/cynapse/main/install.sh | bash
-```
-
 ### Build from Source
 ```bash
-git clone https://github.com/Alartist40/cynapse.git
-cd cynapse
+git clone https://github.com/Alartist40/cynapse-harness.git
+cd cynapse-harness
 cargo build --release
-cp target/release/cynapse ~/.local/bin/cynapse
+./target/release/cynapse
 ```
 
 ### System Health Verification
-After installation, run the self-healing diagnostic to verify hardware, SIMD acceleration, storage, and database integrity:
+After compilation, run the self-healing diagnostic to verify hardware, SIMD acceleration, storage, and database integrity:
 ```bash
-cynapse doctor --fix
+./target/release/cynapse doctor --fix
 ```
 
-`cynapse doctor` exits 1 when no inference backend answers (Ollama on 11434/11435 or the llama-server daemon on 38265) and prints the exact remediation; the TUI probes those ports at startup and uses the first live one.
+`cynapse doctor` performs 22 comprehensive diagnostics across CPU, GPU, AVX2 SIMD, GBNF grammar compiler, SQLite FTS5 database, model integrity, and inference daemon reachability (port 38265).
 
 ---
 
@@ -68,6 +63,8 @@ Type `/` in the prompt bar to trigger the floating command menu:
 | `/drawer` | Open interactive Dendrite Memory drawer inspector |
 | `/thinking` | Toggle collapsible model reasoning/thinking stream blocks |
 | `/theme` | Cycle color themes (Dark Slate, Neon Cyber, Amber CRT, Emerald Matrix) |
+| `/update` | Check, pull, and compile latest Cynapse updates with non-blocking live modal |
+| `/undo` | Roll back latest file modifications made by autonomous agent tools |
 | `/session` | Manage and resume saved conversation sessions |
 | `/clear` | Reset conversation view and restore brand banner |
 | `/exit` | Quit Cynapse TUI |
@@ -189,9 +186,9 @@ Six architectural pillars transforming small local models (0.5B to 3B) into reli
 |--------|-------|
 | Tests passed | 324 |
 | Tests failed | 0 |
-| Build | `cargo build --release` succeeds |
-| System doctor | 14 checks, 100% health (14 Pass); exits non-zero if any check fails |
-| Acceptance gates | G1-G33 all PASSED |
+| Build | `cargo build --release` succeeds (9.3 MB standalone binary) |
+| System doctor | 22 checks, 100% health (22 Pass, 0 Warning, 0 Failed) |
+| Acceptance gates | G1-G37 all PASSED |
 
 ---
 

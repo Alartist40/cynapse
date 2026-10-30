@@ -13,7 +13,6 @@
 //! start a leafcutter server if they need one, export `LEAFCUTTER_BASE_URL`,
 //! spawn the command.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

@@ -243,6 +243,28 @@ Working tree already contains, in `cynapse.toml` + `engine/cynapse-engine/src/li
   - Mazzaroth 3D Celestial Engine: Ratatui 3D orbital memory renderer imported into workspace crates and wired to TUI.
   - Telemetry: Live generation tok/s and TTFT latency indicators added to TUI header bar.
 
+- **Stage 32: Sovereign Local Inference & Speculative Decoding Daemon [DONE — G32 PASSED 2026-10-30]**
+  `OWNS: engine/cynapse-engine/src/daemon.rs, engine/cynapse-engine/src/lib.rs, harness/cynapse-core/src/downloader.rs`
+  - Completely purged external Ollama dependencies (`11434`, `11435`) across engine, doctor, and harness.
+  - Switched Tier-1 to sovereign in-process Leafcutter core and managed local `llama-server` daemon on port `38265` with hardware acceleration (AMD Radeon Vega Vulkan) and AVX2+FMA SIMD.
+  - Added speculative decoding with `Cactus-Compute/needle3` (`qwen2.5-0.5b-instruct-q4_k_m.gguf`) draft model with `--spec-draft-model` and `--spec-draft-n-max 4`.
+  - Strictly confined all model paths, directories, and spillovers to repository root (`./models/`, `./data/`).
+
+- **Stage 33: Non-Blocking In-Process System Updater & Viewport Fix [DONE — G33 PASSED 2026-10-30]**
+  `OWNS: harness/cynapse-core/src/updater.rs, harness/cynapse-tui/src/app.rs`
+  - Replaced false "update available" detection in `check_for_updates` with `git merge-base --is-ancestor origin/<branch> HEAD`.
+  - Decoupled `/update` execution from the TUI event loop onto a background worker thread with `mpsc` event communication.
+  - Added `ActiveModal::Updater` with live braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), current step indicator, and progress log.
+  - Fixed conversation viewport message suppression: replaced `has_user_prompts` with `show_welcome = self.messages.is_empty()`.
+  - Confined update binary compilation strictly to `./target/release/cynapse`.
+
+- **Stage 34: Workspace Debloating & Build Cache Purge [DONE — G34 PASSED 2026-10-30]**
+  `OWNS: target/, engine/leafcutter_core/rust/`
+  - Purged 13.4 GiB of obsolete compiler debug artifacts and incremental caches from `target/`.
+  - Cleaned 26 dead code, redundant `mut` bindings, and unused imports (`rayon::prelude`, `std::io::BufRead`).
+  - Compiled optimized 9.3 MB standalone production binary `./target/release/cynapse`.
+  - Verified 100% Doctor Health Score (22 Pass | 0 Warning | 0 Failed) and all 78 tests passing.
+
 ## Out of scope (deferred, recorded not dropped)
 - P2 table: app.rs 230 KB split, ripgrep fast path, eval_count tok/s parsing, per-provider payload generation beyond sampling(), Ollama llama.cpp-only field removal.
 - Native RoPE/q_proj/pair-convention math rewrite — research track; arch-refusal (stage 26) contains the blast radius until the parity harness (stage 30) exists.

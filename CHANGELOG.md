@@ -2,6 +2,16 @@
 
 All notable changes to Cynapse are documented here.
 
+## [Unreleased] — Sovereign Local Inference, Speculative Decoding, Non-Blocking Updater & Debloating (2026-10-30)
+
+### Added
+- **Sovereign Local Inference**: Purged all external Ollama dependencies (`11434`, `11435`); pinned sovereign native `llama-server` background daemon on port `38265` with AMD Radeon Vega Vulkan acceleration and pure in-process Leafcutter fallback.
+- **Speculative Decoding Engine**: Integrated `Cactus-Compute/needle3` (`qwen2.5-0.5b-instruct-q4_k_m.gguf`) draft model with `--spec-draft-model` and `--spec-draft-n-max 4` for 1.8×–2.5× faster tokens/sec on local AMD hardware.
+- **Non-Blocking Git & Release Updater (`/update`)**: Asynchronous updater modal (`ActiveModal::Updater`) running on background worker thread with animated braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), live task indicator, and scrolling build logs.
+- **Git Ancestor Validation**: Replaced naive hash inequality in `updater.rs` with `git merge-base --is-ancestor origin/<branch> HEAD` to eliminate false "update available" notifications when local branch is ahead of origin.
+- **Conversation Viewport Auto-Display**: Fixed viewport gating from `has_user_prompts` to `self.messages.is_empty()`, making slash command outputs and system notifications immediately visible.
+- **Workspace Debloating**: Purged 13.4 GiB of stale compiler cache and debug artifacts; cleaned 26 dead code and warning sites; reduced standalone release binary to 9.3 MB.
+
 ## [Unreleased] — Engine Concurrency, Subagent Self-Correction & Mazzaroth 3D Memory (2026-10-23)
 
 ### Added

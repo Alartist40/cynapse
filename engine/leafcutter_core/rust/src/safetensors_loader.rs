@@ -32,8 +32,8 @@ pub trait WeightProvider: Send + Sync {
     /// map names appropriately.
     fn load_layer_weights(
         &self,
-        layer_idx: usize,
-        layer_type: &str,
+        _layer_idx: usize,
+        _layer_type: &str,
         _layer_names: &[&str],
         prefix: &str,
     ) -> Result<HashMap<String, Vec<f32>>, String>
@@ -337,7 +337,7 @@ fn read_safetensors_header(file: &mut File) -> Result<HashMap<String, StTensor>,
             .ok_or_else(|| format!("{name}: no dtype"))?;
         let dtype = StDtype::from_str(dtype_str)
             .ok_or_else(|| format!("{name}: unknown dtype {dtype_str}"))?;
-        let shape: Vec<u64> = obj
+        let _shape: Vec<u64> = obj
             .get("data_offsets")
             .and_then(|v| v.as_array())
             .ok_or_else(|| format!("{name}: no data_offsets"))?

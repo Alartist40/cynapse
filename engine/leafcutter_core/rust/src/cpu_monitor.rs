@@ -67,7 +67,7 @@ fn run_loop() {
 
         let temp = read_cpu_temp();
         let rss_mb = read_rss_mb();
-        let (cpu_pct, new_idle, new_total) = read_cpu_usage(prev_idle, prev_total);
+        let (_cpu_pct, new_idle, new_total) = read_cpu_usage(prev_idle, prev_total);
         prev_idle = Some(new_idle);
         prev_total = Some(new_total);
 

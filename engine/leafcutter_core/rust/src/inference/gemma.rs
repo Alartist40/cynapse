@@ -176,11 +176,11 @@ pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Ten
             let q_row = &q_w.data[r * q_out..(r + 1) * q_out];
             let k_row = &k_w.data[r * k_out..(r + 1) * k_out];
             let v_row = &v_w.data[r * v_out..(r + 1) * v_out];
-            let mut dst = &mut data[r * total_out..r * total_out + q_out];
+            let dst = &mut data[r * total_out..r * total_out + q_out];
             dst.copy_from_slice(q_row);
-            let mut dst = &mut data[r * total_out + q_out..r * total_out + q_out + k_out];
+            let dst = &mut data[r * total_out + q_out..r * total_out + q_out + k_out];
             dst.copy_from_slice(k_row);
-            let mut dst = &mut data[r * total_out + q_out + k_out..r * total_out + total_out];
+            let dst = &mut data[r * total_out + q_out + k_out..r * total_out + total_out];
             dst.copy_from_slice(v_row);
         }
         Tensor::from_vec(data, vec![in_dim, total_out])
@@ -287,7 +287,7 @@ pub fn gemma_layer_forward(
         .get("self_attn.v_proj.weight")
         .or_else(|| layer_weights.get("attn_v.weight"));
     // Default values from layer_cfg (which itself comes from GGUF metadata).
-    let mut num_heads: usize = 16;
+    let num_heads: usize = 16;
     let mut num_kv_heads = layer_cfg.num_kv_heads;
     let mut head_dim = layer_cfg.q_head_dim;
     let mut kv_head_dim = layer_cfg.k_head_dim;
