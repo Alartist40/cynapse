@@ -395,11 +395,7 @@ impl TuiApp {
             reflection_worker,
             input: String::new(),
             input_cursor: 0,
-            messages: vec![ChatMessage {
-                role: "system".into(),
-                content: "Welcome to CYNAPSE — Pure Rust AI Agent System with Dendrite Graph Memory.".into(),
-                thinking: None,
-            }],
+            messages: Vec::new(),
             modal: ActiveModal::None,
             theme: crate::theme::load_theme(),
             is_generating: false,
