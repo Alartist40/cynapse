@@ -736,9 +736,18 @@ impl CynapseDoctor {
     }
 
     fn check_spillover_hygiene(&self) -> DoctorItem {
-        let spill_dir = dirs::home_dir()
-            .map(|h| h.join(".cynapse").join("spill"))
-            .unwrap_or_else(|| PathBuf::from(".cynapse/spill"));
+        let spill_dir = if PathBuf::from("data/spill").is_dir() {
+            PathBuf::from("data/spill")
+        } else if let Some(home) = dirs::home_dir() {
+            let p = home.join(".cynapse").join("spill");
+            if p.is_dir() {
+                p
+            } else {
+                PathBuf::from("data/spill")
+            }
+        } else {
+            PathBuf::from("data/spill")
+        };
 
         if !spill_dir.exists() {
             if self.auto_fix {

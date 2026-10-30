@@ -65,17 +65,27 @@ enum Commands {
     Undo,
 }
 
-/// Resolve models directory dynamically relative to executable, workspace, or user home folder.
+/// Resolve models directory dynamically relative to workspace first, or user home folder.
 fn resolve_models_dir() -> PathBuf {
+    let local = PathBuf::from("./models");
+    if local.is_dir() {
+        return local;
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_models = cwd.join("models");
+        if cwd_models.is_dir() {
+            return cwd_models;
+        }
+    }
     if let Some(home) = dirs::home_dir() {
         let user_models = home.join(".cynapse").join("models");
-        let _ = std::fs::create_dir_all(&user_models);
-        user_models
-    } else {
-        let local = PathBuf::from("./models");
-        let _ = std::fs::create_dir_all(&local);
-        local
+        if user_models.is_dir() {
+            return user_models;
+        }
     }
+    let fallback = PathBuf::from("models");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
 }
 
 #[tokio::main]
@@ -120,7 +130,14 @@ async fn main() -> Result<()> {
             println!("✓ Model successfully downloaded to: {}", target_path.display());
         }
         Some(Commands::Memory) => {
-            let db_path = dirs::home_dir().map(|h| h.join(".cynapse").join("dendrite.db")).unwrap_or_else(|| PathBuf::from("data/dendrite.db"));
+            let db_path = if PathBuf::from("data/dendrite.db").exists() {
+                PathBuf::from("data/dendrite.db")
+            } else if let Some(home) = dirs::home_dir() {
+                let p = home.join(".cynapse").join("dendrite.db");
+                if p.exists() { p } else { PathBuf::from("data/dendrite.db") }
+            } else {
+                PathBuf::from("data/dendrite.db")
+            };
             if db_path.exists() {
                 if let Ok(store) = cynapse_memory::store::DendriteStore::open(&db_path) {
                     let _ = store.load_all(&session.graph);
@@ -129,7 +146,14 @@ async fn main() -> Result<()> {
             cynapse_tui::memory_render::render_dendrite_visualizer(&session.graph);
         }
         Some(Commands::Doctor { fix }) => {
-            let db_path = dirs::home_dir().map(|h| h.join(".cynapse").join("dendrite.db")).unwrap_or_else(|| PathBuf::from("data/dendrite.db"));
+            let db_path = if PathBuf::from("data/dendrite.db").exists() {
+                PathBuf::from("data/dendrite.db")
+            } else if let Some(home) = dirs::home_dir() {
+                let p = home.join(".cynapse").join("dendrite.db");
+                if p.exists() { p } else { PathBuf::from("data/dendrite.db") }
+            } else {
+                PathBuf::from("data/dendrite.db")
+            };
             let doctor = cynapse_core::doctor::CynapseDoctor::new(models_dir.clone(), db_path.clone(), fix);
             let report = doctor.run_diagnostics();
 

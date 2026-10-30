@@ -20,8 +20,22 @@ pub struct LlamaServerDaemon {
 }
 
 impl LlamaServerDaemon {
-    /// Discovers `llama-server` executable in system PATH or ~/.cynapse/bin/
+    /// Discovers `llama-server` executable in local workspace bin/, system PATH, or fallback locations
     pub fn find_binary() -> Option<PathBuf> {
+        // 1. Workspace local bin directory
+        if let Ok(cwd) = std::env::current_dir() {
+            let local_bin = cwd.join("bin").join("llama-server");
+            if local_bin.is_file() {
+                return Some(local_bin);
+            }
+        }
+        for local_rel in ["bin/llama-server", "./bin/llama-server", "../bin/llama-server"] {
+            let p = PathBuf::from(local_rel);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+
         if let Ok(home) = std::env::var("HOME") {
             let user_bin = PathBuf::from(home).join(".cynapse").join("bin").join("llama-server");
             if user_bin.is_file() {
@@ -128,16 +142,22 @@ impl LlamaServerDaemon {
             .stderr(err_stdio);
 
         // Set LD_LIBRARY_PATH to ensure Cynapse libraries and acceleration backends resolve
-        if let Ok(home) = std::env::var("HOME") {
-            let cynapse_lib = format!("{}/.cynapse/lib", home);
-            let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            let new_ld = if existing_ld.is_empty() {
-                format!("{}:/usr/local/lib/ollama:/usr/local/lib/ollama/vulkan", cynapse_lib)
-            } else {
-                format!("{}:{}:/usr/local/lib/ollama:/usr/local/lib/ollama/vulkan", cynapse_lib, existing_ld)
-            };
-            cmd.env("LD_LIBRARY_PATH", new_ld);
+        let mut ld_dirs = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            ld_dirs.push(cwd.join("lib").to_string_lossy().to_string());
         }
+        ld_dirs.push("./lib".to_string());
+        if let Ok(home) = std::env::var("HOME") {
+            ld_dirs.push(format!("{}/.cynapse/lib", home));
+        }
+        ld_dirs.push("/usr/local/lib/ollama".to_string());
+        ld_dirs.push("/usr/local/lib/ollama/vulkan".to_string());
+        if let Ok(existing_ld) = std::env::var("LD_LIBRARY_PATH") {
+            if !existing_ld.is_empty() {
+                ld_dirs.push(existing_ld);
+            }
+        }
+        cmd.env("LD_LIBRARY_PATH", ld_dirs.join(":"));
 
         // Check for speculative decoding draft model in parent directory or ~/.cynapse/models
         let mut draft_found = false;
