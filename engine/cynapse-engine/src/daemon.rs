@@ -105,8 +105,8 @@ impl LlamaServerDaemon {
         // Context size: uses configured engine context or default ENGINE_CTX_SIZE
         let ctx_size = crate::engine_ctx_size().to_string();
 
-        let child = Command::new(&bin)
-            .arg("-m")
+        let mut cmd = Command::new(&bin);
+        cmd.arg("-m")
             .arg(model_path)
             .arg("--port")
             .arg(port.to_string())
@@ -125,8 +125,45 @@ impl LlamaServerDaemon {
             .arg("--no-webui")
             .arg("--jinja")
             .stdout(out_stdio)
-            .stderr(err_stdio)
-            .spawn()?;
+            .stderr(err_stdio);
+
+        // Set LD_LIBRARY_PATH to ensure Cynapse libraries and acceleration backends resolve
+        if let Ok(home) = std::env::var("HOME") {
+            let cynapse_lib = format!("{}/.cynapse/lib", home);
+            let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let new_ld = if existing_ld.is_empty() {
+                format!("{}:/usr/local/lib/ollama:/usr/local/lib/ollama/vulkan", cynapse_lib)
+            } else {
+                format!("{}:{}:/usr/local/lib/ollama:/usr/local/lib/ollama/vulkan", cynapse_lib, existing_ld)
+            };
+            cmd.env("LD_LIBRARY_PATH", new_ld);
+        }
+
+        // Check for speculative decoding draft model in parent directory or ~/.cynapse/models
+        let mut draft_found = false;
+        if let Some(parent) = model_path.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+                    if (name.contains("needle") || name.contains("draft") || name.contains("qwen2.5-0.5b"))
+                        && name.ends_with(".gguf")
+                        && p != model_path
+                    {
+                        cmd.arg("--spec-draft-model").arg(&p);
+                        cmd.arg("--spec-draft-n-max").arg("4");
+                        draft_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !draft_found {
+            // Enable prompt ngram speculative decoding for immediate zero-RAM acceleration
+            cmd.arg("--spec-type").arg("ngram-simple");
+        }
+
+        let child = cmd.spawn()?;
 
         let mut daemon = Self {
             child: Some(child),

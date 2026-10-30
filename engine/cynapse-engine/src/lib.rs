@@ -244,8 +244,8 @@ pub struct ProviderFallbackChain {
 impl Default for ProviderFallbackChain {
     fn default() -> Self {
         Self::new(
-            ProviderKind::Ollama,
-            vec![ProviderKind::LlamaServer, ProviderKind::NativeLeafcutter],
+            ProviderKind::LlamaServer,
+            vec![ProviderKind::NativeLeafcutter],
         )
     }
 }
@@ -693,22 +693,9 @@ pub async fn fetch_native_models(endpoint: &str) -> Vec<String> {
     models
 }
 
-pub async fn fetch_ollama_models(endpoint: &str) -> Vec<String> {
-    let mut models = Vec::new();
-    let client = shared_http_client();
-    let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
-    if let Ok(res) = client.get(&url).timeout(std::time::Duration::from_secs(3)).send().await {
-        if let Ok(parsed) = res.json::<NativeTagsResp>().await {
-            if let Some(endpoint_models) = parsed.models {
-                for m in endpoint_models {
-                    if !models.contains(&m.name) {
-                        models.push(m.name);
-                    }
-                }
-            }
-        }
-    }
-    models
+pub async fn fetch_ollama_models(_endpoint: &str) -> Vec<String> {
+    // Ollama connections are strictly disabled; Cynapse uses sovereign llama-server daemon and NativeLeafcutter.
+    Vec::new()
 }
 
 pub fn route_model(model_path: &Path, _prefer_gpu: bool) -> RouteDecision {
@@ -1389,107 +1376,16 @@ pub async fn try_llama_server_stream(
 }
 
 pub async fn try_ollama_stream(
-    endpoint: &str,
+    _endpoint: &str,
     model_name: &str,
-    prompt: &str,
-    system_prompt: &str,
-    on_token: impl FnMut(TokenType, &str),
+    _prompt: &str,
+    _system_prompt: &str,
+    _on_token: impl FnMut(TokenType, &str),
 ) -> Result<ExecutionStats> {
-    let client = shared_http_client();
-    let resolved = if model_name.contains(':') {
-        model_name.to_string()
-    } else {
-        let available_tags = fetch_ollama_models(endpoint).await;
-        resolve_model_tag(model_name, &available_tags)
-    };
-    let ollama_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
-    let (slot_id, cache_prompt) = slots::SlotManager::slot_params(slots::SlotPurpose::Interactive);
-    let s = sampling();
-    let ctx_size = engine_ctx_size();
-
-    let ngl = std::env::var("CYNAPSE_N_GPU_LAYERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(99);
-
-    let payload = serde_json::json!({
-        "model": resolved,
-        "prompt": prompt,
-        "system": system_prompt,
-        "stream": true,
-        "cache_prompt": cache_prompt,
-        "keep_alive": -1,
-        "slot_id": slot_id,
-        "id_slot": slot_id,
-        "options": {
-            "num_ctx": ctx_size,
-            "num_gpu": ngl,
-            "num_thread": physical_core_count(),
-            "temperature": s.temperature,
-            "top_p": s.top_p,
-            "top_k": s.top_k,
-            "repeat_penalty": s.repeat_penalty,
-            "repeat_last_n": s.repeat_last_n
-        }
-    });
-
-    let start = Instant::now();
-    let resp = client
-        .post(&ollama_url)
-        .header("Accept", "application/x-ndjson, text/event-stream, application/json")
-        .json(&payload)
-        .send()
-        .await
-        .context("Failed to connect to Ollama endpoint")?;
-
-    if !resp.status().is_success() {
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            if resolved != model_name {
-                let retry_payload = serde_json::json!({
-                    "model": model_name,
-                    "prompt": prompt,
-                    "system": system_prompt,
-                    "stream": true,
-                    "cache_prompt": cache_prompt,
-                    "keep_alive": -1,
-                    "slot_id": slot_id,
-                    "id_slot": slot_id,
-                    "options": {
-                        "num_ctx": ctx_size,
-                        "num_gpu": ngl,
-                        "num_thread": physical_core_count(),
-                        "temperature": s.temperature,
-                        "top_p": s.top_p,
-                        "top_k": s.top_k,
-                        "repeat_penalty": s.repeat_penalty,
-                        "repeat_last_n": s.repeat_last_n
-                    }
-                });
-                if let Ok(retry_resp) = client
-                    .post(&ollama_url)
-                    .header("Accept", "application/x-ndjson, text/event-stream, application/json")
-                    .json(&retry_payload)
-                    .send()
-                    .await
-                {
-                    if retry_resp.status().is_success() {
-                        return parse_http_stream(retry_resp, model_name, start, on_token).await;
-                    }
-                }
-            }
-            if let Some(local_path) = find_model_file_path(model_name) {
-                anyhow::bail!(
-                    "Ollama model '{}' not found (HTTP 404). To register this local GGUF, run:\nollama create {} -f Modelfile (with 'FROM {}')",
-                    model_name,
-                    model_name,
-                    local_path.display()
-                );
-            }
-        }
-        anyhow::bail!("Ollama returned HTTP error: {}", resp.status());
-    }
-
-    parse_http_stream(resp, model_name, start, on_token).await
+    anyhow::bail!(
+        "Ollama execution is disabled in Cynapse for model '{}'. Cynapse uses sovereign llama.cpp engine and NativeLeafcutter.",
+        model_name
+    );
 }
 
 pub async fn try_native_leafcutter_stream(
@@ -1538,7 +1434,7 @@ pub async fn query_tier1_stream(
     };
 
     let mut candidate_providers = vec![resolved_provider];
-    for p in [ProviderKind::Ollama, ProviderKind::LlamaServer, ProviderKind::NativeLeafcutter] {
+    for p in [ProviderKind::LlamaServer, ProviderKind::NativeLeafcutter] {
         if !candidate_providers.contains(&p) {
             candidate_providers.push(p);
         }
@@ -1605,8 +1501,8 @@ pub async fn unload_model(endpoint: &str, model_name: &str) {
 
 /// Preload and pin model into memory (keep_alive: -1 for Ollama, or spawn daemon for local GGUF).
 pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
-    let client = shared_http_client();
-    let endpoint_clean = endpoint.trim_end_matches('/');
+    let _client = shared_http_client();
+    let _endpoint_clean = endpoint.trim_end_matches('/');
 
     engine_log(&format!("preload_model requested for '{}' on '{}'", model_name, endpoint));
 
@@ -1616,40 +1512,18 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
         .unwrap_or(99);
     let ctx_size = engine_ctx_size();
 
-    // 1. Check if Ollama is running and pin with keep_alive: -1 and GPU layers offloaded
-    let tags_url = format!("{}/api/tags", endpoint_clean);
-    if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_secs(3)).send().await {
-        if resp.status().is_success() {
-            let available_tags = fetch_ollama_models(endpoint).await;
-            let resolved = resolve_model_tag(model_name, &available_tags);
-            let gen_url = format!("{}/api/generate", endpoint_clean);
-            let payload = serde_json::json!({
-                "model": resolved,
-                "keep_alive": -1,
-                "options": {
-                    "num_gpu": ngl,
-                    "num_ctx": ctx_size,
-                }
-            });
-            engine_log(&format!(
-                "Preloading model '{}' (resolved as '{}', ngl: {}, ctx: {}) via Ollama /api/generate keep_alive: -1",
-                model_name, resolved, ngl, ctx_size
-            ));
-            match client.post(&gen_url)
-                .json(&payload)
-                .timeout(Duration::from_secs(120))
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => {
-                    engine_log(&format!("Ollama preload completed successfully with status: {}", r.status()));
+    // 1. Managed llama-server daemon preloading and pinning into RAM
+    let daemon_port = daemon::DEFAULT_DAEMON_PORT;
+    if let Some(local_path) = find_model_file_path(model_name) {
+        if local_path.is_file() {
+            if daemon::LlamaServerDaemon::is_healthy(daemon_port) {
+                engine_log(&format!("LlamaServerDaemon already active and healthy on port {}", daemon_port));
+                return Ok(());
+            } else {
+                engine_log(&format!("Spawning and pinning model '{}' via LlamaServerDaemon on port {}", model_name, daemon_port));
+                if daemon::LlamaServerDaemon::get_or_spawn_daemon(&local_path, daemon_port) {
+                    engine_log(&format!("LlamaServerDaemon successfully spawned and pinned in RAM on port {}", daemon_port));
                     return Ok(());
-                }
-                Ok(r) => {
-                    engine_log(&format!("Ollama preload returned non-success status: {}", r.status()));
-                }
-                Err(e) => {
-                    engine_log(&format!("Ollama preload request error: {}", e));
                 }
             }
         }
@@ -1800,7 +1674,7 @@ mod tests {
     fn test_provider_fallback_chain() {
         let mut chain = ProviderFallbackChain::new(
             ProviderKind::LlamaServer,
-            vec![ProviderKind::Ollama, ProviderKind::NativeLeafcutter],
+            vec![ProviderKind::NativeLeafcutter],
         );
 
         // 1. Initially resolves to primary (llama-server)
@@ -1808,15 +1682,15 @@ mod tests {
         assert_eq!(p, ProviderKind::LlamaServer);
         assert!(!is_probe);
 
-        // 2. On failure, escalates to Ollama with sticky override
+        // 2. On failure, escalates to NativeLeafcutter with sticky override
         chain.record_failure(ProviderKind::LlamaServer, "Connection refused");
         let (p, is_probe) = chain.resolve_provider();
-        assert_eq!(p, ProviderKind::Ollama);
+        assert_eq!(p, ProviderKind::NativeLeafcutter);
         assert!(!is_probe);
         assert_eq!(chain.consecutive_failures, 1);
 
         // 3. On success on fallback, resets back to primary
-        chain.record_success(ProviderKind::Ollama);
+        chain.record_success(ProviderKind::NativeLeafcutter);
         let (p, is_probe) = chain.resolve_provider();
         assert_eq!(p, ProviderKind::LlamaServer);
         assert!(!is_probe);
@@ -1824,7 +1698,7 @@ mod tests {
 
         // 4. Consecutive failure cooldown escalation
         chain.record_failure(ProviderKind::LlamaServer, "Err 1");
-        chain.record_failure(ProviderKind::Ollama, "Err 2");
+        chain.record_failure(ProviderKind::NativeLeafcutter, "Err 2");
         assert_eq!(chain.consecutive_failures, 2);
     }
 

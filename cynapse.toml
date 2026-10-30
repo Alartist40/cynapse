@@ -5,12 +5,11 @@ name = "cynapse"
 version = "0.1.0"
 
 [engine]
-# Stock Ollama listens on 11434; llama-server daemon uses 38265 (auto-probed).
-tier1_endpoint = "http://127.0.0.1:11434"
-default_model = "ministral-3:3b"
+# Cynapse managed llama-server daemon uses port 38265.
+tier1_endpoint = "http://127.0.0.1:38265"
+default_model = "Ornith-1.5-9B-Q4_K_M.gguf"
 memory_headroom_mb = 1536
-# Prompt context size shared by llama-server, Ollama num_ctx, and the native
-# engine. Memory context budget must stay below ~40% of this value.
+# Prompt context size for the Cynapse engine.
 ctx_size = 4096
 # Optional extra directories to search for local GGUF models.
 model_search_paths = []

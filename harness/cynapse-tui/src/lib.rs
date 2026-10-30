@@ -19,10 +19,9 @@ pub mod theme;
 use memory_render::{render_dendrite_visualizer, render_memory_pipeline, truncate_smart, PipelineState, StepStatus};
 use app::TuiApp;
 
-/// Fallback inference backend candidates probed in order when the configured
-/// `tier1_endpoint` port is dead (sync with cynapse_core::doctor::LOCAL_BACKEND_PORTS):
-/// 11434 = stock Ollama, 11435 = alternate Ollama, 38265 = llama-server daemon.
-pub const FALLBACK_BACKEND_PORTS: [u16; 3] = [11434, 11435, 38265];
+/// Fallback inference backend candidates (sync with cynapse_core::doctor::LOCAL_BACKEND_PORTS):
+/// 38265 = Cynapse llama-server daemon.
+pub const FALLBACK_BACKEND_PORTS: [u16; 1] = [38265];
 
 /// Split an endpoint URL into (host, explicit port). `None` when no port is present.
 fn endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
@@ -133,8 +132,8 @@ pub struct TuiSession {
 impl TuiSession {
     pub fn new(models_dir: PathBuf) -> Self {
         install_panic_hook();
-        let mut active_model_name = "ministral-3:3b".to_string();
-        let mut tier1_endpoint = "http://127.0.0.1:11434".to_string();
+        let mut active_model_name = "Ornith-1.5-9B-Q4_K_M.gguf".to_string();
+        let mut tier1_endpoint = "http://127.0.0.1:38265".to_string();
 
         // Load runtime configuration from cynapse.toml using toml parser
         let config_candidates = [

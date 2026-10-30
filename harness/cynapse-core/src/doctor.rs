@@ -3,9 +3,8 @@ use std::io::Read;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
-/// Well-known local inference backend ports, probed in order.
-/// 11434 = stock Ollama, 11435 = alternate Ollama, 38265 = llama-server daemon.
-pub const LOCAL_BACKEND_PORTS: [u16; 3] = [11434, 11435, 38265];
+/// Well-known local inference backend ports: 38265 = Cynapse llama-server daemon.
+pub const LOCAL_BACKEND_PORTS: [u16; 1] = [38265];
 
 const PROBE_CONNECT_TIMEOUT_MS: u64 = 300;
 const PROBE_READ_TIMEOUT_MS: u64 = 700;
@@ -54,7 +53,7 @@ pub fn probe_port(host: &str, port: u16) -> bool {
         }
     }
 
-    handshake(host, port, "/api/tags") || handshake(host, port, "/health")
+    handshake(host, port, "/health") || handshake(host, port, "/v1/models")
 }
 
 /// Probe the well-known local inference backends in order and return the base
