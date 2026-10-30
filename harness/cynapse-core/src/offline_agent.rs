@@ -602,6 +602,7 @@ pub fn isolate_thinking_scratchpad(output: &str) -> (String, Option<String>) {
     let mut thinking_parts = Vec::new();
 
     let patterns = [
+        ("<think>", "</think>"),
         ("<thinking>", "</thinking>"),
         ("<thought>", "</thought>"),
     ];

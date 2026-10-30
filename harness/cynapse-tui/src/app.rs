@@ -25,6 +25,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use unicode_width::UnicodeWidthStr;
 use tokio::sync::mpsc;
 
 use cynapse_core::offline_agent::{validate_gbnf_tool_calls, LoopGuard};
@@ -539,9 +540,12 @@ impl TuiApp {
 
     pub fn scroll_down(&mut self, delta: u16) {
         let max_scroll = self.last_max_scroll.load(Ordering::Relaxed);
+        let upper_bound = max_scroll.saturating_add(8);
         self.scroll_offset = self.scroll_offset.saturating_add(delta);
-        if self.scroll_offset >= max_scroll {
-            self.scroll_offset = max_scroll;
+        if self.scroll_offset >= upper_bound {
+            self.scroll_offset = upper_bound;
+            self.auto_scroll = true;
+        } else if self.scroll_offset >= max_scroll {
             self.auto_scroll = true;
         } else {
             self.auto_scroll = false;
@@ -3351,7 +3355,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         let inner_height = viewport_area.height.saturating_sub(2) as usize;
 
         let total_visual_lines = calculate_visual_lines(&chat_lines, inner_width);
-        let max_scroll = (total_visual_lines as u16).saturating_sub(inner_height as u16);
+        let max_scroll = (total_visual_lines as u16 + 4).saturating_sub(inner_height as u16);
         self.last_max_scroll.store(max_scroll, Ordering::Relaxed);
         let effective_scroll = if !has_user_prompts {
             self.scroll_offset.min(max_scroll)
@@ -3362,7 +3366,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         };
 
         let scroll_title = if max_scroll > 0 {
-            let pct = (effective_scroll as f32 / max_scroll as f32 * 100.0) as u32;
+            let pct = (effective_scroll as f32 / max_scroll as f32 * 100.0).min(100.0) as u32;
             format!(" Conversation Viewport [▲ Scroll {}% ▼] (Up/Down/PgUp/PgDn) ", pct)
         } else {
             " Conversation Viewport (PgUp/PgDn to scroll) ".to_string()
@@ -4483,41 +4487,47 @@ fn calculate_visual_lines(lines: &[Line], width: usize) -> usize {
     let mut total = 0;
     for line in lines {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        if text.trim().is_empty() {
+        if text.is_empty() {
             total += 1;
             continue;
         }
 
         // Subdivide by explicit newlines if any span contains them
         for sub_line in text.split('\n') {
-            if sub_line.trim().is_empty() {
+            if sub_line.is_empty() {
                 total += 1;
                 continue;
             }
 
-            let leading_spaces = sub_line.chars().take_while(|c| c.is_whitespace()).count();
-            let mut cur_col = leading_spaces;
-            let mut line_count = 1;
-            let mut first_word = true;
+            let sub_w = UnicodeWidthStr::width(sub_line);
+            if sub_w <= width {
+                total += 1;
+            } else {
+                let leading_spaces = sub_line.chars().take_while(|c| c.is_whitespace()).count();
+                let mut cur_col = leading_spaces;
+                let mut line_count = 1;
+                let mut first_word = true;
 
-            for word in sub_line.split_whitespace() {
-                let w_len = word.chars().count();
-                if first_word {
-                    first_word = false;
-                    if cur_col + w_len <= width {
-                        cur_col += w_len;
+                for word in sub_line.split_whitespace() {
+                    let w_len = UnicodeWidthStr::width(word);
+                    if first_word {
+                        first_word = false;
+                        if cur_col + w_len <= width {
+                            cur_col += w_len;
+                        } else {
+                            line_count += (cur_col + w_len).saturating_sub(1) / width;
+                            cur_col = (cur_col + w_len) % width;
+                        }
+                    } else if cur_col + 1 + w_len <= width {
+                        cur_col += 1 + w_len;
                     } else {
-                        line_count += (cur_col + w_len).saturating_sub(1) / width;
-                        cur_col = (cur_col + w_len) % width;
+                        line_count += 1;
+                        cur_col = w_len.min(width);
                     }
-                } else if cur_col + 1 + w_len <= width {
-                    cur_col += 1 + w_len;
-                } else {
-                    line_count += 1;
-                    cur_col = w_len.min(width);
                 }
+                let raw_min = (sub_w + width - 1) / width;
+                total += line_count.max(raw_min);
             }
-            total += line_count;
         }
     }
     total

@@ -951,11 +951,13 @@ pub struct ExecutionStats {
 #[derive(Deserialize, Default)]
 struct StreamMessage {
     content: Option<String>,
+    thinking: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct StreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -984,17 +986,12 @@ impl StreamChunk {
                 return Some((TokenType::Thinking, t.clone()));
             }
         }
-        if let Some(r) = &self.response {
-            if !r.is_empty() {
-                return Some((TokenType::Response, r.clone()));
-            }
-        }
-        if let Some(c) = &self.content {
-            if !c.is_empty() {
-                return Some((TokenType::Response, c.clone()));
-            }
-        }
         if let Some(m) = &self.message {
+            if let Some(th) = &m.thinking {
+                if !th.is_empty() {
+                    return Some((TokenType::Thinking, th.clone()));
+                }
+            }
             if let Some(c) = &m.content {
                 if !c.is_empty() {
                     return Some((TokenType::Response, c.clone()));
@@ -1004,6 +1001,11 @@ impl StreamChunk {
         if let Some(choices) = &self.choices {
             if let Some(first) = choices.first() {
                 if let Some(d) = &first.delta {
+                    if let Some(rc) = &d.reasoning_content {
+                        if !rc.is_empty() {
+                            return Some((TokenType::Thinking, rc.clone()));
+                        }
+                    }
                     if let Some(c) = &d.content {
                         if !c.is_empty() {
                             return Some((TokenType::Response, c.clone()));
@@ -1015,6 +1017,16 @@ impl StreamChunk {
                         return Some((TokenType::Response, t.clone()));
                     }
                 }
+            }
+        }
+        if let Some(r) = &self.response {
+            if !r.is_empty() {
+                return Some((TokenType::Response, r.clone()));
+            }
+        }
+        if let Some(c) = &self.content {
+            if !c.is_empty() {
+                return Some((TokenType::Response, c.clone()));
             }
         }
         None
@@ -1597,21 +1609,58 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
 
     engine_log(&format!("preload_model requested for '{}' on '{}'", model_name, endpoint));
 
-    // 1. In-process Tier 1 (llama.cpp FFI) preloading into memory cache
+    let ngl = std::env::var("CYNAPSE_N_GPU_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(99);
+    let ctx_size = engine_ctx_size();
+
+    // 1. Check if Ollama is running and pin with keep_alive: -1 and GPU layers offloaded
+    let tags_url = format!("{}/api/tags", endpoint_clean);
+    if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_secs(3)).send().await {
+        if resp.status().is_success() {
+            let available_tags = fetch_ollama_models(endpoint).await;
+            let resolved = resolve_model_tag(model_name, &available_tags);
+            let gen_url = format!("{}/api/generate", endpoint_clean);
+            let payload = serde_json::json!({
+                "model": resolved,
+                "keep_alive": -1,
+                "options": {
+                    "num_gpu": ngl,
+                    "num_ctx": ctx_size,
+                }
+            });
+            engine_log(&format!(
+                "Preloading model '{}' (resolved as '{}', ngl: {}, ctx: {}) via Ollama /api/generate keep_alive: -1",
+                model_name, resolved, ngl, ctx_size
+            ));
+            match client.post(&gen_url)
+                .json(&payload)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    engine_log(&format!("Ollama preload completed successfully with status: {}", r.status()));
+                    return Ok(());
+                }
+                Ok(r) => {
+                    engine_log(&format!("Ollama preload returned non-success status: {}", r.status()));
+                }
+                Err(e) => {
+                    engine_log(&format!("Ollama preload request error: {}", e));
+                }
+            }
+        }
+    }
+
+    // 2. In-process Tier 1 (llama.cpp FFI) preloading into memory cache
     if leafcutter::llama_ffi::is_available() {
         if let Some(local_path) = find_model_file_path(model_name) {
             if local_path.is_file() {
-                let ngl = std::env::var("CYNAPSE_N_GPU_LAYERS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(99);
-                let ctx_size = std::env::var("CYNAPSE_CTX_SIZE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(4096);
                 engine_log(&format!("Preloading Tier 1 in-process llama model: {}", local_path.display()));
                 let lp = local_path.clone();
-                match tokio::task::spawn_blocking(move || get_or_load_llama_engine(&lp, ngl, ctx_size)).await {
+                match tokio::task::spawn_blocking(move || get_or_load_llama_engine(&lp, ngl, ctx_size as u32)).await {
                     Ok(Ok(_)) => {
                         engine_log(&format!("Tier 1 in-process llama model preloaded into RAM: {}", local_path.display()));
                         return Ok(());
@@ -1627,7 +1676,7 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
         }
     }
 
-    // 2. In-process Tier 2 (Leafcutter pure Rust) preloading into memory cache
+    // 3. In-process Tier 2 (Leafcutter pure Rust) preloading into memory cache
     if let Some(local_path) = find_model_file_path(model_name) {
         if local_path.is_file() && local_path.extension().map_or(false, |ext| ext == "gguf") {
             let path_str = local_path.to_string_lossy().to_string();
@@ -1648,36 +1697,7 @@ pub async fn preload_model(endpoint: &str, model_name: &str) -> Result<()> {
         }
     }
 
-    // 3. Check if Ollama is running and pin with keep_alive: -1
-    let tags_url = format!("{}/api/tags", endpoint_clean);
-    if let Ok(resp) = client.get(&tags_url).timeout(Duration::from_secs(3)).send().await {
-        if resp.status().is_success() {
-            let available_tags = fetch_ollama_models(endpoint).await;
-            let resolved = resolve_model_tag(model_name, &available_tags);
-            let gen_url = format!("{}/api/generate", endpoint_clean);
-            let payload = serde_json::json!({
-                "model": resolved,
-                "keep_alive": -1
-            });
-            engine_log(&format!("Preloading model '{}' (resolved as '{}') via Ollama /api/generate keep_alive: -1", model_name, resolved));
-            match client.post(&gen_url)
-                .json(&payload)
-                .timeout(Duration::from_secs(90))
-                .send()
-                .await
-            {
-                Ok(r) => {
-                    engine_log(&format!("Ollama preload completed with status: {}", r.status()));
-                    return Ok(());
-                }
-                Err(e) => {
-                    engine_log(&format!("Ollama preload request error: {}", e));
-                }
-            }
-        }
-    }
-
-    // 2. If daemon can be spawned for local path
+    // 4. If daemon can be spawned for local path
     let daemon_port = daemon::DEFAULT_DAEMON_PORT;
     if !daemon::LlamaServerDaemon::is_healthy(daemon_port) {
         if let Some(local_path) = find_model_file_path(model_name) {
