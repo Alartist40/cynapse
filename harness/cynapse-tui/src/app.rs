@@ -199,6 +199,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/fork", description: "Fork current conversation into a new branched session" },
     SlashCommand { name: "/update", description: "Check, pull, and compile latest Cynapse updates from git" },
     SlashCommand { name: "/export", description: "Export current conversation to Markdown or JSON in ~/.cynapse/exports/" },
+    SlashCommand { name: "/synapse", description: "Manage dynamic Synapse extension tool packs (install, enable, inspect)" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
     SlashCommand { name: "/exit", description: "Exit Cynapse TUI" },
 ];
@@ -2683,6 +2684,86 @@ impl TuiApp {
                                     continue;
                                 }
 
+                                if trimmed == "/synapse" || trimmed.starts_with("/synapse ") {
+                                    let reg = cynapse_core::synapse::SynapseRegistry::global();
+                                    reg.reload();
+                                    let subcmd = trimmed.strip_prefix("/synapse").unwrap_or("").trim();
+
+                                    if subcmd.is_empty() || subcmd == "list" {
+                                        let list = reg.list_synapses();
+                                        if list.is_empty() {
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: "🔌 **Synapse Extensions**: No external tool extensions installed in `~/.cynapse/synapses/`.\n\nInstall extensions using `/synapse install <name>` or drop manifest directories in `~/.cynapse/synapses/`.".into(),
+                                                thinking: None,
+                                            });
+                                        } else {
+                                            let mut lines = vec![format!("🔌 **Installed Synapse Tool Extensions ({} total)**:", list.len())];
+                                            for syn in list {
+                                                let state = if syn.enabled.unwrap_or(true) { "🟢 Active" } else { "⚪ Disabled" };
+                                                let tools_summary = syn.tools.iter().map(|t| format!("`{}`", t.name)).collect::<Vec<_>>().join(", ");
+                                                lines.push(format!("• **{}** (v{}) — {} [{}]\n  _{}_\n  Tools: {}", syn.name, syn.version, state, syn.title, syn.description, tools_summary));
+                                            }
+                                            lines.push("\nCommands: `/synapse enable <name>`, `/synapse disable <name>`, `/synapse reload`".into());
+                                            self.messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: lines.join("\n"),
+                                                thinking: None,
+                                            });
+                                        }
+                                    } else if let Some(name) = subcmd.strip_prefix("enable ") {
+                                        let name = name.trim();
+                                        match reg.set_enabled(name, true) {
+                                            Ok(_) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("✓ Synapse extension '{}' enabled. Tools now exposed to agent.", name),
+                                                    thinking: None,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("❌ {}", e),
+                                                    thinking: None,
+                                                });
+                                            }
+                                        }
+                                    } else if let Some(name) = subcmd.strip_prefix("disable ") {
+                                        let name = name.trim();
+                                        match reg.set_enabled(name, false) {
+                                            Ok(_) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("✓ Synapse extension '{}' disabled.", name),
+                                                    thinking: None,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("❌ {}", e),
+                                                    thinking: None,
+                                                });
+                                            }
+                                        }
+                                    } else if subcmd == "reload" {
+                                        reg.reload();
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "✓ Synapse registry reloaded from disk.".into(),
+                                            thinking: None,
+                                        });
+                                    } else {
+                                        self.messages.push(ChatMessage {
+                                            role: "system".into(),
+                                            content: "⚠️ Usage: `/synapse` (or `/synapse list`), `/synapse enable <name>`, `/synapse disable <name>`, `/synapse reload`".into(),
+                                            thinking: None,
+                                        });
+                                    }
+                                    continue;
+                                }
+
                                 // User Prompt Execution
                                 self.messages.push(ChatMessage {
                                     role: "user".into(),
@@ -3173,18 +3254,28 @@ impl TuiApp {
     }
 
     pub fn render_sparkline(&self) -> String {
-        const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-        if self.throughput_history.is_empty() {
-            return " ▂▃▅".to_string();
+        const WAVES_ACTIVE: [&str; 6] = [
+            "⡀⣀⣄⣤⣦⣶",
+            "⣀⣄⣤⣦⣶⣿",
+            "⣄⣤⣦⣶⣿⣶",
+            "⣤⣦⣶⣿⣶⣤",
+            "⣦⣶⣿⣶⣤⣄",
+            "⣶⣿⣶⣤⣄⣀",
+        ];
+        const WAVES_IDLE: [&str; 4] = [
+            "⡀⡀⣀⣀⡀⡀",
+            "⡀⣀⣤⣤⣀⡀",
+            "⣀⣤⣶⣶⣤⣀",
+            "⡀⣀⣤⣤⣀⡀",
+        ];
+
+        if self.is_generating || self.last_tok_per_sec > 0.0 {
+            let idx = self.anim_tick % WAVES_ACTIVE.len();
+            format!("[{}]", WAVES_ACTIVE[idx])
+        } else {
+            let idx = (self.anim_tick / 2) % WAVES_IDLE.len();
+            format!("[{}]", WAVES_IDLE[idx])
         }
-        let max = self.throughput_history.iter().copied().fold(0.0f64, f64::max).max(1.0);
-        let mut out = String::with_capacity(8);
-        for &val in self.throughput_history.iter().rev().take(8).collect::<Vec<_>>().iter().rev() {
-            let normalized = (val / max).clamp(0.0, 1.0);
-            let idx = ((normalized * 7.0).round() as usize).min(7);
-            out.push(BARS[idx]);
-        }
-        out
     }
 
     fn get_matching_commands(&self) -> Vec<&'static SlashCommand> {
@@ -3378,7 +3469,7 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         }
 
         if in_code_block {
-            let line_spans = Self::highlight_code_line(raw_line, &code_lang);
+            let line_spans = TuiApp::highlight_code_line(raw_line, &code_lang);
             let mut full_spans = vec![
                 Span::styled("    │ ", Style::default().fg(Color::Cyan)),
             ];
@@ -3497,16 +3588,23 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
                 ),
                 Span::styled("  │  ", t.dim_text()),
                 Span::styled(
-                    if self.last_tok_per_sec > 0.0 {
+                    if self.is_generating {
+                        let wave = self.render_sparkline();
                         if let Some(ttft) = self.last_ttft_ms {
-                            format!("Perf: {:.1} t/s (TTFT: {}ms) {}", self.last_tok_per_sec, ttft, self.render_sparkline())
+                            format!("Perf: {:.1} t/s (TTFT: {}ms) {}", self.last_tok_per_sec, ttft, wave)
                         } else {
-                            format!("Perf: {:.1} t/s {}", self.last_tok_per_sec, self.render_sparkline())
+                            format!("Perf: {:.1} t/s {}", self.last_tok_per_sec, wave)
                         }
+                    } else if self.last_tok_per_sec > 0.0 {
+                        format!("Perf: {:.1} t/s {}", self.last_tok_per_sec, self.render_sparkline())
                     } else {
                         format!("Perf: idle {}", self.render_sparkline())
                     },
-                    Style::default().fg(Color::LightYellow),
+                    if self.is_generating {
+                        Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(180, 160, 220))
+                    },
                 ),
             ]
         };

@@ -1,0 +1,42 @@
+[synapse]
+name = "soup"
+title = "Soup Post-Training & Model Fine-Tuning"
+version = "0.71.0"
+author = "MakazhanAlpamys / Cynapse"
+description = "Low-VRAM layer-streaming post-training, dataset validator, chat-template doctor, and GGUF exporter"
+enabled = true
+
+[[tools]]
+name = "soup_advise"
+description = "Pre-flight recommendation (PROMPT_ENG / RAG / SFT / DPO / GRPO) for a dataset + goal"
+command = "python3 runner.py advise"
+transport = "stdio"
+concurrency_safe = true
+
+[[tools]]
+name = "soup_data_doctor"
+description = "Chat-template compatibility doctor vs tokenizer (detects EOS leaks, BOS duplication, truncation risks)"
+command = "python3 runner.py data_doctor"
+transport = "stdio"
+concurrency_safe = true
+
+[[tools]]
+name = "soup_data_inspect"
+description = "Dataset stats: row counts, column inspection, token length distributions, and duplicate analysis"
+command = "python3 runner.py data_inspect"
+transport = "stdio"
+concurrency_safe = true
+
+[[tools]]
+name = "soup_profile"
+description = "Low-VRAM layer streaming hardware profiler: estimate memory, speed, and GPU fit before fine-tuning"
+command = "python3 runner.py profile"
+transport = "stdio"
+concurrency_safe = true
+
+[[tools]]
+name = "soup_export"
+description = "Export fine-tuned adapter / model to GGUF format for Cynapse Leafcutter or llama-server"
+command = "python3 runner.py export"
+transport = "stdio"
+concurrency_safe = false

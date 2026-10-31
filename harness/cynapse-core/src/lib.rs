@@ -21,6 +21,7 @@ pub mod security;
 pub mod session;
 pub mod skills;
 pub mod subagent;
+pub mod synapse;
 pub mod undo;
 pub mod updater;
 use serde::{Deserialize, Serialize};
@@ -360,7 +361,17 @@ pub fn execute_tool(name: &str, arg1: &str, arg2: Option<&str>) -> Result<String
             let _ = child.kill();
             bail!("Command timed out after 10 seconds: {}", trimmed);
         }
-        _ => bail!("Unknown tool: {}", name),
+        _ => {
+            // Check dynamic Synapse extensions
+            let reg = synapse::SynapseRegistry::global();
+            let json_arg = if let Some(a2) = arg2 {
+                serde_json::json!({ "arg1": arg1, "arg2": a2 })
+            } else {
+                serde_json::from_str(arg1).unwrap_or_else(|_| serde_json::json!({ "arg": arg1 }))
+            };
+            reg.execute_tool(name, &json_arg)
+                .map_err(|e| anyhow::anyhow!("Unknown tool '{}' or Synapse execution error: {}", name, e))
+        }
     }
 }
 
