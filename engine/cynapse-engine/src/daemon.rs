@@ -109,11 +109,15 @@ impl LlamaServerDaemon {
             (Stdio::null(), Stdio::null())
         };
 
-        let ngl = match crate::detect_vram_free_mb() {
-            Some(vram) if vram > 6000 => "99".to_string(),
-            Some(vram) if vram > 3000 => "33".to_string(),
-            Some(vram) if vram > 1000 => "16".to_string(),
-            _ => "0".to_string(),
+        let ngl = if let Some(custom_ngl) = crate::gpu_layers() {
+            custom_ngl.to_string()
+        } else {
+            match crate::detect_vram_free_mb() {
+                Some(vram) if vram > 6000 => "99".to_string(),
+                Some(vram) if vram > 3000 => "33".to_string(),
+                Some(vram) if vram > 1000 => "16".to_string(),
+                _ => "0".to_string(),
+            }
         };
         let threads = crate::physical_core_count().to_string();
         // Context size: uses configured engine context or default ENGINE_CTX_SIZE

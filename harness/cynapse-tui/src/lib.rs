@@ -116,6 +116,7 @@ struct EngineConfig {
     tier1_endpoint: Option<String>,
     default_model: Option<String>,
     ctx_size: Option<usize>,
+    gpu_layers: Option<usize>,
     model_search_paths: Option<Vec<String>>,
 }
 
@@ -155,6 +156,9 @@ impl TuiSession {
                             }
                             if let Some(sz) = engine.ctx_size {
                                 cynapse_engine::set_engine_ctx_size(sz);
+                            }
+                            if let Some(gl) = engine.gpu_layers {
+                                cynapse_engine::set_gpu_layers(gl);
                             }
                             if let Some(paths) = engine.model_search_paths {
                                 let pbufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();

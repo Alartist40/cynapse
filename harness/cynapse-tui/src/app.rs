@@ -44,7 +44,7 @@ use crate::theme::AppTheme;
 
 pub const MAX_AGENT_STEPS: usize = 14;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -198,6 +198,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/rewind", description: "Rewind conversation history by N turns (default 1)" },
     SlashCommand { name: "/fork", description: "Fork current conversation into a new branched session" },
     SlashCommand { name: "/update", description: "Check, pull, and compile latest Cynapse updates from git" },
+    SlashCommand { name: "/export", description: "Export current conversation to Markdown or JSON in ~/.cynapse/exports/" },
     SlashCommand { name: "/clear", description: "Clear conversation history" },
     SlashCommand { name: "/exit", description: "Exit Cynapse TUI" },
 ];
@@ -2621,6 +2622,67 @@ impl TuiApp {
                                     }
                                 }
 
+                                if trimmed == "/export" || trimmed.starts_with("/export ") {
+                                    let format = trimmed.strip_prefix("/export").unwrap_or("").trim().to_lowercase();
+                                    let export_dir = dirs::home_dir().map(|h| h.join(".cynapse").join("exports")).unwrap_or_else(|| PathBuf::from("exports"));
+                                    let _ = std::fs::create_dir_all(&export_dir);
+                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+                                    if format == "json" {
+                                        let file_path = export_dir.join(format!("cynapse_session_{}.json", ts));
+                                        let json_data = serde_json::to_string_pretty(&self.messages).unwrap_or_default();
+                                        match std::fs::write(&file_path, json_data) {
+                                            Ok(_) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("✓ Conversation exported to JSON: {}", file_path.display()),
+                                                    thinking: None,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("❌ Export failed: {}", e),
+                                                    thinking: None,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        let file_path = export_dir.join(format!("cynapse_session_{}.md", ts));
+                                        let mut doc = format!("# Cynapse Session Export\n- **Date**: UNIX {}\n- **Model**: {}\n\n---\n\n", ts, self.active_model_name);
+                                        for m in &self.messages {
+                                            let role_badge = match m.role.as_str() {
+                                                "user" => "### 👤 User",
+                                                "assistant" => "### 🤖 Cynapse",
+                                                "system" => "### ℹ️ System",
+                                                _ => "### ⚠️ Note",
+                                            };
+                                            doc.push_str(&format!("{}\n\n", role_badge));
+                                            if let Some(ref think) = m.thinking {
+                                                doc.push_str(&format!("<details>\n<summary>Thinking Process</summary>\n\n{}\n</details>\n\n", think));
+                                            }
+                                            doc.push_str(&format!("{}\n\n", m.content));
+                                        }
+                                        match std::fs::write(&file_path, doc) {
+                                            Ok(_) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("✓ Conversation exported to Markdown: {}", file_path.display()),
+                                                    thinking: None,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                self.messages.push(ChatMessage {
+                                                    role: "system".into(),
+                                                    content: format!("❌ Export failed: {}", e),
+                                                    thinking: None,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
                                 // User Prompt Execution
                                 self.messages.push(ChatMessage {
                                     role: "user".into(),
@@ -3211,6 +3273,89 @@ impl TuiApp {
         items
     }
 
+    pub fn highlight_code_line(line: &str, lang: &str) -> Vec<Span<'static>> {
+    let lower_lang = lang.to_lowercase();
+    let trimmed = line.trim_start();
+    
+    // Comments
+    if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("--") {
+        return vec![Span::styled(line.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))];
+    }
+
+    let mut spans = Vec::new();
+    let rust_kw = ["fn", "let", "mut", "pub", "struct", "enum", "impl", "use", "match", "if", "else", "for", "while", "loop", "return", "self", "Self", "async", "await", "trait", "where", "type", "const", "static", "unsafe"];
+    let py_kw = ["def", "class", "import", "from", "return", "if", "elif", "else", "for", "while", "try", "except", "finally", "with", "as", "pass", "yield", "lambda", "async", "await"];
+    let sh_kw = ["if", "then", "else", "fi", "for", "do", "done", "in", "case", "esac", "while", "echo", "exit", "source", "export"];
+
+    let keywords = match lower_lang.as_str() {
+        "rust" | "rs" => &rust_kw[..],
+        "python" | "py" => &py_kw[..],
+        "bash" | "sh" | "shell" | "zsh" => &sh_kw[..],
+        _ => &rust_kw[..],
+    };
+
+    let mut current_token = String::new();
+    let mut in_quote: Option<char> = None;
+
+    for ch in line.chars() {
+        if let Some(q) = in_quote {
+            current_token.push(ch);
+            if ch == q {
+                spans.push(Span::styled(current_token.clone(), Style::default().fg(Color::Yellow)));
+                current_token.clear();
+                in_quote = None;
+            }
+        } else if ch == '"' || ch == '\'' || ch == '`' {
+            if !current_token.is_empty() {
+                let is_kw = keywords.contains(&current_token.as_str());
+                let style = if is_kw {
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                } else if current_token.chars().all(|c| c.is_ascii_digit()) {
+                    Style::default().fg(Color::LightCyan)
+                } else {
+                    Style::default().fg(Color::LightGreen)
+                };
+                spans.push(Span::styled(current_token.clone(), style));
+                current_token.clear();
+            }
+            in_quote = Some(ch);
+            current_token.push(ch);
+        } else if ch.is_alphanumeric() || ch == '_' {
+            current_token.push(ch);
+        } else {
+            if !current_token.is_empty() {
+                let is_kw = keywords.contains(&current_token.as_str());
+                let style = if is_kw {
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                } else if current_token.chars().all(|c| c.is_ascii_digit()) {
+                    Style::default().fg(Color::LightCyan)
+                } else {
+                    Style::default().fg(Color::LightGreen)
+                };
+                spans.push(Span::styled(current_token.clone(), style));
+                current_token.clear();
+            }
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::White)));
+        }
+    }
+
+    if !current_token.is_empty() {
+        let is_kw = keywords.contains(&current_token.as_str());
+        let style = if in_quote.is_some() {
+            Style::default().fg(Color::Yellow)
+        } else if is_kw {
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        } else if current_token.chars().all(|c| c.is_ascii_digit()) {
+            Style::default().fg(Color::LightCyan)
+        } else {
+            Style::default().fg(Color::LightGreen)
+        };
+        spans.push(Span::styled(current_token, style));
+    }
+
+    spans
+}
+
 pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code_block = false;
@@ -3233,10 +3378,12 @@ pub fn render_markdown_lines(text: &str, theme: AppTheme) -> Vec<Line<'static>> 
         }
 
         if in_code_block {
-            lines.push(Line::from(vec![
+            let line_spans = Self::highlight_code_line(raw_line, &code_lang);
+            let mut full_spans = vec![
                 Span::styled("    │ ", Style::default().fg(Color::Cyan)),
-                Span::styled(raw_line.to_string(), Style::default().fg(Color::LightGreen)),
-            ]));
+            ];
+            full_spans.extend(line_spans);
+            lines.push(Line::from(full_spans));
             continue;
         }
 

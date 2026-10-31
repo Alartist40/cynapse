@@ -41,6 +41,18 @@ pub fn set_engine_ctx_size(n: usize) {
     }
 }
 
+static GPU_LAYERS: OnceLock<usize> = OnceLock::new();
+
+/// Explicit GPU layer offload override from cynapse.toml or CLI `--gpu-layers`.
+pub fn set_gpu_layers(n: usize) {
+    let _ = GPU_LAYERS.set(n);
+}
+
+/// Explicit GPU layer offload count if configured.
+pub fn gpu_layers() -> Option<usize> {
+    GPU_LAYERS.get().copied()
+}
+
 /// Effective context size: cynapse.toml value if set, else `ENGINE_CTX_SIZE`.
 /// Drives llama-server `--ctx-size`, Ollama `num_ctx`, and overflow reporting.
 pub fn engine_ctx_size() -> usize {

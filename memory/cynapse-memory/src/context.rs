@@ -473,11 +473,15 @@ fn score(nodes: &[Node], query: &str) -> Vec<ScoredNode> {
                 return (n.clone(), 0.0);
             }
 
+            // Semantic trigram character-vector similarity (soft semantic match)
+            let semantic_sim = compute_char_trigram_similarity(&n.content.to_lowercase(), &q);
+            let semantic_boost = semantic_sim * 12.0;
+
             // Specialization index boost spec(e)
             let spec_boost = n.spec_index() as f64;
 
-            // Final 2-tier score combining lexical BM25 + specialization + recency decay
-            let mut final_score = (bm25_score * recency_decay) + (spec_boost * 4.0);
+            // Final hybrid score combining lexical BM25 + dense character trigram vector + specialization + recency decay
+            let mut final_score = (bm25_score * recency_decay) + semantic_boost + (spec_boost * 4.0);
 
             // Connectivity bonus — hub nodes carry more weight
             final_score += (n.links.len() + n.backlinks.len()) as f64 * 0.3;
@@ -503,6 +507,43 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
         return 0;
     }
     haystack.matches(needle).count()
+}
+
+/// Computes character trigram cosine similarity vector for fast dense semantic retrieval.
+fn compute_char_trigram_similarity(a: &str, b: &str) -> f64 {
+    if a.len() < 3 || b.len() < 3 {
+        return 0.0;
+    }
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    
+    let mut a_tri = std::collections::HashMap::new();
+    for window in a_chars.windows(3) {
+        let tri: String = window.iter().collect();
+        *a_tri.entry(tri).or_insert(0) += 1;
+    }
+
+    let mut b_tri = std::collections::HashMap::new();
+    for window in b_chars.windows(3) {
+        let tri: String = window.iter().collect();
+        *b_tri.entry(tri).or_insert(0) += 1;
+    }
+
+    let mut dot_product = 0.0;
+    for (tri, count_a) in &a_tri {
+        if let Some(count_b) = b_tri.get(tri) {
+            dot_product += (*count_a * *count_b) as f64;
+        }
+    }
+
+    let norm_a: f64 = a_tri.values().map(|v| (*v * *v) as f64).sum::<f64>().sqrt();
+    let norm_b: f64 = b_tri.values().map(|v| (*v * *v) as f64).sum::<f64>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        (dot_product / (norm_a * norm_b)).clamp(0.0, 1.0)
+    }
 }
 
 /// Token estimate considering character count, word count, and UTF-8 bytes.

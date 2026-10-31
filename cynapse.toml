@@ -11,6 +11,8 @@ default_model = "Ornith-1.5-9B-Q4_K_M.gguf"
 memory_headroom_mb = 1536
 # Prompt context size for the Cynapse engine.
 ctx_size = 4096
+# GPU layers offloaded to Vulkan/ROCm on AMD Cezanne Radeon Graphics (boosts inference speed)
+gpu_layers = 20
 # Optional extra directories to search for local GGUF models.
 model_search_paths = []
 
